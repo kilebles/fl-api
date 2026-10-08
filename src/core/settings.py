@@ -1,0 +1,84 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Logging
+    log_level: str = Field(default="SUCCESS", description="Minimum log level (DEBUG, INFO, SUCCESS, WARNING, ERROR, CRITICAL)")
+    monitor_url: str | None = Field(default=None, description="flow-stat base URL, e.g. http://192.168.1.100:8080")
+
+    # Dolphin Anty
+    anty_token: str = Field(default="", description="Dolphin Anty JWT token")
+    anty_local_api: str = Field(default="http://localhost:3001", description="Dolphin Anty Local API base URL")
+
+    # Storage
+    accounts_dir: Path = Field(default=Path("accounts"), description="Directory with account_N/ folders")
+    output_dir: Path = Field(default=Path("output"), description="Root directory for job results")
+    download_dir: Path = Field(default=Path("output/_tmp"), description="Scratch directory for downloads before they are renamed into a job folder")
+
+    # Flow API
+    api_url: str = Field(
+        default="https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText",
+        description="Veo text-to-video endpoint URL",
+    )
+    polling_url: str = Field(
+        default="https://aisandbox-pa.googleapis.com/v1/video:batchCheckAsyncVideoGenerationStatus",
+        description="Video status polling endpoint URL",
+    )
+    api_timeout: float = Field(default=30.0, description="API request timeout in seconds")
+    image_api_timeout: float = Field(default=120.0, description="Timeout for image generation API requests (blocking call)")
+    polling_timeout: float = Field(default=600.0, description="Polling timeout in seconds")
+
+    # Flow frontend / labs.google session
+    labs_url: str = Field(
+        default="https://flow.google.com/",
+        description="Flow home URL opened in the browser profile (reCAPTCHA + project discovery)",
+    )
+    flow_base_url: str = Field(
+        default="https://flow.google.com",
+        description="Flow frontend origin used for Origin/Referer headers and project pages",
+    )
+    labs_base_url: str = Field(
+        default="https://labs.google",
+        description="Legacy Google Labs base URL (next-auth session that issues the API access token, tRPC project/media endpoints)",
+    )
+    labs_session_refresh_interval: float = Field(
+        default=1200.0,
+        description="Seconds between labs.google session refreshes (access tokens live ~1h)",
+    )
+
+    # reCAPTCHA
+    recaptcha_site_key: str = Field(default="6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV", description="reCAPTCHA site key")
+    recaptcha_action: str = Field(default="VIDEO_GENERATION", description="Default reCAPTCHA action name")
+    reload_every_min: int = Field(default=8, description="Minimum tokens before page reload")
+    reload_every_max: int = Field(default=25, description="Maximum tokens before page reload")
+    reload_timeout: float = Field(default=15.0, description="Timeout in seconds for page reload")
+
+    # Generation defaults
+    video_aspect_ratio: str = Field(default="VIDEO_ASPECT_RATIO_LANDSCAPE", description="Video aspect ratio")
+    video_model_key: str = Field(default="veo_3_1_t2v_lite_low_priority", description="Text-to-video model key")
+    i2v_model_key: str = Field(default="veo_3_1_r2v_lite_low_priority", description="Image-to-video model key")
+    flash_t2v_model_key: str = Field(default="abra_t2v_10s", description="Text-to-video model of the flash_t2v and f2v modes")
+    flash_i2v_model_key: str = Field(default="abra_r2v_10s", description="Image-to-video model of the flash_i2v mode")
+    f2v_model_key: str = Field(default="abra_t2v_10s", description="Frame-to-video model for f2v clips after the first one")
+    image_model_name: str = Field(
+        default="GEM_PIX_2",
+        description="Image model for flowMedia:batchGenerateImages; NARWHAL retired 2026-10-05",
+    )
+
+    # Rotation
+    rotate_every_generations: int = Field(default=300, description="Rotate account after this many successful generations")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
