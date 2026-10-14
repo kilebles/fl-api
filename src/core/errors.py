@@ -22,6 +22,12 @@ class DiskFullError(Exception):
     """No space left on the output disk. Stop the batch instead of retrying or skipping items."""
 
 
+class InputImageRejectedError(GenerationFilteredError):
+    """Video failed with PUBLIC_ERROR_IP_INPUT_IMAGE: the source image shows protected
+    intellectual property (logos, known characters). Not a proxy problem — a new source
+    image may pass, otherwise the row is skipped like any filtered generation."""
+
+
 class ImageQuotaError(Exception):
     """Image model daily quota reached for this account. The account can still make videos."""
 

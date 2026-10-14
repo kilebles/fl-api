@@ -6,6 +6,7 @@ from pathlib import Path
 from src.core.errors import (
     GenerationFilteredError,
     ImageQuotaError,
+    InputImageRejectedError,
     VideoAccessDeniedError,
 )
 from src.engine.session import SubmittedVideo
@@ -20,8 +21,10 @@ class FakeSession:
         images: bool = True,
         filtered: set[str] | None = None,
         image_quota_after: int | None = None,
+        ip_rejections: dict[str, int] | None = None,
     ) -> None:
         self.name = name
+        self._ip_rejections = dict(ip_rejections or {})
         self.can_rotate = False
         self.account_count = 1
         self.on_cooldown = False
@@ -75,6 +78,10 @@ class FakeSession:
 
     async def finish_video(self, index: int, submitted: SubmittedVideo) -> Path:
         await asyncio.sleep(0.01)
+        prompt = submitted.media_id.split("-", 2)[2]
+        if self._ip_rejections.get(prompt, 0) > 0:
+            self._ip_rejections[prompt] -= 1
+            raise InputImageRejectedError(f"IP_INPUT_IMAGE: {prompt}")
         self._scratch.mkdir(parents=True, exist_ok=True)
         path = self._scratch / f"{submitted.media_id}.mp4"
         path.write_text(submitted.media_id)

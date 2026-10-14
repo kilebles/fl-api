@@ -49,6 +49,15 @@ def image_cooldown_remaining(dolphin_id: str | None) -> float:
     return max(0.0, _IMAGE_COOLDOWNS.get(dolphin_id, 0.0) - time.monotonic())
 
 
+def image_quota_limited(dolphin_id: str | None) -> bool:
+    """True while the account's last image attempt hit the image quota (no image succeeded since).
+
+    The cooldown clock is only a retry pacer: it can run out long before the rolling
+    ~24h quota frees up, so "limited" is tracked by the hit counter instead.
+    """
+    return bool(dolphin_id) and _IMAGE_COOLDOWN_HITS.get(dolphin_id, 0) > 0
+
+
 def reset_image_cooldown(dolphin_id: str | None) -> None:
     """Clear the image cooldown and its hit counter after a successful image."""
     if dolphin_id:

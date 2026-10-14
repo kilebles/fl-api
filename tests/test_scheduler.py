@@ -91,3 +91,29 @@ async def test_worker_without_capability_does_not_start(tmp_path: Path):
     await BatchScheduler([idle, busy], BatchOptions(output_dir=tmp_path / "out")).run(items)
 
     assert not idle.started and busy.started
+
+
+async def test_ip_input_image_regenerates_the_source_image_once(tmp_path: Path):
+    session = FakeSession("a", tmp_path / "tmp", ip_rejections={"v0": 1, "v1": 2})
+    out = tmp_path / "out"
+    items = [
+        WorkItem(index=i, name=str(i), video_prompt=f"v{i}", image_prompt=f"i{i}", image_path=out / f"{i}.jpg")
+        for i in range(2)
+    ]
+
+    stats = await BatchScheduler([session], BatchOptions(output_dir=out)).run(items)
+
+    assert stats.done == 1 and stats.skipped == 1
+    assert session.images_made.count("i0") == 2 and session.images_made.count("i1") == 2
+    assert (out / "0.mp4").exists() and "IP_INPUT_IMAGE" in (out / "1.skip").read_text()
+
+
+async def test_ip_input_image_on_a_static_image_skips_at_once(tmp_path: Path):
+    static = tmp_path / "s.jpg"
+    static.write_text("x")
+    session = FakeSession("a", tmp_path / "tmp", ip_rejections={"v0": 1})
+    out = tmp_path / "out"
+
+    stats = await BatchScheduler([session], BatchOptions(output_dir=out)).run([WorkItem(index=0, name="0", video_prompt="v0", image_path=static)])
+
+    assert stats.skipped == 1 and static.exists() and not session.images_made

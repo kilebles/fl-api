@@ -18,6 +18,7 @@ from src.core.errors import (
     GenerationFilteredError,
     GenerationTimedOutError,
     ImageQuotaError,
+    InputImageRejectedError,
     IpProhibitedError,
     RateLimitError,
     VideoAccessDeniedError,
@@ -45,6 +46,8 @@ WATCHDOG_STALL_TIMEOUT = 600.0
 # A row the server times out on this many times is skipped for good: each attempt costs
 # ~5 minutes and the same prompt/image fails on every account.
 ITEM_TIMEOUT_SKIP_AFTER = 2
+# PUBLIC_ERROR_IP_INPUT_IMAGE: a generated source image is replaced this many times before the row is skipped.
+IMAGE_REGENERATIONS = 1
 
 MIN_FREE_BYTES = 1024 ** 3
 
@@ -101,6 +104,7 @@ class _BatchState:
     stats: BatchStats = field(default_factory=BatchStats)
     fatal: BaseException | None = None
     timeouts: dict[int, int] = field(default_factory=dict)
+    image_regenerations: dict[int, int] = field(default_factory=dict)
     inflight: set[asyncio.Task] = field(default_factory=set)
     deadline: float = 0.0
 
@@ -377,6 +381,16 @@ class BatchScheduler:
             path.replace(final_path)
             logger.bind(event_type="success", account=w.name).success(f"[{w.name}/video] Saved: {final_path}")
             await self._settle(state, item, "done")
+        except InputImageRejectedError as e:
+            regenerated = state.image_regenerations.get(item.index, 0)
+            if item.image_prompt is not None and item.image_path is not None and regenerated < IMAGE_REGENERATIONS:
+                state.image_regenerations[item.index] = regenerated + 1
+                item.image_path.unlink(missing_ok=True)
+                logger.warning(f"[{w.name}/video] {item.name}: source image rejected (intellectual property) — generating a new image")
+                state.image_queue.put_nowait(item)
+            else:
+                logger.warning(f"[{w.name}/video] {item.name}: source image rejected (intellectual property) — permanent skip")
+                await self._settle(state, item, "skipped", skip_reason=str(e))
         except GenerationFilteredError as e:
             logger.warning(f"[{w.name}/video] Filtered (permanent skip): {item.name}")
             await self._settle(state, item, "skipped", skip_reason=str(e))

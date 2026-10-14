@@ -21,6 +21,9 @@ class ResultSync:
     source images stay until the job ends because its videos are made from them. f2v
     keeps its clips too — the chain resumes from them.
 
+    A file rewritten under the same name (a source image generated again) is uploaded
+    again: files are compared by modification time, not only by name.
+
     `kick()` asks for a sync in the background; `close()` runs the last one and tells
     whether every file made it to the store (only then may the folder be deleted).
     """
@@ -41,6 +44,12 @@ class ResultSync:
         self._lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._failed: set[str] = set()
+        directory = output.directory
+        self._synced: dict[str, int] = (
+            {p.name: p.stat().st_mtime_ns for p in directory.iterdir() if p.is_file() and p.name in output.stored}
+            if directory.is_dir()
+            else {}
+        )
         self._task = asyncio.create_task(self._loop(), name=f"sync_{job_id}")
 
     def kick(self) -> None:
@@ -68,7 +77,10 @@ class ResultSync:
                 return
             changed = False
             for path in sorted(directory.iterdir()):
-                if not path.is_file() or path.suffix not in KIND_BY_SUFFIX or path.name in self._output.stored:
+                if not path.is_file() or path.suffix not in KIND_BY_SUFFIX:
+                    continue
+                mtime = path.stat().st_mtime_ns
+                if path.name in self._output.stored and self._synced.get(path.name, mtime) == mtime:
                     continue
                 try:
                     if path.suffix == ".skip":
@@ -85,6 +97,7 @@ class ResultSync:
                     continue
                 self._failed.discard(path.name)
                 self._output.stored.add(path.name)
+                self._synced[path.name] = mtime
                 changed = True
                 row = path.stem
                 if path == self._output.final(row) and not self._output.mode.chain:

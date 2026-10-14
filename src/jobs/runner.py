@@ -20,6 +20,10 @@ from src.jobs.modes import MODES, Strategy
 from src.jobs.storage import JobOutput
 
 MAX_COOLDOWN_WAIT = 3600.0
+# While an account sits on the rolling (~24h) image quota a stalled pass is not the end:
+# wait this long and try again, up to IMAGE_QUOTA_MAX_WAITS times in a row (~26h).
+IMAGE_QUOTA_WAIT = 900.0
+IMAGE_QUOTA_MAX_WAITS = 104
 
 ProgressCallback = Callable[[JobState, JobProgress, str | None], Awaitable[None]]
 
@@ -55,7 +59,7 @@ class JobRunner:
         `output` lets the caller share the result state (e.g. with files already moved to
         the object store); by default it is read from `spec.output_dir`.
         """
-        accounts = self._accounts.active()
+        accounts = [a for a in self._accounts.active() if not self._settings.accounts_enabled or a.name in self._settings.accounts_enabled]
         if not accounts:
             raise NoAccountsError(f"No accounts with dolphin_id in {self._accounts.root}")
 
@@ -78,6 +82,7 @@ class JobRunner:
 
         try:
             prev_progress: int | None = None
+            quota_waits = 0
             while True:
                 missing = output.missing()
                 if not missing:
@@ -86,13 +91,21 @@ class JobRunner:
                 progress = output.progress(pass_num)
                 current = progress.images_done + progress.videos_done + progress.skipped
                 if prev_progress is not None and current <= prev_progress:
-                    wait = self._cooldown_wait(accounts, output.needs_images(missing))
-                    if wait <= 0:
+                    images_needed = output.needs_images(missing)
+                    wait = self._cooldown_wait(accounts, images_needed)
+                    if wait > 0:
+                        wait = min(wait, MAX_COOLDOWN_WAIT) + 5.0
+                        message = f"all accounts paused (quota or model access) — waiting {wait / 60:.0f}m"
+                    elif images_needed and quota_waits < IMAGE_QUOTA_MAX_WAITS and any(
+                        cooldowns.image_quota_limited(a.dolphin_id) for a in accounts
+                    ):
+                        quota_waits += 1
+                        wait = IMAGE_QUOTA_WAIT
+                        message = f"image quota on some accounts — next pass in {wait / 60:.0f}m"
+                    else:
                         message = f"pass {pass_num} made no progress, {len(missing)} rows left — see logs"
                         logger.warning(f"[job] {message}")
                         return await self._finish(JobState.STOPPED, output, pass_num, message, report)
-                    wait = min(wait, MAX_COOLDOWN_WAIT) + 5.0
-                    message = f"all accounts paused (quota or model access) — waiting {wait / 60:.0f}m"
                     logger.warning(f"[job] {message}")
                     await report(JobState.WAITING, message)
                     for session in sessions:
@@ -100,6 +113,8 @@ class JobRunner:
                     await asyncio.sleep(wait)
                     prev_progress = None
                     continue
+                if prev_progress is not None and current > prev_progress:
+                    quota_waits = 0
                 prev_progress = current
 
                 pass_num += 1

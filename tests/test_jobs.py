@@ -128,11 +128,14 @@ async def test_f2v_chain_feeds_last_good_frame(tmp_path: Path, monkeypatch):
 
 
 async def _queue(tmp_path: Path, runner: JobRunner):
+    from src.core.db import Database
     from src.jobs.queue import JobQueue
     from src.jobs.repository import JobRepository
 
-    repo = JobRepository(f"sqlite+aiosqlite:///{tmp_path / 'db' / 'jobs.db'}")
-    await repo.init()
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'db' / 'jobs.db'}")
+    await db.init()
+    repo = JobRepository(db)
+    repo.close = db.close
     store = LocalObjectStore(Settings(_env_file=None, storage_dir=tmp_path / "bucket"))
     return JobQueue(runner, repo, store, tmp_path / "work"), repo, store
 
@@ -273,3 +276,57 @@ def test_api_flow(tmp_path: Path, monkeypatch):
         assert client.delete(f"/api/jobs/{job['id']}", headers=auth).status_code == 204
         assert client.get(f"/api/jobs/{job['id']}", headers=auth).status_code == 404
         assert not any(k.startswith("jobs/") for k in _keys(store))
+
+
+async def test_runner_waits_while_an_account_is_on_the_image_quota(tmp_path: Path, monkeypatch):
+    from src.dolphin import cooldowns
+    from src.jobs import runner as runner_module
+
+    session = FakeSession("a", tmp_path / "tmp", videos=False, images=False)
+    runner = _runner_with(tmp_path, monkeypatch, [session])
+    monkeypatch.setattr(runner_module, "IMAGE_QUOTA_WAIT", 0.01)
+    monkeypatch.setattr(cooldowns, "_IMAGE_COOLDOWN_HITS", {"1": 1})
+    monkeypatch.setattr(cooldowns, "_IMAGE_COOLDOWNS", {})
+    messages = []
+
+    async def on_progress(state, progress, message):
+        if state is JobState.WAITING:
+            messages.append(message)
+            session._images = True
+            cooldowns.reset_image_cooldown("1")
+
+    spec = JobSpec(mode=Mode.IMG, rows=[JobRow(name="1", image_prompt="i")], output_dir=tmp_path / "out")
+    state, progress, _ = await runner.run(spec, on_progress)
+
+    assert state is JobState.DONE and progress.images_done == 1
+    assert len(messages) == 1 and "image quota" in messages[0]
+
+
+async def test_result_sync_uploads_a_regenerated_image_again(tmp_path: Path):
+    from src.jobs.sync import ResultSync
+
+    import os
+
+    from src.core.db import Database
+    from src.jobs.repository import JobRepository
+
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'db' / 'j.db'}")
+    await db.init()
+    repo = JobRepository(db)
+    store = LocalObjectStore(Settings(_env_file=None, storage_dir=tmp_path / "bucket"))
+    await repo.create("job1", JobRequest(mode=Mode.I2V, rows=[JobRow(name="1", prompt="p", image_prompt="i")]))
+    spec = JobSpec(mode=Mode.I2V, rows=[JobRow(name="1", prompt="p", image_prompt="i")], output_dir=tmp_path / "out")
+    spec.output_dir.mkdir()
+    output = JobOutput(spec)
+    sync = ResultSync("job1", output, store, repo)
+
+    (spec.output_dir / "1.jpg").write_text("first")
+    await sync.sync()
+    (spec.output_dir / "1.jpg").write_text("second")
+    os.utime(spec.output_dir / "1.jpg", ns=(1, 10**18))
+    await sync.sync()
+    await sync.close()
+
+    assert (store.root / "jobs/job1/1.jpg").read_text() == "second"
+    assert [f.name for f in await repo.files("job1")] == ["1.jpg"]
+    await db.close()

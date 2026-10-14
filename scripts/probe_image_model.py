@@ -62,6 +62,13 @@ DEFAULT_CANDIDATES = [
     "IMAGEN_4_FAST",
     "IMAGEN_4_ULTRA",
     "NARWHAL_2",
+    "GEM_PIX_2_VERTEX",
+    "GEM_PIX_VERTEX",
+    "GEM_PIX_PRO_VERTEX",
+    "GEM_PIX_2_LITE_VERTEX",
+    "BELUGA",
+    "BELUGA_VERTEX",
+    "HARBOR_SEAL",
     "BOGUS_MODEL_XYZ",
 ]
 PROMPT = "a red apple on a wooden table, studio light"
@@ -88,6 +95,7 @@ async def probe(settings, credentials: CredentialsService, producer: RecaptchaTo
     url = image.IMAGE_API_URL_TEMPLATE.format(project_id=credentials.project_id)
     accepted: list[str] = []
     reauthenticated = False
+    proxy_failures = 0
     pending = list(models)
     while pending:
         model = pending[0]
@@ -110,13 +118,21 @@ async def probe(settings, credentials: CredentialsService, producer: RecaptchaTo
                 )
             ],
         )
-        async with httpx.AsyncClient(proxy=proxy_url, http2=True) as client:
-            response = await client.post(
-                url,
-                content=request.model_dump_json(exclude_none=True),
-                headers=api_headers(settings.flow_base_url, credentials.authorization, headers),
-                timeout=120.0,
-            )
+        try:
+            async with httpx.AsyncClient(proxy=proxy_url, http2=True) as client:
+                response = await client.post(
+                    url,
+                    content=request.model_dump_json(exclude_none=True),
+                    headers=api_headers(settings.flow_base_url, credentials.authorization, headers),
+                    timeout=120.0,
+                )
+        except (httpx.ProxyError, httpx.ConnectError, httpx.ReadTimeout) as e:
+            proxy_failures += 1
+            if proxy_failures > 5:
+                raise
+            logger.warning(f"{model}: {type(e).__name__} ({e}) — retrying in 10s ({proxy_failures}/5)")
+            await asyncio.sleep(10)
+            continue
         body = re.sub(r"\s+", " ", response.text)
         if response.status_code == 401 and not reauthenticated:
             logger.warning("HTTP 401 — the labs.google session token is stale, signing in again and retrying")

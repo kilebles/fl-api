@@ -12,7 +12,7 @@ Generation core for Google Flow (Veo video + image models): Dolphin Anty account
 
 ```
 src/
-├── core/        settings.py, errors.py, logger.py (loguru + flow-stat sink)
+├── core/        settings.py, errors.py, logger.py (loguru + flow-stat sink), db.py (Database: one async engine, Base)
 ├── accounts/    AccountInfo, ProxyInfo, AccountRepository (accounts/account_N/*.txt)
 ├── dolphin/     manager.py (DolphinAntyManager: start/rotate/proxies), local_api.py, public_api.py,
 │                cooldowns.py (per-account pauses: cooldown / image quota / video denied)
@@ -26,9 +26,13 @@ src/
 │                runner.py (JobRunner — passes), repository.py (jobs / job_files tables),
 │                sync.py (ResultSync — uploads results as they appear), queue.py (JobQueue — persistent, one job at a time),
 │                excel.py (xlsx → rows)
+├── prompts/     prompt generation ported from ../hdoc-prompts: models.py (I2VPrompt template, GeneratedPair),
+│                llm.py (LLMClient: Gemini gemini-* / OpenAI gpt-*, structured JSON, retries), generation.py
+│                (brief → template; template + paragraphs → pairs), builder.py (pure prompt/validation logic),
+│                scenario.py (.docx/.txt → paragraphs), xlsx.py, service.py (PromptService: templates + background runs)
 ├── storage/     objects.py (ObjectStore protocol: LocalObjectStore → /files/{key}, S3ObjectStore → presigned links)
-└── api/         app.py (create_app, bearer token), routes.py (/api/…), schemas.py
-scripts/         serve.py (web API), run_job.py (CLI, local output only), check_session.py, probe_image_model.py
+└── api/         app.py (create_app, bearer token), routes.py (/api/…), prompts.py (/api/prompts/…), schemas.py
+scripts/         serve.py (web API), import_prompt_templates.py (hdoc-prompts data/prompts/*.json → DB), run_job.py (CLI, local output only), check_session.py, probe_image_model.py
 tests/           fakes + tests for scheduler, runner, queue, session recovery
 ```
 
@@ -41,13 +45,15 @@ POST /api/jobs (JobRequest) → jobs table (queued) → JobQueue worker:
    JobOutput.missing() → BatchScheduler(sessions).run(work_items)   (or run_chain for f2v)
       worker per AccountSession: pick video (image ready) else image → session.make_image / submit_video
       → finish_video (poll + download) in the background → {name}.mp4 / {name}.jpg / {name}.skip
-   no progress in a pass → wait for the earliest cooldown if every account is paused, else STOPPED
+   no progress in a pass → wait for the earliest cooldown if every account is paused; while an account is on the
+   rolling image quota (hit counter, not the cooldown clock) → next pass in 15 min, up to ~26h; else STOPPED
    ResultSync (kicked on every change): upload jpg/mp4 → store key jobs/{id}/{name}, record in job_files;
    final results deleted locally at once, the folder at the end (kept if an upload failed)
 ```
 
 - A restart re-queues running jobs; `retry` re-queues stopped/failed/cancelled ones — only unfinished rows run.
 
+- `ACCOUNTS_ENABLED` limits jobs to some accounts (default: every account with a dolphin_id).
 - **Strategy.PARALLEL**: one `AccountSession` per account (single-account `DolphinAntyManager`); rotation restarts the same profile, an account on cooldown just stops working.
 - **Strategy.SEQUENTIAL**: one session over a manager with all accounts; rotation moves to the next account. f2v always runs this way.
 - Jobs run one at a time — they all drive the same Dolphin profiles.
@@ -70,7 +76,7 @@ POST /api/jobs (JobRequest) → jobs table (queued) → JobQueue worker:
 - **403**: pause 7–14s, then 30–60s; 3rd in a row → rotate; 2 such rotations on the same proxy → account cooldown (5m doubling, max 2h). `PUBLIC_ERROR_MODEL_ACCESS_DENIED` = plan lacks the model: pauses only videos (`mark_video_denied`, 30m doubling) or only images; no rotation.
 - **429**: `PER_MODEL_DAILY_QUOTA_REACHED` → video: account cooldown (max 4h) + rotation; image: image-only cooldown (`ImageQuotaError`), the account keeps making videos. `TOO_MUCH_TRAFFIC` → pause 2/5/10 min, no rotation. Others → 7/30/90s pause, 4th in a row rotates.
 - **400**: permanent skip (`.skip`).
-- Polling: `IP_PROHIBITED` → rotate; server `TIMED_OUT` twice on different rows → rotate, twice on the same row → skip.
+- Polling: `PUBLIC_ERROR_IP_INPUT_IMAGE` = the source image shows protected IP (logos, characters), not a proxy block → `InputImageRejectedError`: a generated image is deleted and made again once, then the row is skipped (static image: skip at once), no rotation. `IP_PROHIBITED` → rotate; server `TIMED_OUT` twice on different rows → rotate, twice on the same row → skip.
 - reCAPTCHA token timeout: wait once, then restart the browser. `RecaptchaInterfaceError`, `DiskFullError`, `DolphinNotRunningError` stop the job (`FATAL_ERRORS`).
 - Every `ROTATE_EVERY_GENERATIONS` videos the session rotates in the background.
 
@@ -98,6 +104,15 @@ accounts/account_N/
 `GET/POST /api/jobs` · `GET /api/jobs/{id}` (+ rows, queue position) · `GET /api/jobs/{id}/files` (presigned `url` / `download_url`) ·
 `POST /api/jobs/{id}/cancel|retry` · `DELETE /api/jobs/{id}` (with its objects) · `GET /api/events` (SSE `job` events) · `GET /api/accounts` · `GET /health` · `GET /files/{key}` (local storage only, unsigned, range requests).
 `API_TOKEN` → `Authorization: Bearer …` (or `?token=` for EventSource). serve.py disables uvicorn's loop setup: Playwright needs the proactor loop on Windows.
+
+## Prompts (`/api/prompts`)
+
+Brief (.txt/.docx) → `POST /templates` (Gemini `PROMPT_TEMPLATE_MODEL`, ~5–60 s, synchronous) → style template.
+Scenario (.docx/.txt) + template + model + pair_count → `POST /runs` → background run (rolling story summary in order,
+stock subjects for the whole scenario, then pairs per paragraph concurrently) → rows `{paragraph}.{pair}` with img/vid →
+`GET /runs/{id}/xlsx` (number, img_prompt, vid_prompt, stock_query_1..3, paragraph) or straight into an i2v job.
+Runs don't use the browser accounts: up to `PROMPT_PARALLEL_RUNS` at once; unfinished runs restart on API start.
+Keys: `GOOGLE_API_KEY`, `OPENAI_API_KEY` (the hdoc-prompts Google key is invalid; fl-api uses motion-aign's).
 
 ## Usage
 

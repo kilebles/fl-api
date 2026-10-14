@@ -1,4 +1,4 @@
-"""Jobs and their result files in a SQL database (SQLite locally, Postgres later — same code)."""
+"""Jobs and their result files in the database."""
 
 from collections import Counter
 from datetime import datetime
@@ -18,16 +18,11 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 
+from src.core.db import Base, Database
 from src.jobs.models import JobProgress, JobRequest, JobRow, JobState, JobStatus
 from src.jobs.modes import MODES, Mode, Strategy
-
-
-class Base(DeclarativeBase):
-    pass
 
 
 class JobRecord(Base):
@@ -75,20 +70,8 @@ KIND_BY_SUFFIX = {".jpg": "image", ".mp4": "video", ".skip": "skip"}
 
 
 class JobRepository:
-    def __init__(self, url: str) -> None:
-        self._engine: AsyncEngine = create_async_engine(url)
-        self._session = async_sessionmaker(self._engine, expire_on_commit=False)
-
-    async def init(self) -> None:
-        """Create the tables (and the SQLite file's folder)."""
-        parsed = make_url(self._engine.url)
-        if parsed.get_backend_name() == "sqlite" and parsed.database not in (None, "", ":memory:"):
-            Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
-        async with self._engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-
-    async def close(self) -> None:
-        await self._engine.dispose()
+    def __init__(self, db: Database) -> None:
+        self._session = db.session
 
     async def create(self, job_id: str, request: JobRequest) -> JobRecord:
         record = JobRecord(
@@ -167,6 +150,7 @@ class JobRepository:
             created_at=datetime.now(),
         )
         async with self._session() as session:
+            await session.execute(delete(JobFileRecord).where(JobFileRecord.job_id == job_id, JobFileRecord.name == name))
             session.add(record)
             await session.commit()
 

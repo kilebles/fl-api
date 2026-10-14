@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     # Storage
     accounts_dir: Path = Field(default=Path("accounts"), description="Directory with account_N/ folders")
+    accounts_enabled: list[str] = Field(default=[], description='Accounts jobs may use, e.g. ["account_1","account_2"]; empty = every account with a dolphin_id')
     output_dir: Path = Field(default=Path("output"), description="Root directory for job results")
     download_dir: Path = Field(default=Path("work/_tmp"), description="Scratch directory for downloads before they are renamed into a job folder")
     work_dir: Path = Field(default=Path("work"), description="API jobs: local work folders, removed once results are in the object store")
@@ -40,6 +41,12 @@ class Settings(BaseSettings):
     s3_access_key: str = Field(default="", description="S3 access key id")
     s3_secret_key: str = Field(default="", description="S3 secret access key")
     s3_url_ttl: int = Field(default=3600, description="Lifetime of presigned download links, seconds")
+
+    # LLM (prompt generation)
+    google_api_key: str = Field(default="", description="Gemini API key")
+    openai_api_key: str = Field(default="", description="OpenAI API key (gpt-* models)")
+    prompt_template_model: str = Field(default="gemini-2.5-flash", description="Model that extracts templates from briefs")
+    prompt_parallel_runs: int = Field(default=2, description="Prompt generation runs at once")
 
     # Web API
     api_token: str = Field(default="", description="Bearer token required by the web API; empty disables the check")

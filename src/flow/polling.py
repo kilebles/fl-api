@@ -4,7 +4,7 @@ import time
 import httpx
 from loguru import logger
 
-from src.core.errors import GenerationFilteredError, GenerationTimedOutError, IpProhibitedError
+from src.core.errors import GenerationFilteredError, GenerationTimedOutError, InputImageRejectedError, IpProhibitedError
 from src.core.settings import Settings
 from src.flow.http import api_headers
 from src.flow.models import MediaInfo
@@ -118,6 +118,12 @@ class PollingService:
                 error = media_status.get("error", {})
                 visibility = media_data.get("visibility", "")
                 error_msg = str(failure_reasons) + " " + str(error)
+                if "PUBLIC_ERROR_IP_INPUT_IMAGE" in str(error):
+                    logger.warning(
+                        f"Generation failed: source image rejected as protected intellectual property "
+                        f"(not a proxy problem). reasons={failure_reasons}, error={error}"
+                    )
+                    raise InputImageRejectedError(f"IP_INPUT_IMAGE: {failure_reasons or error}")
                 if "IP_PROHIBITED" in failure_reasons or "IP_PROHIBITED" in str(error):
                     logger.warning(
                         f"Generation failed: IP_PROHIBITED — proxy IP blocked. "
