@@ -30,8 +30,14 @@ src/
 │                llm.py (LLMClient: Gemini gemini-* / OpenAI gpt-*, structured JSON, retries), generation.py
 │                (brief → template; template + paragraphs → pairs), builder.py (pure prompt/validation logic),
 │                scenario.py (.docx/.txt → paragraphs), xlsx.py, service.py (PromptService: templates + background runs)
+├── infographics/ ported from ../motion-aign: main.py (CLI: .docx → subjects + Wikimedia images → scenario.json),
+│                categories.py (people / places / artifacts), services/ (Gemini detector, Wikidata, Wikimedia search with
+│                a 6s throttle, image relevance/selection — sync, stdlib logging), service.py (InfographicsService)
 ├── storage/     objects.py (ObjectStore protocol: LocalObjectStore → /files/{key}, S3ObjectStore → presigned links)
-└── api/         app.py (create_app, bearer token), routes.py (/api/…), prompts.py (/api/prompts/…), schemas.py
+└── api/         app.py (create_app, bearer token), routes.py (/api/…), prompts.py (/api/prompts/…),
+                 infographics.py (/api/infographics/…), schemas.py
+renderer/        Remotion project (PersonalityCard composition) + render.mjs (bundle once, one Chrome, images over a local
+                 HTTP server — jobs never share public/); `npm install` once, Chrome Headless Shell downloads on first render
 scripts/         serve.py (web API), import_prompt_templates.py (hdoc-prompts data/prompts/*.json → DB), run_job.py (CLI, local output only), check_session.py, probe_image_model.py
 tests/           fakes + tests for scheduler, runner, queue, session recovery
 ```
@@ -114,10 +120,19 @@ stock subjects for the whole scenario, then pairs per paragraph concurrently) �
 Runs don't use the browser accounts: up to `PROMPT_PARALLEL_RUNS` at once; unfinished runs restart on API start.
 Keys: `GOOGLE_API_KEY`, `OPENAI_API_KEY` (the hdoc-prompts Google key is invalid; fl-api uses motion-aign's).
 
+## Infographics (`/api/infographics`)
+
+Scenario .docx + categories → `POST /runs` → one run at a time, two subprocess stages with `PROGRESS` lines in
+`work/infographics/{id}/log.txt`: `python -m src.infographics.main` (searching: Gemini detects subjects, Wikidata years,
+Wikimedia images picked by Gemini; slow — Wikimedia 429s are waited out) then `node renderer/render.mjs plan.json`
+(rendering, ~1 min per 10 s card). Clips go to the store as they appear (`infographics/{id}/videos/`); a restart resumes
+(scenario.json present → no new search, uploaded clips are not rendered again). Remotion may need a company license for SaaS.
+
 ## Usage
 
 ```bash
 uv sync
+(cd renderer && npm install)          # once, for infographics
 uv run python scripts/serve.py
 uv run python scripts/run_job.py t2v path/to/rome_179.xlsx [--strategy sequential]
 uv run python scripts/check_session.py account_1 [--generate]

@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", description="OpenAI API key (gpt-* models)")
     prompt_template_model: str = Field(default="gemini-2.5-flash", description="Model that extracts templates from briefs")
     prompt_parallel_runs: int = Field(default=2, description="Prompt generation runs at once")
+    infographics_model: str = Field(default="gemini-2.5-flash", description="Gemini model of the infographics pipeline")
+    renderer_dir: Path = Field(default=Path("renderer"), description="Remotion project that renders infographic cards")
+    render_concurrency: int | None = Field(default=None, description="Chrome tabs per render (None = Remotion default; 1 on a small server)")
 
     # Web API
     api_token: str = Field(default="", description="Bearer token required by the web API; empty disables the check")

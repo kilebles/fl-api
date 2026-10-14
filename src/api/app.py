@@ -10,10 +10,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from loguru import logger
 
 from src.accounts.repository import AccountRepository
+from src.api.infographics import router as infographics_router
 from src.api.prompts import router as prompts_router
 from src.api.routes import router
 from src.core.db import Database
 from src.core.settings import Settings
+from src.infographics.service import InfographicsService
+from src.infographics.service import NotFoundError as InfographicNotFoundError
 from src.jobs.queue import InputNotFoundError, JobNotFoundError, JobQueue
 from src.jobs.repository import JobRepository
 from src.jobs.runner import JobRunner
@@ -51,11 +54,14 @@ def create_app(
         app.state.objects = store
         app.state.queue = queue
         app.state.prompts = prompts
+        app.state.infographics = infographics = InfographicsService(db, store, settings)
         await queue.start()
         await prompts.start()
+        await infographics.start()
         try:
             yield
         finally:
+            await infographics.stop()
             await prompts.stop()
             await queue.stop()
             await db.close()
@@ -77,6 +83,7 @@ def create_app(
     )
     app.include_router(router, dependencies=[Depends(check_token)])
     app.include_router(prompts_router, dependencies=[Depends(check_token)])
+    app.include_router(infographics_router, dependencies=[Depends(check_token)])
 
     @app.get("/files/{key:path}", include_in_schema=False)
     async def local_file(key: str, request: Request, download: str | None = None) -> FileResponse:
@@ -102,6 +109,10 @@ def create_app(
 
     @app.exception_handler(NotFoundError)
     async def _prompt_not_found(request: Request, exc: NotFoundError) -> JSONResponse:
+        return JSONResponse({"detail": f"{exc} not found"}, status_code=404)
+
+    @app.exception_handler(InfographicNotFoundError)
+    async def _infographic_not_found(request: Request, exc: InfographicNotFoundError) -> JSONResponse:
         return JSONResponse({"detail": f"{exc} not found"}, status_code=404)
 
     @app.exception_handler(LLMNotConfiguredError)
