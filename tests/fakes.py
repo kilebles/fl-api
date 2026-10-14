@@ -3,7 +3,11 @@
 import asyncio
 from pathlib import Path
 
-from src.core.errors import GenerationFilteredError, ImageQuotaError, VideoAccessDeniedError
+from src.core.errors import (
+    GenerationFilteredError,
+    ImageQuotaError,
+    VideoAccessDeniedError,
+)
 from src.engine.session import SubmittedVideo
 
 
@@ -76,3 +80,4 @@ class FakeSession:
         path.write_text(submitted.media_id)
         self.videos_made.append(submitted.media_id)
         return path
+

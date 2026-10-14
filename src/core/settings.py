@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,7 +24,26 @@ class Settings(BaseSettings):
     # Storage
     accounts_dir: Path = Field(default=Path("accounts"), description="Directory with account_N/ folders")
     output_dir: Path = Field(default=Path("output"), description="Root directory for job results")
-    download_dir: Path = Field(default=Path("output/_tmp"), description="Scratch directory for downloads before they are renamed into a job folder")
+    download_dir: Path = Field(default=Path("work/_tmp"), description="Scratch directory for downloads before they are renamed into a job folder")
+    work_dir: Path = Field(default=Path("work"), description="API jobs: local work folders, removed once results are in the object store")
+    database_url: str = Field(default="sqlite+aiosqlite:///data/fl-api.db", description="SQLAlchemy async URL of the job database")
+
+    # Result storage: "local" keeps files in storage_dir and serves them from the API; "s3" uses a bucket
+    storage: Literal["local", "s3"] = Field(default="local", description="Where inputs and results are kept")
+    storage_dir: Path = Field(default=Path("storage"), description="Local storage folder")
+    public_url: str = Field(default="http://127.0.0.1:8000", description="Base URL of this API in links to local files")
+
+    # S3 API (Cloudflare R2 in production, SeaweedFS locally), used with STORAGE=s3
+    s3_endpoint_url: str | None = Field(default=None, description="e.g. https://<account>.r2.cloudflarestorage.com or http://localhost:9000")
+    s3_region: str = Field(default="auto", description="'auto' for R2")
+    s3_bucket: str = Field(default="fl-api", description="Bucket for inputs and results")
+    s3_access_key: str = Field(default="", description="S3 access key id")
+    s3_secret_key: str = Field(default="", description="S3 secret access key")
+    s3_url_ttl: int = Field(default=3600, description="Lifetime of presigned download links, seconds")
+
+    # Web API
+    api_token: str = Field(default="", description="Bearer token required by the web API; empty disables the check")
+    cors_origins: list[str] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"], description="Origins of the web frontend")
 
     # Flow API
     api_url: str = Field(
@@ -71,8 +91,8 @@ class Settings(BaseSettings):
     flash_i2v_model_key: str = Field(default="abra_r2v_10s", description="Image-to-video model of the flash_i2v mode")
     f2v_model_key: str = Field(default="abra_t2v_10s", description="Frame-to-video model for f2v clips after the first one")
     image_model_name: str = Field(
-        default="GEM_PIX_2",
-        description="Image model for flowMedia:batchGenerateImages; NARWHAL retired 2026-10-05",
+        default="BELUGA",
+        description="Image model for flowMedia:batchGenerateImages; BELUGA = Nano Banana 2.1 in the Flow UI (GEM_PIX_2, HARBOR_SEAL also accepted; NARWHAL retired 2026-10-05)",
     )
 
     # Rotation

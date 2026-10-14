@@ -1,6 +1,7 @@
 """Rows from the .xlsx files the prompt step produced (same columns the Telegram bot accepted)."""
 
 from pathlib import Path
+from typing import BinaryIO
 
 from openpyxl import load_workbook
 
@@ -14,7 +15,7 @@ def _cell(row: tuple, col: int | None) -> str:
     return str(row[col]).strip()
 
 
-def load_rows(path: Path, mode: Mode) -> list[JobRow]:
+def load_rows(source: Path | BinaryIO, mode: Mode) -> list[JobRow]:
     """
     Read job rows from the first sheet.
 
@@ -25,7 +26,7 @@ def load_rows(path: Path, mode: Mode) -> list[JobRow]:
     Rows without a number or the needed prompts are left out.
     """
     spec = MODES[mode]
-    workbook = load_workbook(path, read_only=True)
+    workbook = load_workbook(source, read_only=True)
     try:
         sheet = workbook.active
         header = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())

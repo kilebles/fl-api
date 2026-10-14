@@ -1,4 +1,4 @@
-"""Runs one job: builds sessions for its strategy and repeats passes until the output folder is complete."""
+"""Runs one job: builds sessions for its strategy and repeats passes until every row is finished."""
 
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -33,7 +33,7 @@ class JobRunner:
     Runs jobs against the configured accounts.
 
     A job runs in passes: each pass gives the missing rows to the scheduler (or the f2v
-    chain). Rows that keep failing get a .skip marker, so every pass either makes
+    chain). Rows that keep failing are skipped, so every pass either makes
     progress or ends the job: when a pass changes nothing, the runner waits for the
     earliest account cooldown if every account is paused, otherwise it stops.
     """
@@ -44,13 +44,22 @@ class JobRunner:
         self._public_api = DolphinPublicApi(settings.anty_token)
         self._local_api = DolphinLocalApi(settings.anty_local_api)
 
-    async def run(self, spec: JobSpec, on_progress: ProgressCallback | None = None) -> tuple[JobState, JobProgress, str | None]:
-        """Run the job to the end; returns its final state, progress and a message."""
+    async def run(
+        self,
+        spec: JobSpec,
+        on_progress: ProgressCallback | None = None,
+        output: JobOutput | None = None,
+    ) -> tuple[JobState, JobProgress, str | None]:
+        """Run the job to the end; returns its final state, progress and a message.
+
+        `output` lets the caller share the result state (e.g. with files already moved to
+        the object store); by default it is read from `spec.output_dir`.
+        """
         accounts = self._accounts.active()
         if not accounts:
             raise NoAccountsError(f"No accounts with dolphin_id in {self._accounts.root}")
 
-        output = JobOutput(spec)
+        output = output or JobOutput(spec)
         output.directory.mkdir(parents=True, exist_ok=True)
         mode = MODES[spec.mode]
         model_key = spec.video_model_key or mode.video_model(self._settings)

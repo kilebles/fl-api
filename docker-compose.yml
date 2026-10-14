@@ -1,0 +1,13 @@
+# Local S3 for development (production uses Cloudflare R2). MinIO no longer publishes
+# images, so this is SeaweedFS; without an identities config its S3 API accepts any keys.
+services:
+  s3:
+    image: chrislusf/seaweedfs:latest
+    command: server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=1024 -volume.max=0
+    ports:
+      - "8333:8333"
+    volumes:
+      - s3:/data
+
+volumes:
+  s3:

@@ -39,7 +39,7 @@ def _find_direct_url(media: dict) -> str | None:
 class ImageGenerationService:
     """
     Image generation via flowMedia:batchGenerateImages (model from settings.image_model_name,
-    GEM_PIX_2 since 2026-10-05 when NARWHAL was retired) and download of the results.
+    BELUGA = Nano Banana 2.1 since 2026-10-13) and download of the results.
     """
 
     IMAGE_API_URL_TEMPLATE = API_BASE + "/projects/{project_id}/flowMedia:batchGenerateImages"

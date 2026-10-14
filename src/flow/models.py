@@ -186,7 +186,7 @@ class ImageRequestItem(BaseModel):
     clientContext: ClientContext
     imageAspectRatio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE"
     imageInputs: list[ImageInput] = Field(default_factory=list)
-    imageModelName: str = "GEM_PIX_2"
+    imageModelName: str = "BELUGA"
     seed: int = Field(ge=1, le=999999)
     structuredPrompt: StructuredPrompt
 

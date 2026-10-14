@@ -10,20 +10,8 @@ uv run python scripts/run_job.py i2v i2v_rome_220.xlsx
 uv run pytest
 ```
 
-Programmatic use (what a web API wraps):
+Web API (results in `storage/` by default; `STORAGE=s3` for R2, `docker compose up -d` for a local S3):
 
-```python
-from src.accounts.repository import AccountRepository
-from src.core.settings import get_settings
-from src.jobs.models import JobRow, JobSpec
-from src.jobs.modes import Mode
-from src.jobs.queue import JobQueue
-from src.jobs.runner import JobRunner
-
-settings = get_settings()
-queue = JobQueue(JobRunner(settings, AccountRepository(settings.accounts_dir)))
-queue.start()                                   # inside the running event loop
-status = queue.submit(JobSpec(mode=Mode.T2V, rows=[JobRow(name="1", prompt="...")], output_dir=settings.output_dir / "job1"))
-queue.get(status.id)                            # state + progress
-queue.cancel(status.id)
+```bash
+uv run python scripts/serve.py          # http://127.0.0.1:8000/docs
 ```

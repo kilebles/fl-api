@@ -1,11 +1,12 @@
 # fl-api
 
-Generation core for Google Flow (Veo video + image models): Dolphin Anty accounts, reCAPTCHA browser sessions, rotation, and ready-made batch modes. Extracted from `../flow-api` (Telegram bot) on 2026-10-07 without the bot, prompt generation, Yandex Disk, stock images and WARP. A web API for the site will wrap `JobQueue`.
+Generation core for Google Flow (Veo video + image models): Dolphin Anty accounts, reCAPTCHA browser sessions, rotation, and ready-made batch modes. Extracted from `../flow-api` (Telegram bot) on 2026-10-07 without the bot, prompt generation, Yandex Disk, stock images and WARP. A FastAPI web API wraps `JobQueue`; results go to `storage/` served by the API (`STORAGE=local`, default, for running on the Mac) or to an S3 bucket (`STORAGE=s3`, Cloudflare R2 in production); a SaaS frontend comes next.
 
 ## Tech Stack
 
 - **Python 3.12+**, **uv**
 - **httpx** (async, http2), **playwright** (CDP to Dolphin Anty), **pydantic / pydantic-settings**, **loguru**, **openpyxl** (xlsx input)
+- **FastAPI** + uvicorn, **SQLAlchemy async** (SQLite now, Postgres later), **boto3** (S3 API: R2 in prod, SeaweedFS from docker-compose locally)
 
 ## Layout
 
@@ -20,22 +21,32 @@ src/
 │                browser/recaptcha.py (RecaptchaTokenProducer), human_behavior.py, timing.py
 ├── engine/      session.py (AccountSession — one browser session + the whole recovery policy),
 │                scheduler.py (BatchScheduler — image/video queues, workers), chain.py (f2v), frames.py (ffmpeg)
-└── jobs/        modes.py (Mode, Strategy, MODES), models.py (JobSpec, JobRow, JobState, JobStatus),
-                 storage.py (JobOutput — output folder = job state), runner.py (JobRunner — passes),
-                 queue.py (JobQueue — one job at a time), excel.py (xlsx → rows)
-scripts/         run_job.py (CLI), check_session.py (session smoke test), probe_image_model.py
+├── jobs/        modes.py (Mode, Strategy, MODES), models.py (JobRequest, JobSpec, JobRow, JobState, JobStatus),
+│                storage.py (JobOutput — results in the work folder + names already in the store),
+│                runner.py (JobRunner — passes), repository.py (jobs / job_files tables),
+│                sync.py (ResultSync — uploads results as they appear), queue.py (JobQueue — persistent, one job at a time),
+│                excel.py (xlsx → rows)
+├── storage/     objects.py (ObjectStore protocol: LocalObjectStore → /files/{key}, S3ObjectStore → presigned links)
+└── api/         app.py (create_app, bearer token), routes.py (/api/…), schemas.py
+scripts/         serve.py (web API), run_job.py (CLI, local output only), check_session.py, probe_image_model.py
 tests/           fakes + tests for scheduler, runner, queue, session recovery
 ```
 
 ## Flow of a job
 
 ```
-JobQueue.submit(JobSpec) → JobRunner.run → passes:
+POST /api/jobs (JobRequest) → jobs table (queued) → JobQueue worker:
+   work/{id}/: download avatar/static image, restore skips + images/clips of unfinished rows from the store
+   JobRunner.run(JobSpec, output=JobOutput(stored=names in job_files)) → passes:
    JobOutput.missing() → BatchScheduler(sessions).run(work_items)   (or run_chain for f2v)
       worker per AccountSession: pick video (image ready) else image → session.make_image / submit_video
       → finish_video (poll + download) in the background → {name}.mp4 / {name}.jpg / {name}.skip
    no progress in a pass → wait for the earliest cooldown if every account is paused, else STOPPED
+   ResultSync (kicked on every change): upload jpg/mp4 → store key jobs/{id}/{name}, record in job_files;
+   final results deleted locally at once, the folder at the end (kept if an upload failed)
 ```
+
+- A restart re-queues running jobs; `retry` re-queues stopped/failed/cancelled ones — only unfinished rows run.
 
 - **Strategy.PARALLEL**: one `AccountSession` per account (single-account `DolphinAntyManager`); rotation restarts the same profile, an account on cooldown just stops working.
 - **Strategy.SEQUENTIAL**: one session over a manager with all accounts; rotation moves to the next account. f2v always runs this way.
@@ -81,10 +92,18 @@ accounts/account_N/
 
 `MONITOR_URL` enables the flow-stat sink (`../flow-stat`); events carry `event_type`, `account`, `proxy` via `logger.bind`. One `success` event per saved file.
 
+## Web API (`scripts/serve.py`)
+
+`GET /api/modes` · `POST /api/uploads` (picture → key) · `POST /api/rows/xlsx` (xlsx + mode → rows) ·
+`GET/POST /api/jobs` · `GET /api/jobs/{id}` (+ rows, queue position) · `GET /api/jobs/{id}/files` (presigned `url` / `download_url`) ·
+`POST /api/jobs/{id}/cancel|retry` · `DELETE /api/jobs/{id}` (with its objects) · `GET /api/events` (SSE `job` events) · `GET /api/accounts` · `GET /health` · `GET /files/{key}` (local storage only, unsigned, range requests).
+`API_TOKEN` → `Authorization: Bearer …` (or `?token=` for EventSource). serve.py disables uvicorn's loop setup: Playwright needs the proactor loop on Windows.
+
 ## Usage
 
 ```bash
 uv sync
+uv run python scripts/serve.py
 uv run python scripts/run_job.py t2v path/to/rome_179.xlsx [--strategy sequential]
 uv run python scripts/check_session.py account_1 [--generate]
 uv run pytest

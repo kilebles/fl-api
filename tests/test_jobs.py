@@ -8,10 +8,11 @@ from src.accounts.repository import AccountRepository
 from src.core.settings import Settings
 from src.engine import scheduler
 from src.jobs.excel import load_rows
-from src.jobs.models import JobRow, JobSpec, JobState
+from src.jobs.models import JobRequest, JobRow, JobSpec, JobState, JobStatus
 from src.jobs.modes import Mode
 from src.jobs.runner import JobRunner
 from src.jobs.storage import JobOutput
+from src.storage.objects import LocalObjectStore
 from tests.fakes import FakeSession
 
 
@@ -126,25 +127,149 @@ async def test_f2v_chain_feeds_last_good_frame(tmp_path: Path, monkeypatch):
     assert session.model_keys[0] == "abra_t2v_10s" and session.model_keys[1] is None
 
 
-async def test_queue_runs_and_cancels(tmp_path: Path, monkeypatch):
+async def _queue(tmp_path: Path, runner: JobRunner):
+    from src.jobs.queue import JobQueue
+    from src.jobs.repository import JobRepository
+
+    repo = JobRepository(f"sqlite+aiosqlite:///{tmp_path / 'db' / 'jobs.db'}")
+    await repo.init()
+    store = LocalObjectStore(Settings(_env_file=None, storage_dir=tmp_path / "bucket"))
+    return JobQueue(runner, repo, store, tmp_path / "work"), repo, store
+
+
+def _keys(store: LocalObjectStore) -> set[str]:
+    return {p.relative_to(store.root).as_posix() for p in store.root.rglob("*") if p.is_file()}
+
+
+async def _until_finished(queue, job_id: str) -> JobStatus:
     import asyncio
 
-    from src.jobs.queue import JobQueue
+    for _ in range(200):
+        status = await queue.get(job_id)
+        if status.state.finished:
+            return status
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish: {status}")
+
+
+async def test_queue_runs_stores_results_and_cancels(tmp_path: Path, monkeypatch):
+    session = FakeSession("a", tmp_path / "tmp")
+    queue, repo, store = await _queue(tmp_path, _runner_with(tmp_path, monkeypatch, [session]))
+    await queue.start()
+    rows = [JobRow(name="1", prompt="p", image_prompt="i")]
+    first = await queue.submit(JobRequest(mode=Mode.I2V, rows=rows))
+    second = await queue.submit(JobRequest(mode=Mode.T2V, rows=[JobRow(name="1", prompt="p")]))
+    assert await queue.cancel(second.id)
+
+    status = await _until_finished(queue, first.id)
+    await queue.stop()
+
+    assert status.state is JobState.DONE and status.progress.images_done == 1 and status.progress.videos_done == 1
+    assert (await queue.get(second.id)).state is JobState.CANCELLED
+    assert _keys(store) == {f"jobs/{first.id}/1.jpg", f"jobs/{first.id}/1.mp4"}
+    assert not (tmp_path / "work" / first.id).exists()
+    await repo.close()
+
+
+async def test_retry_restores_images_and_runs_only_missing_rows(tmp_path: Path, monkeypatch):
+    import asyncio
+
+    session = FakeSession("a", tmp_path / "tmp", videos=False)
+    runner = _runner_with(tmp_path, monkeypatch, [session])
+    queue, repo, _ = await _queue(tmp_path, runner)
+    await queue.start()
+    rows = [JobRow(name=str(i), prompt=f"p{i}", image_prompt=f"i{i}") for i in range(2)]
+    job = await queue.submit(JobRequest(mode=Mode.I2V, rows=rows))
+    for _ in range(200):
+        if len(session.images_made) == 2:
+            break
+        await asyncio.sleep(0.02)
+    assert await queue.cancel(job.id)
+
+    status = await _until_finished(queue, job.id)
+    assert status.state is JobState.CANCELLED and status.progress.images_done == 2 and status.progress.videos_done == 0
+    assert not (tmp_path / "work" / job.id).exists()
+
+    session._videos = True
+    assert await queue.retry(job.id)
+    status = await _until_finished(queue, job.id)
+    await queue.stop()
+
+    assert status.state is JobState.DONE and status.progress.videos_done == 2
+    assert session.images_made == ["i0", "i1"]
+    assert sorted(p.name for p in session.sources) == ["0.jpg", "1.jpg"]
+    await repo.close()
+
+
+async def test_queue_requeues_job_interrupted_by_stop(tmp_path: Path, monkeypatch):
+    import asyncio
 
     session = FakeSession("a", tmp_path / "tmp")
     runner = _runner_with(tmp_path, monkeypatch, [session])
-    queue = JobQueue(runner)
-    queue.start()
-    first = queue.submit(JobSpec(mode=Mode.T2V, rows=[JobRow(name="1", prompt="p")], output_dir=tmp_path / "a"))
-    second = queue.submit(JobSpec(mode=Mode.T2V, rows=[JobRow(name="1", prompt="p")], output_dir=tmp_path / "b"))
-    assert queue.cancel(second.id)
+    started = asyncio.Event()
 
-    for _ in range(100):
-        if queue.get(first.id).state.finished:
-            break
-        await asyncio.sleep(0.02)
+    async def slow_run(spec, on_progress=None, output=None):
+        started.set()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(runner, "run", slow_run)
+    queue, repo, _ = await _queue(tmp_path, runner)
+    await queue.start()
+    job = await queue.submit(JobRequest(mode=Mode.T2V, rows=[JobRow(name="1", prompt="p")]))
+    await asyncio.wait_for(started.wait(), 2)
     await queue.stop()
 
-    assert queue.get(first.id).state is JobState.DONE
-    assert queue.get(second.id).state is JobState.CANCELLED
-    assert not (tmp_path / "b").exists()
+    assert (await queue.get(job.id)).state is JobState.QUEUED
+    await repo.close()
+
+
+def test_api_flow(tmp_path: Path, monkeypatch):
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from src.api.app import create_app
+
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'db' / 'jobs.db'}",
+        work_dir=tmp_path / "work",
+        api_token="secret",
+        storage_dir=tmp_path / "bucket",
+    )
+    store = LocalObjectStore(settings)
+    runner = _runner_with(tmp_path, monkeypatch, [FakeSession("a", tmp_path / "tmp")])
+    auth = {"Authorization": "Bearer secret"}
+
+    with TestClient(create_app(settings, objects=store, runner=runner)) as client:
+        assert client.get("/api/jobs").status_code == 401
+        assert {m["id"] for m in client.get("/api/modes", headers=auth).json()} == set(Mode)
+
+        upload = client.post("/api/uploads", headers=auth, files={"file": ("face.png", b"png")}).json()
+        bad = client.post("/api/jobs", headers=auth, json={"mode": "i2i2v", "rows": [{"name": "1", "prompt": "p", "image_prompt": "i"}]})
+        assert bad.status_code == 422
+
+        job = client.post(
+            "/api/jobs",
+            headers=auth,
+            json={"mode": "i2i2v", "title": "test", "avatar": upload["key"], "rows": [{"name": "1", "prompt": "p", "image_prompt": "i"}]},
+        ).json()
+        for _ in range(200):
+            detail = client.get(f"/api/jobs/{job['id']}", headers=auth).json()
+            if detail["state"] == "done":
+                break
+            time.sleep(0.02)
+
+        assert detail["state"] == "done" and detail["rows"][0]["name"] == "1"
+        files = client.get(f"/api/jobs/{job['id']}/files", headers=auth).json()
+        assert {f["name"] for f in files} == {"1.jpg", "1.mp4"}
+        video = next(f for f in files if f["name"] == "1.mp4")
+        assert video["url"] == f"http://127.0.0.1:8000/files/jobs/{job['id']}/1.mp4"
+        path = video["url"].removeprefix("http://127.0.0.1:8000")
+        assert client.get(path, headers={"Range": "bytes=0-1"}).status_code == 206
+        assert "attachment" in client.get(video["download_url"].removeprefix("http://127.0.0.1:8000")).headers["content-disposition"]
+        assert client.get("/files/../pyproject.toml").status_code == 404
+        assert client.post(f"/api/jobs/{job['id']}/retry", headers=auth).status_code == 409
+        assert client.delete(f"/api/jobs/{job['id']}", headers=auth).status_code == 204
+        assert client.get(f"/api/jobs/{job['id']}", headers=auth).status_code == 404
+        assert not any(k.startswith("jobs/") for k in _keys(store))
