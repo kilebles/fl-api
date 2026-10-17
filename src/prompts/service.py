@@ -1,19 +1,23 @@
 """Prompt templates and generation runs: stored in the database, runs execute in the background."""
 
 import asyncio
+import json
 import uuid
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import JSON, DateTime, Integer, String, Text, delete, select, update
+from sqlalchemy import JSON, DateTime, Integer, String, Text, delete, func, select, update
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db import Base, Database
 from src.prompts.generation import generate_pairs, parse_template
 from src.prompts.llm import LLMClient
 from src.prompts.models import GENERATION_MODELS, GeneratedPair, I2VPrompt
+
+DEFAULT_TEMPLATES = Path(__file__).with_name("default_templates.json")
 
 
 class RunState(StrEnum):
@@ -80,6 +84,20 @@ class PromptService:
 
     async def start(self) -> None:
         async with self._session() as session:
+            count = await session.scalar(select(func.count()).select_from(PromptTemplateRecord))
+            if not count and DEFAULT_TEMPLATES.is_file():
+                items = json.loads(DEFAULT_TEMPLATES.read_text(encoding="utf-8"))
+                for item in items:
+                    session.add(
+                        PromptTemplateRecord(
+                            id=item["id"],
+                            title=item["title"],
+                            data=item["data"],
+                            created_at=datetime.now(),
+                        )
+                    )
+                await session.commit()
+                logger.info(f"[prompts] seeded {len(items)} default prompt templates")
             result = await session.scalars(
                 select(PromptRunRecord.id).where(PromptRunRecord.state.in_([RunState.QUEUED.value, RunState.RUNNING.value]))
             )
