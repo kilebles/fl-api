@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
-from sqlalchemy.engine import make_url
+from loguru import logger
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -23,6 +25,20 @@ class Database:
             Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_add_missing_columns)
 
     async def close(self) -> None:
         await self.engine.dispose()
+
+
+def _add_missing_columns(conn: Connection) -> None:
+    """Additive migration: columns added to a model later are added to its existing table (nullable)."""
+    inspector = inspect(conn)
+    for table in Base.metadata.sorted_tables:
+        existing = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            kind = column.type.compile(dialect=conn.dialect)
+            conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {kind}'))
+            logger.info(f"[db] added column {table.name}.{column.name}")

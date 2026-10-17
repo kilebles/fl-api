@@ -69,6 +69,7 @@ class JobRequest(BaseModel):
     mode: Mode
     rows: list[JobRow]
     title: str | None = Field(default=None, max_length=200)
+    project_id: str | None = Field(default=None, max_length=32)
     strategy: Strategy = Strategy.PARALLEL
     static_image: str | None = Field(default=None, description="i2v: key of the picture used for every video")
     avatar: str | None = Field(default=None, description="i2i2v: key of the reference picture")
@@ -108,6 +109,7 @@ class JobProgress(BaseModel):
 class JobStatus(BaseModel):
     id: str
     title: str | None = None
+    project_id: str | None = None
     mode: Mode
     strategy: Strategy
     state: JobState = JobState.QUEUED

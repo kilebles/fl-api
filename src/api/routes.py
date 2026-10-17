@@ -82,8 +82,8 @@ async def rows_from_xlsx(file: UploadFile, mode: Annotated[Mode, Form()]) -> Row
 
 
 @router.get("/jobs")
-async def list_jobs(queue: Queue, limit: int = 100) -> list[JobStatus]:
-    return await queue.recent(min(max(limit, 1), 500))
+async def list_jobs(queue: Queue, limit: int = 100, project_id: str | None = None) -> list[JobStatus]:
+    return await queue.recent(min(max(limit, 1), 500), project_id)
 
 
 @router.post("/jobs", status_code=201)

@@ -80,8 +80,8 @@ class JobQueue:
     async def get(self, job_id: str) -> JobStatus:
         return await self._repo.status(await self._record(job_id))
 
-    async def recent(self, limit: int = 100) -> list[JobStatus]:
-        return await self._repo.statuses(await self._repo.recent(limit))
+    async def recent(self, limit: int = 100, project_id: str | None = None) -> list[JobStatus]:
+        return await self._repo.statuses(await self._repo.recent(limit, project_id))
 
     async def record(self, job_id: str) -> JobRecord:
         return await self._record(job_id)

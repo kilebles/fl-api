@@ -54,6 +54,7 @@ class InfographicRunRecord(Base):
     __tablename__ = "infographic_runs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    project_id: Mapped[str | None] = mapped_column(String(32), index=True)
     scenario_name: Mapped[str] = mapped_column(String(300))
     scenario_key: Mapped[str] = mapped_column(String(400))
     categories: Mapped[list[str]] = mapped_column(JSON)
@@ -128,9 +129,12 @@ class InfographicsService:
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
 
-    async def runs(self, limit: int = 100) -> list[InfographicRunRecord]:
+    async def runs(self, limit: int = 100, project_id: str | None = None) -> list[InfographicRunRecord]:
+        query = select(InfographicRunRecord).order_by(InfographicRunRecord.created_at.desc()).limit(limit)
+        if project_id is not None:
+            query = query.where(InfographicRunRecord.project_id == project_id)
         async with self._session() as session:
-            return list(await session.scalars(select(InfographicRunRecord).order_by(InfographicRunRecord.created_at.desc()).limit(limit)))
+            return list(await session.scalars(query))
 
     async def run(self, run_id: str) -> InfographicRunRecord:
         async with self._session() as session:
@@ -139,12 +143,15 @@ class InfographicsService:
             raise NotFoundError(f"infographic run {run_id}")
         return record
 
-    async def create(self, scenario_name: str, content: bytes, categories: list[str], one_per_person: bool) -> InfographicRunRecord:
+    async def create(
+        self, scenario_name: str, content: bytes, categories: list[str], one_per_person: bool, project_id: str | None = None
+    ) -> InfographicRunRecord:
         run_id = uuid.uuid4().hex[:12]
         scenario_key = _key(run_id, "scenario.docx")
         await self._objects.put(content, scenario_key, "scenario.docx")
         record = InfographicRunRecord(
             id=run_id,
+            project_id=project_id,
             scenario_name=scenario_name,
             scenario_key=scenario_key,
             categories=categories,

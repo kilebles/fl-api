@@ -41,6 +41,7 @@ class Card(BaseModel):
 
 class RunSummary(BaseModel):
     id: str
+    project_id: str | None
     scenario_name: str
     categories: list[str]
     one_per_person: bool
@@ -60,6 +61,7 @@ class RunDetail(RunSummary):
 def _summary(record: InfographicRunRecord) -> dict:
     return {
         "id": record.id,
+        "project_id": record.project_id,
         "scenario_name": record.scenario_name,
         "categories": record.categories,
         "one_per_person": record.one_per_person,
@@ -79,8 +81,8 @@ async def categories() -> list[Category]:
 
 
 @router.get("/runs")
-async def list_runs(service: Service) -> list[RunSummary]:
-    return [RunSummary(**_summary(r)) for r in await service.runs()]
+async def list_runs(service: Service, project_id: str | None = None) -> list[RunSummary]:
+    return [RunSummary(**_summary(r)) for r in await service.runs(project_id=project_id)]
 
 
 @router.post("/runs", status_code=201)
@@ -89,6 +91,7 @@ async def create_run(
     file: UploadFile,
     categories: Annotated[str, Form()] = "people",
     one_per_person: Annotated[bool, Form()] = False,
+    project_id: Annotated[str | None, Form()] = None,
 ) -> RunSummary:
     """Find the subjects of a scenario (.docx) and render a card for each; takes from minutes to hours."""
     name = file.filename or "scenario.docx"
@@ -101,7 +104,7 @@ async def create_run(
     data = await file.read(MAX_DOC_BYTES + 1)
     if len(data) > MAX_DOC_BYTES:
         raise HTTPException(413, "file is larger than 10 MB")
-    record = await service.create(PurePosixPath(name).stem, data, chosen, one_per_person)
+    record = await service.create(PurePosixPath(name).stem, data, chosen, one_per_person, project_id or None)
     return RunSummary(**_summary(record))
 
 

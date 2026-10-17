@@ -40,6 +40,7 @@ class PromptRunRecord(Base):
     __tablename__ = "prompt_runs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    project_id: Mapped[str | None] = mapped_column(String(32), index=True)
     template_id: Mapped[str] = mapped_column(String(32))
     template_title: Mapped[str] = mapped_column(String(300))
     model: Mapped[str] = mapped_column(String(64))
@@ -147,9 +148,12 @@ class PromptService:
 
     # Runs
 
-    async def runs(self, limit: int = 100) -> list[PromptRunRecord]:
+    async def runs(self, limit: int = 100, project_id: str | None = None) -> list[PromptRunRecord]:
+        query = select(PromptRunRecord).order_by(PromptRunRecord.created_at.desc()).limit(limit)
+        if project_id is not None:
+            query = query.where(PromptRunRecord.project_id == project_id)
         async with self._session() as session:
-            return list(await session.scalars(select(PromptRunRecord).order_by(PromptRunRecord.created_at.desc()).limit(limit)))
+            return list(await session.scalars(query))
 
     async def run(self, run_id: str) -> PromptRunRecord:
         async with self._session() as session:
@@ -158,7 +162,9 @@ class PromptService:
             raise NotFoundError(f"run {run_id}")
         return record
 
-    async def create_run(self, template_id: str, model: str, pair_count: int, scenario_name: str, paragraphs: list[str]) -> PromptRunRecord:
+    async def create_run(
+        self, template_id: str, model: str, pair_count: int, scenario_name: str, paragraphs: list[str], project_id: str | None = None
+    ) -> PromptRunRecord:
         if model not in {m for m, _ in GENERATION_MODELS}:
             raise ValueError(f"unknown model: {model}")
         if not paragraphs:
@@ -169,6 +175,7 @@ class PromptService:
             raise ValueError(f"pair count must be 1..{available}")
         record = PromptRunRecord(
             id=uuid.uuid4().hex[:12],
+            project_id=project_id,
             template_id=template_id,
             template_title=template.title,
             model=model,

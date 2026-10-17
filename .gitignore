@@ -5,12 +5,12 @@ __pycache__/
 .ruff_cache/
 
 .env
-accounts/
-logs/
-output/
+/accounts/
+/logs/
+/output/
 
-data/
-work/
+/data/
+/work/
 
-storage/
-.playwright-mcp/
+/storage/
+/.playwright-mcp/

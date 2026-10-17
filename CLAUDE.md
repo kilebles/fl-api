@@ -12,7 +12,10 @@ Generation core for Google Flow (Veo video + image models): Dolphin Anty account
 
 ```
 src/
-├── core/        settings.py, errors.py, logger.py (loguru + flow-stat sink), db.py (Database: one async engine, Base)
+├── core/        settings.py, errors.py, logger.py (loguru + flow-stat sink), db.py (Database: one async engine, Base,
+│                additive migration — new model columns are added to existing tables on start)
+├── projects/    service.py (ProjectService: projects = «Ролики», title + style line; jobs/prompt runs/infographic runs carry project_id)
+├── avatars/     service.py (AvatarService: name, appearance text, reference image keys; i2i2v uses the first key)
 ├── accounts/    AccountInfo, ProxyInfo, AccountRepository (accounts/account_N/*.txt)
 ├── dolphin/     manager.py (DolphinAntyManager: start/rotate/proxies), local_api.py, public_api.py,
 │                cooldowns.py (per-account pauses: cooldown / image quota / video denied)
@@ -35,7 +38,7 @@ src/
 │                a 6s throttle, image relevance/selection — sync, stdlib logging), service.py (InfographicsService)
 ├── storage/     objects.py (ObjectStore protocol: LocalObjectStore → /files/{key}, S3ObjectStore → presigned links)
 └── api/         app.py (create_app, bearer token), routes.py (/api/…), prompts.py (/api/prompts/…),
-                 infographics.py (/api/infographics/…), schemas.py
+                 infographics.py (/api/infographics/…), library.py (/api/projects, /api/avatars), schemas.py
 renderer/        Remotion project (PersonalityCard composition) + render.mjs (bundle once, one Chrome, images over a local
                  HTTP server — jobs never share public/); `npm install` once, Chrome Headless Shell downloads on first render
 scripts/         serve.py (web API), import_prompt_templates.py (hdoc-prompts data/prompts/*.json → DB), run_job.py (CLI, local output only), check_session.py, probe_image_model.py

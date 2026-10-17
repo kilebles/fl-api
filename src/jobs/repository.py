@@ -30,6 +30,7 @@ class JobRecord(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     title: Mapped[str | None] = mapped_column(String(200))
+    project_id: Mapped[str | None] = mapped_column(String(32), index=True)
     mode: Mapped[str] = mapped_column(String(16))
     strategy: Mapped[str] = mapped_column(String(16))
     state: Mapped[str] = mapped_column(String(16), index=True)
@@ -77,6 +78,7 @@ class JobRepository:
         record = JobRecord(
             id=job_id,
             title=request.title,
+            project_id=request.project_id,
             mode=request.mode.value,
             strategy=request.strategy.value,
             state=JobState.QUEUED.value,
@@ -97,10 +99,12 @@ class JobRepository:
         async with self._session() as session:
             return await session.get(JobRecord, job_id)
 
-    async def recent(self, limit: int = 100) -> list[JobRecord]:
+    async def recent(self, limit: int = 100, project_id: str | None = None) -> list[JobRecord]:
+        query = select(JobRecord).order_by(JobRecord.created_at.desc()).limit(limit)
+        if project_id is not None:
+            query = query.where(JobRecord.project_id == project_id)
         async with self._session() as session:
-            result = await session.scalars(select(JobRecord).order_by(JobRecord.created_at.desc()).limit(limit))
-            return list(result)
+            return list(await session.scalars(query))
 
     async def next_queued(self) -> JobRecord | None:
         async with self._session() as session:
@@ -190,6 +194,7 @@ def to_status(record: JobRecord, counts: Counter[str]) -> JobStatus:
     return JobStatus(
         id=record.id,
         title=record.title,
+        project_id=record.project_id,
         mode=Mode(record.mode),
         strategy=Strategy(record.strategy),
         state=JobState(record.state),

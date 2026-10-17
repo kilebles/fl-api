@@ -52,6 +52,7 @@ class TemplatePatch(BaseModel):
 
 class RunSummary(BaseModel):
     id: str
+    project_id: str | None
     template_id: str
     template_title: str
     model: str
@@ -85,6 +86,7 @@ def _template(record: PromptTemplateRecord, detail: bool = False) -> TemplateSum
 def _run(record: PromptRunRecord, detail: bool = False) -> RunSummary:
     fields = {
         "id": record.id,
+        "project_id": record.project_id,
         "template_id": record.template_id,
         "template_title": record.template_title,
         "model": record.model,
@@ -145,8 +147,8 @@ async def delete_template(template_id: str, prompts: Prompts) -> None:
 
 
 @router.get("/runs")
-async def list_runs(prompts: Prompts) -> list[RunSummary]:
-    return [_run(r) for r in await prompts.runs()]
+async def list_runs(prompts: Prompts, project_id: str | None = None) -> list[RunSummary]:
+    return [_run(r) for r in await prompts.runs(project_id=project_id)]
 
 
 @router.post("/runs", status_code=201)
@@ -156,12 +158,13 @@ async def create_run(
     template_id: Annotated[str, Form()],
     model: Annotated[str, Form()],
     pair_count: Annotated[int, Form()],
+    project_id: Annotated[str | None, Form()] = None,
 ) -> RunSummary:
     """Generate prompt pairs for a scenario (.docx / .txt) in the background."""
     name = file.filename or "scenario.txt"
     try:
         paragraphs = await asyncio.to_thread(parse_scenario, name, await _read(file))
-        record = await prompts.create_run(template_id, model, pair_count, PurePosixPath(name).stem, paragraphs)
+        record = await prompts.create_run(template_id, model, pair_count, PurePosixPath(name).stem, paragraphs, project_id or None)
     except (ValueError, UnicodeDecodeError) as e:
         raise HTTPException(422, str(e)) from None
     return _run(record)
