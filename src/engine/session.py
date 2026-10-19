@@ -2,6 +2,7 @@
 
 import asyncio
 import random
+import shutil
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
@@ -330,9 +331,9 @@ class AccountSession:
             raise RuntimeError(f"[{index}] No media returned from image generation")
         dest.parent.mkdir(parents=True, exist_ok=True)
         downloaded = await self._image.download(
-            media_ids[0], dict(self._downloader.cookies), output_dir=dest.parent, proxy_url=used_proxy[0]
+            media_ids[0], dict(self._downloader.cookies), proxy_url=used_proxy[0]
         )
-        downloaded.replace(dest)
+        shutil.move(str(downloaded), str(dest))
         return dest
 
     # ── request + recovery policy ─────────────────────────────────────────

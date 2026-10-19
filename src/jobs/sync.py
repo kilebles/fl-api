@@ -75,9 +75,10 @@ class ResultSync:
             directory = self._output.directory
             if not directory.is_dir():
                 return
+            valid_rows = {r.name for r in self._output._spec.rows}
             changed = False
             for path in sorted(directory.iterdir()):
-                if not path.is_file() or path.suffix not in KIND_BY_SUFFIX:
+                if not path.is_file() or path.suffix not in KIND_BY_SUFFIX or path.stem not in valid_rows:
                     continue
                 mtime = path.stat().st_mtime_ns
                 if path.name in self._output.stored and self._synced.get(path.name, mtime) == mtime:

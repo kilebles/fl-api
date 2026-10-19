@@ -5,10 +5,12 @@ from pathlib import PurePosixPath
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.infographics.categories import CATEGORIES
 from src.infographics.service import InfographicRunRecord, InfographicsService
+from src.storage.zip_stream import stream_zip, zip_headers
 
 MAX_DOC_BYTES = 10 * 1024**2
 
@@ -127,6 +129,27 @@ async def get_run(run_id: str, service: Service, request: Request) -> RunDetail:
         for e in record.entries
     ]
     return RunDetail(**_summary(record), cards=cards)
+
+
+@router.get("/runs/{run_id}/zip")
+async def run_zip(run_id: str, service: Service, request: Request) -> StreamingResponse:
+    """Stream all rendered card videos (or source images) of an infographic run as a ZIP archive."""
+    record = await service.run(run_id)
+    items: list[tuple[str, str]] = []
+    for e in record.entries:
+        safe_name = str(e.get("name", "")).replace("/", "-").replace("\\", "-").strip()
+        if e.get("video_key"):
+            items.append((f"{e['id']} {safe_name}.mp4", e["video_key"]))
+        elif e.get("image_key"):
+            suffix = PurePosixPath(e["image_key"]).suffix or ".jpg"
+            items.append((f"{e['id']} {safe_name}{suffix}", e["image_key"]))
+    if not items:
+        raise HTTPException(404, "no files to download")
+    return StreamingResponse(
+        stream_zip(request.app.state.objects, items),
+        media_type="application/zip",
+        headers=zip_headers(f"{record.scenario_name}.zip", f"infographics_{run_id}.zip"),
+    )
 
 
 @router.post("/runs/{run_id}/retry")

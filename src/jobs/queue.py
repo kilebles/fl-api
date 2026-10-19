@@ -1,6 +1,7 @@
 """Persistent job queue: the service the web API wraps (submit / list / cancel / retry / delete / events)."""
 
 import asyncio
+import json
 import shutil
 import uuid
 from collections.abc import AsyncIterator
@@ -50,11 +51,15 @@ class JobQueue:
         self._stopping = False
 
     async def start(self) -> None:
+        await self._repo.sync_from_store(self._objects)
         requeued = await self._repo.requeue_interrupted()
         if requeued:
             logger.info(f"[queue] {requeued} interrupted job(s) queued again")
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._run_forever(), name="job_queue")
+
+    async def sync(self) -> int:
+        return await self._repo.sync_from_store(self._objects)
 
     async def stop(self) -> None:
         """Stop taking jobs; a running job is interrupted and resumes on the next start."""

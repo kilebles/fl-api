@@ -3,6 +3,8 @@
 import asyncio
 import mimetypes
 import shutil
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote, urlencode
@@ -18,11 +20,20 @@ def content_type(name: str) -> str:
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
+@dataclass(frozen=True)
+class StoredObject:
+    key: str
+    size: int
+    last_modified: datetime
+
+
 class ObjectStore(Protocol):
     async def ensure_bucket(self) -> None: ...
     async def upload(self, path: Path, key: str) -> None: ...
     async def put(self, data: bytes, key: str, name: str) -> None: ...
     async def download(self, key: str, path: Path) -> None: ...
+    async def get_bytes(self, key: str) -> bytes: ...
+    async def list_objects(self, prefix: str) -> list[StoredObject]: ...
     async def exists(self, key: str) -> bool: ...
     async def delete_prefix(self, prefix: str) -> None: ...
     def url(self, key: str, download_name: str | None = None) -> str: ...
@@ -65,6 +76,31 @@ class LocalObjectStore:
     async def download(self, key: str, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.copyfile, self.path(key), path)
+
+    async def get_bytes(self, key: str) -> bytes:
+        return await asyncio.to_thread(self.path(key).read_bytes)
+
+    async def list_objects(self, prefix: str) -> list[StoredObject]:
+        def _list() -> list[StoredObject]:
+            if not self.root.exists():
+                return []
+            items: list[StoredObject] = []
+            for p in sorted(self.root.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(self.root).as_posix()
+                if rel.startswith(prefix):
+                    st = p.stat()
+                    items.append(
+                        StoredObject(
+                            key=rel,
+                            size=st.st_size,
+                            last_modified=datetime.fromtimestamp(st.st_mtime),
+                        )
+                    )
+            return items
+
+        return await asyncio.to_thread(_list)
 
     async def exists(self, key: str) -> bool:
         try:
@@ -121,6 +157,33 @@ class S3ObjectStore:
     async def download(self, key: str, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._client.download_file, self.bucket, key, str(path))
+
+    async def get_bytes(self, key: str) -> bytes:
+        def _get() -> bytes:
+            resp = self._client.get_object(Bucket=self.bucket, Key=key)
+            return resp["Body"].read()
+
+        return await asyncio.to_thread(_get)
+
+    async def list_objects(self, prefix: str) -> list[StoredObject]:
+        def _list() -> list[StoredObject]:
+            items: list[StoredObject] = []
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    lm = obj.get("LastModified")
+                    if isinstance(lm, datetime) and lm.tzinfo is not None:
+                        lm = lm.replace(tzinfo=None)
+                    items.append(
+                        StoredObject(
+                            key=obj["Key"],
+                            size=int(obj.get("Size", 0)),
+                            last_modified=lm or datetime.now(),
+                        )
+                    )
+            return items
+
+        return await asyncio.to_thread(_list)
 
     async def exists(self, key: str) -> bool:
         try:

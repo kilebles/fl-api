@@ -3,7 +3,7 @@ import io
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import PurePosixPath
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
@@ -14,6 +14,7 @@ from src.jobs.excel import load_rows
 from src.jobs.models import JobRequest, JobStatus
 from src.jobs.modes import MODES, Mode
 from src.jobs.queue import JobQueue
+from src.storage.zip_stream import natural_key, stream_zip, zip_headers
 
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_UPLOAD_BYTES = 20 * 1024 ** 2
@@ -86,6 +87,12 @@ async def list_jobs(queue: Queue, limit: int = 100, project_id: str | None = Non
     return await queue.recent(min(max(limit, 1), 500), project_id)
 
 
+@router.post("/jobs/sync")
+async def sync_jobs(queue: Queue) -> dict[str, int]:
+    restored = await queue.sync()
+    return {"restored": restored}
+
+
 @router.post("/jobs", status_code=201)
 async def create_job(body: JobRequest, queue: Queue) -> JobStatus:
     return await queue.submit(body)
@@ -121,8 +128,42 @@ async def job_files(job_id: str, request: Request, queue: Queue) -> list[JobFile
             download_url=objects.url(f.key, download_name=prefix + f.name) if f.key else None,
             created_at=f.created_at,
         )
-        for f in await queue.files(job_id)
+        for f in sorted(await queue.files(job_id), key=lambda f: (natural_key(f.row), f.name))
     ]
+
+
+@router.get("/jobs/{job_id}/zip")
+async def job_zip(
+    job_id: str,
+    request: Request,
+    queue: Queue,
+    kind: Literal["video", "image", "all"] | None = None,
+) -> StreamingResponse:
+    """Stream all done files of a job (or only `video` / `image`) as a ZIP/ZIP64 archive."""
+    record = await queue.record(job_id)
+    files = [f for f in await queue.files(job_id) if f.key and f.kind in ("video", "image")]
+    if kind in ("video", "image"):
+        selected = [f for f in files if f.kind == kind]
+    else:
+        selected = files
+    if not selected:
+        raise HTTPException(404, "no files to download")
+
+    selected.sort(key=lambda f: (natural_key(f.row), f.name))
+    both_kinds = len({f.kind for f in selected}) > 1
+    items = [
+        (f"{'videos' if f.kind == 'video' else 'images'}/{f.name}" if both_kinds else f.name, f.key)
+        for f in selected
+        if f.key
+    ]
+    base = (record.title or f"job_{job_id}").strip()
+    suffix = "_videos" if kind == "video" else "_images" if kind == "image" else ""
+    download_name = f"{base}{suffix}.zip"
+    return StreamingResponse(
+        stream_zip(request.app.state.objects, items),
+        media_type="application/zip",
+        headers=zip_headers(download_name, f"job_{job_id}{suffix}.zip"),
+    )
 
 
 @router.post("/jobs/{job_id}/cancel")
