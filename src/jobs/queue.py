@@ -244,15 +244,21 @@ class JobQueue:
                     await self._objects.download(key, path)
                 inputs[field] = path
 
+        valid_rows = {r.name for r in record.job_rows}
         done_rows = {f.row for f in files if f.kind == "skip" or f.kind == ("video" if mode.makes_videos else "image")}
         for f in files:
+            if f.row not in valid_rows:
+                continue
             path = out / f.name
             if path.exists():
                 continue
             if f.kind == "skip":
                 path.write_text(f.reason or "")
             elif (mode.chain and f.kind == "video") or (mode.makes_videos and f.kind == "image" and f.row not in done_rows):
-                await self._objects.download(f.key, path)
+                try:
+                    await self._objects.download(f.key, path)
+                except Exception as e:
+                    logger.warning(f"[queue] job {record.id}: could not download {f.key}, will regenerate: {e}")
 
         return JobSpec(
             mode=Mode(record.mode),

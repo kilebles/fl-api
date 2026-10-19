@@ -115,6 +115,8 @@ async def get_job(job_id: str, queue: Queue) -> JobDetail:
 @router.get("/jobs/{job_id}/files")
 async def job_files(job_id: str, request: Request, queue: Queue) -> list[JobFile]:
     """Results with presigned links: `url` to show / play, `download_url` to save."""
+    record = await queue.record(job_id)
+    valid_rows = {r.name for r in record.job_rows}
     objects = request.app.state.objects
     prefix = f"{job_id}_"
     return [
@@ -129,6 +131,7 @@ async def job_files(job_id: str, request: Request, queue: Queue) -> list[JobFile
             created_at=f.created_at,
         )
         for f in sorted(await queue.files(job_id), key=lambda f: (natural_key(f.row), f.name))
+        if f.row in valid_rows
     ]
 
 
@@ -141,7 +144,12 @@ async def job_zip(
 ) -> StreamingResponse:
     """Stream all done files of a job (or only `video` / `image`) as a ZIP/ZIP64 archive."""
     record = await queue.record(job_id)
-    files = [f for f in await queue.files(job_id) if f.key and f.kind in ("video", "image")]
+    valid_rows = {r.name for r in record.job_rows}
+    files = [
+        f
+        for f in await queue.files(job_id)
+        if f.key and f.kind in ("video", "image") and f.row in valid_rows
+    ]
     if kind in ("video", "image"):
         selected = [f for f in files if f.kind == kind]
     else:
