@@ -15,7 +15,11 @@ class Base(DeclarativeBase):
 
 class Database:
     def __init__(self, url: str) -> None:
-        self.engine: AsyncEngine = create_async_engine(url)
+        parsed = make_url(url)
+        connect_args = None
+        if parsed.get_backend_name() == "sqlite":
+            connect_args = {"timeout": 30, "check_same_thread": False}
+        self.engine: AsyncEngine = create_async_engine(url, connect_args=connect_args)
         self.session = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def init(self) -> None:
@@ -24,6 +28,9 @@ class Database:
         if parsed.get_backend_name() == "sqlite" and parsed.database not in (None, "", ":memory:"):
             Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
         async with self.engine.begin() as conn:
+            if parsed.get_backend_name() == "sqlite":
+                await conn.execute(text("PRAGMA journal_mode=WAL"))
+                await conn.execute(text("PRAGMA busy_timeout = 30000"))
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_add_missing_columns)
 

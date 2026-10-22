@@ -313,10 +313,10 @@ class JobRepository:
                     restored_jobs += 1
                 else:
                     record = existing_jobs[job_id]
+                    mode = Mode(record.mode)
                     known_rows = {r.get("name") for r in (record.rows or [])}
                     missing_rows = [r for r in row_names if r not in known_rows]
                     if missing_rows:
-                        mode = Mode(record.mode)
                         new_rows = list(record.rows or [])
                         for r in missing_rows:
                             new_rows.append(
@@ -329,6 +329,13 @@ class JobRepository:
                         new_rows.sort(key=lambda item: natural_key(str(item.get("name", ""))))
                         record.rows = new_rows
                         record.total = len(new_rows)
+                    final_done = videos_done if MODES[mode].makes_videos else images_done
+                    db_skipped = sum(1 for (jid, fname) in existing_files if jid == job_id and fname.endswith(".skip"))
+                    total_skipped = max(skipped, db_skipped)
+                    if record.total > 0 and (final_done + total_skipped >= record.total or final_done >= int(record.total * 0.9)):
+                        record.state = JobState.DONE.value
+                        record.message = None
+                        record.finished_at = max((obj.last_modified for _, _, _, obj in jfiles), default=record.finished_at or record.created_at)
 
                 for filename, stem, kind, obj in jfiles:
                     if (job_id, filename) in existing_files:
