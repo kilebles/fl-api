@@ -12,7 +12,7 @@ from src.core.errors import RecaptchaInterfaceError
 from src.core.settings import Settings
 from src.flow.browser.human_behavior import HumanBehavior
 from src.flow.browser.timing import HumanTiming
-from src.flow.google_auth import SCHEME_BEARER, auth_scheme
+from src.flow.google_auth import SCHEME_BEARER, auth_scheme, sapisidhash_header
 
 
 _GRECAPTCHA_INIT_SCRIPT = """
@@ -327,14 +327,15 @@ class RecaptchaTokenProducer:
         page = await self._find_or_create_labs_page(context)
 
         await self._extract_cookies(context)
+        self._publish_cookies()
         await self._ensure_labs_session(context)
         self._cookies_ready.set()
         project_url = await self._ensure_project(page)
+        await self._ensure_browser_headers(page)
         project_settle_delay = random.uniform(5.0, 10.0)
         logger.info(f"Waiting {project_settle_delay:.1f}s for project to settle...")
         await asyncio.sleep(project_settle_delay)
         self._page = page
-        await self._ensure_browser_headers(page)
         self._page_ready.set()
         logger.info(f"Navigated to project page: {project_url}")
         logger.success(
@@ -519,6 +520,7 @@ class RecaptchaTokenProducer:
             await self._wait_for_recaptcha(page, self._settings.reload_timeout * 1000)
             await self._anchor_delay(cold_start=True)
             await self._extract_cookies(context)
+            self._publish_cookies()
             self._last_execute_time = asyncio.get_event_loop().time()  # keep interval after reload
             logger.success(
                 f"Page reloaded successfully (reload #{self._total_reloads})"
@@ -619,37 +621,31 @@ class RecaptchaTokenProducer:
                     continue
 
     async def _ensure_labs_session(self, context, force: bool = False) -> None:
-        """Make sure labs.google holds a valid access token and publish it as the Authorization header.
+        """Build and publish the Authorization header from the browser's Google cookies (SAPISIDHASH).
 
-        The current Flow frontend never sends OAuth tokens from the page, so the token
-        is taken from the legacy next-auth session instead; when it is missing, expired,
-        its refresh failed, or `force` is set (the API rejected it), the profile is
-        signed in again.
+        Google retired https://labs.google/fx/api/auth/* (410 Gone) on 2026-10-21;
+        Flow authenticates against aisandbox-pa.clients6.google.com using first-party
+        Google cookies and SAPISIDHASH.
         """
         async with self._auth_lock:
-            session: dict = {}
-            if not force:
+            if force and self._page is not None and not self._page.is_closed():
                 try:
-                    session = await self._fetch_labs_session()
+                    await self._page.reload(timeout=self._settings.reload_timeout * 1000)
                 except Exception as e:
-                    logger.warning(f"labs.google session check failed: {type(e).__name__}: {e}")
-            token = session.get("access_token")
-            error = session.get("error")
-            expired = self._session_expired(session.get("expires"))
-            if force or not token or error or expired:
-                reason = "forced" if force else f"error={error}, token={'yes' if token else 'no'}, expired={expired}"
-                logger.warning(f"labs.google session unusable ({reason}) — signing in again")
-                await self._labs_signin(context)
+                    logger.warning(f"Page reload during reauthentication failed: {e}")
+            if force or not self._cookies:
                 await self._extract_cookies(context)
                 self._publish_cookies()
-                session = await self._fetch_labs_session()
-                token = session.get("access_token")
-                error = session.get("error")
-                if not token or error:
-                    raise RuntimeError(f"labs.google session still unusable after sign-in (error={error})")
-            self._last_session_refresh = asyncio.get_event_loop().time()
-            self._publish_authorization(
-                f"{SCHEME_BEARER} {token}", source=f"labs.google session (expires {session.get('expires')})"
+
+            sapisid_auth = sapisidhash_header(self._cookies, self._settings.flow_base_url)
+            if sapisid_auth:
+                self._last_session_refresh = asyncio.get_event_loop().time()
+                self._publish_authorization(sapisid_auth, source="Google cookies (SAPISIDHASH)")
+                return
+
+            raise RuntimeError(
+                "Google account is not signed in on flow.google.com "
+                f"(no SAPISID cookies in browser; cookies={sorted(self._cookies)})"
             )
 
     @staticmethod
@@ -703,9 +699,7 @@ class RecaptchaTokenProducer:
         await self._ensure_labs_session(context)
 
     async def _ensure_browser_headers(self, page: Page) -> None:
-        """Derive fingerprint headers from the page if no request exposed them yet."""
-        if self._browser_headers_ready.is_set():
-            return
+        """Derive fingerprint and WIZ API key headers from the page."""
         try:
             derived: dict[str, str] = await page.evaluate(
                 """async () => {
@@ -716,6 +710,11 @@ class RecaptchaTokenProducer:
                         out['sec-ch-ua-mobile'] = data.mobile ? '?1' : '?0';
                         out['sec-ch-ua-platform'] = `"${data.platform}"`;
                     }
+                    const wiz = window.WIZ_global_data;
+                    if (wiz) {
+                        if (wiz.K21R3e) out['x-goog-api-key'] = String(wiz.K21R3e);
+                        out['x-goog-authuser'] = String(wiz.QrtxK ?? '0');
+                    }
                     return out;
                 }"""
             )
@@ -725,8 +724,8 @@ class RecaptchaTokenProducer:
         if derived:
             for key, value in derived.items():
                 self._browser_headers.setdefault(key, value)
-            self._browser_headers_ready.set()
-            logger.info(f"Browser headers derived from page: {sorted(derived)}")
+            logger.info(f"Browser headers derived from page: {sorted(self._browser_headers)}")
+        self._browser_headers_ready.set()
 
     async def _ensure_project(self, page: Page) -> str:
         """Make sure the tab is on a usable Flow project page and return its URL.
@@ -792,8 +791,8 @@ class RecaptchaTokenProducer:
 
     async def _create_project_trpc(self, page: Page) -> str | None:
         """Create a project via the legacy labs.google tRPC endpoint (needs a valid labs.google session)."""
-        if "__Secure-next-auth.session-token" not in self._cookies:
-            logger.info("No labs.google session cookie — skipping legacy tRPC project creation")
+        if auth_scheme(self._authorization or "") != SCHEME_BEARER or "__Secure-next-auth.session-token" not in self._cookies:
+            logger.info("No active legacy labs.google session — skipping tRPC project creation")
             return None
         title = datetime.now(timezone.utc).strftime("%b %d, %I:%M %p")
         payload = {"json": {"projectTitle": title, "toolName": "PINHOLE"}}
@@ -882,7 +881,7 @@ class RecaptchaTokenProducer:
         flow.google.com, then the shared google.com account cookies.
         """
         all_cookies = await context.cookies(
-            ["https://labs.google", self._settings.flow_base_url, "https://google.com"]
+            ["https://labs.google", self._settings.flow_base_url, "https://google.com", "https://clients6.google.com"]
         )
 
         def rank(domain: str) -> int:
@@ -957,17 +956,18 @@ class RecaptchaTokenProducer:
 
     async def _capture_fingerprint(self, request, source: str, headers: dict | None = None) -> None:
         headers = headers if headers is not None else await request.all_headers()
-        if self._browser_headers_ready.is_set():
-            return
         extracted = {k: v for k, v in headers.items() if k in self._FINGERPRINT_HEADERS}
         if not extracted:
             return
+        first_capture = not bool(self._browser_headers)
         self._browser_headers.update(extracted)
-        self._browser_headers_ready.set()
-        logger.success(
-            f"Browser headers intercepted from {source} ({len(extracted)} keys): "
-            f"user-agent={extracted.get('user-agent', '?')!r}, sec-ch-ua={extracted.get('sec-ch-ua', '?')!r}"
-        )
+        if "x-goog-api-key" in self._browser_headers:
+            self._browser_headers_ready.set()
+        if first_capture:
+            logger.success(
+                f"Browser headers intercepted from {source} ({len(extracted)} keys): "
+                f"user-agent={extracted.get('user-agent', '?')!r}, sec-ch-ua={extracted.get('sec-ch-ua', '?')!r}"
+            )
 
     def _register_request_listener(self, page) -> None:
         """Register bearer token request listener on page if not already registered."""

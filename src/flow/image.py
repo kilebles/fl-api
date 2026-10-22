@@ -9,7 +9,7 @@ from loguru import logger
 
 from src.core.errors import DiskFullError, GenerationFilteredError
 from src.core.settings import Settings
-from src.flow.http import API_BASE, api_headers, error_reason
+from src.flow.http import API_BASE, api_endpoint, api_headers, error_reason
 from src.flow.models import (
     ClientContext,
     ImageGenerationRequest,
@@ -56,6 +56,7 @@ class ImageGenerationService:
         authorization: str | None = None,
         proxy_url: str | None = None,
         browser_headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         reference_media_ids: list[str] | None = None,
     ) -> list[str]:
         """
@@ -105,10 +106,10 @@ class ImageGenerationService:
         )
 
         headers = api_headers(self._settings.flow_base_url, authorization, browser_headers)
-        url = self.IMAGE_API_URL_TEMPLATE.format(project_id=project_id)
+        url = api_endpoint(self.IMAGE_API_URL_TEMPLATE.format(project_id=project_id), authorization)
         body = request.model_dump_json(exclude_none=True)
 
-        async with httpx.AsyncClient(proxy=proxy_url, http2=True) as client:
+        async with httpx.AsyncClient(proxy=proxy_url, cookies=cookies, http2=True) as client:
             response = await client.post(
                 url,
                 content=body,

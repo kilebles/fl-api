@@ -10,6 +10,8 @@ from src.core.settings import Settings
 from src.dolphin import cooldowns
 from src.engine import session as session_module
 from src.engine.session import AccountSession
+from src.flow.google_auth import sapisidhash_header
+from src.flow.http import DEFAULT_GOOGLE_API_KEY, api_endpoint, api_headers
 from src.flow.models import MediaInfo, VideoGenerationResponse
 
 
@@ -202,3 +204,17 @@ async def test_401_signs_in_again_without_rotation(tmp_path: Path):
 
     assert video.calls == 2 and manager.rotations == 0
     await session.close()
+
+
+def test_sapisidhash_headers_and_clients6_endpoint():
+    cookies = {"SAPISID": "sap1", "__Secure-1PAPISID": "sap1p", "__Secure-3PAPISID": "sap3p"}
+    auth = sapisidhash_header(cookies, "https://flow.google.com")
+    assert auth is not None and auth.startswith("SAPISIDHASH ")
+
+    headers = api_headers("https://flow.google.com", auth)
+    assert headers["Authorization"] == auth
+    assert headers["x-goog-api-key"] == DEFAULT_GOOGLE_API_KEY
+    assert headers["x-goog-authuser"] == "0"
+
+    rewritten = api_endpoint("https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText", auth)
+    assert rewritten == "https://aisandbox-pa.clients6.google.com/v1/video:batchAsyncGenerateVideoText"

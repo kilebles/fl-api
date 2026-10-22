@@ -217,22 +217,25 @@ class AccountSession:
 
         async def call(token: str, proxy_url: str | None):
             async with self._generate_lock:
+                cookies = dict(self._downloader.cookies) or None
                 common = dict(
                     authorization=self._credentials.authorization,
                     project_id=self._credentials.project_id,
                     recaptcha_token=token,
                     proxy_url=proxy_url,
                     browser_headers=self._credentials.browser_headers or None,
+                    cookies=cookies,
                     model_key=model_key,
                 )
                 if source is None:
-                    return await self._video.generate(prompt=prompt, cookies=dict(self._downloader.cookies) or None, **common)
+                    return await self._video.generate(prompt=prompt, **common)
                 media_id = await self._video.upload_image(
                     image_path=source,
                     authorization=self._credentials.authorization,
                     project_id=self._credentials.project_id,
                     proxy_url=proxy_url,
                     browser_headers=self._credentials.browser_headers or None,
+                    cookies=cookies,
                 )
                 generate = self._video.generate_from_image if image else self._video.generate_from_frame
                 return await generate(prompt=prompt, media_id=media_id, **common)
@@ -266,7 +269,7 @@ class AccountSession:
                     authorization=self._credentials.authorization,
                     proxy_url=submitted.proxy_url,
                     browser_headers=self._credentials.browser_headers,
-                    cookies=submitted.cookies,
+                    cookies=dict(self._downloader.cookies) or submitted.cookies,
                 )
                 break
             except httpx.ProxyError as exc:
@@ -323,6 +326,7 @@ class AccountSession:
                     authorization=self._credentials.authorization,
                     proxy_url=proxy_url,
                     browser_headers=self._credentials.browser_headers or None,
+                    cookies=dict(self._downloader.cookies) or None,
                     reference_media_ids=reference_ids,
                 )
 
@@ -565,6 +569,7 @@ class AccountSession:
                 project_id=project_id,
                 proxy_url=proxy_url,
                 browser_headers=self._credentials.browser_headers or None,
+                cookies=dict(self._downloader.cookies) or None,
             )
             self._reference_media[key] = media_id
             logger.info(f"Reference image {image_path.name} uploaded to project {project_id} as {media_id}")

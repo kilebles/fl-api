@@ -6,7 +6,8 @@ from loguru import logger
 
 from src.core.errors import GenerationFilteredError, GenerationTimedOutError, InputImageRejectedError, IpProhibitedError
 from src.core.settings import Settings
-from src.flow.http import api_headers
+from src.flow.google_auth import SCHEME_SAPISIDHASH, auth_scheme, sapisidhash_header
+from src.flow.http import api_endpoint, api_headers
 from src.flow.models import MediaInfo
 
 _POLL_FIRST_DELAY = 12.5
@@ -52,13 +53,7 @@ class PollingService:
             TimeoutError: If polling exceeds the configured timeout.
             httpx.HTTPStatusError: If the API returns an error status.
         """
-        headers = api_headers(
-            self._settings.flow_base_url,
-            authorization,
-            browser_headers,
-            referer=f"{self._settings.flow_base_url}/project/{project_id}",
-            browser_meta=False,
-        )
+        polling_url = api_endpoint(self._settings.polling_url, authorization)
         body = {
             "media": [{"name": media_id, "projectId": project_id}],
         }
@@ -71,10 +66,20 @@ class PollingService:
 
         while elapsed < self._settings.polling_timeout:
             attempt += 1
+            current_auth = authorization
+            if cookies and auth_scheme(authorization) == SCHEME_SAPISIDHASH:
+                current_auth = sapisidhash_header(cookies, self._settings.flow_base_url) or authorization
+            headers = api_headers(
+                self._settings.flow_base_url,
+                current_auth,
+                browser_headers,
+                referer=f"{self._settings.flow_base_url}/project/{project_id}",
+                browser_meta=False,
+            )
 
             async with httpx.AsyncClient(timeout=self._settings.api_timeout, proxy=proxy_url, cookies=cookies, http2=True) as client:
                 response = await client.post(
-                    self._settings.polling_url,
+                    polling_url,
                     headers=headers,
                     json=body,
                 )

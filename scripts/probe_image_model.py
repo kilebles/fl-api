@@ -119,7 +119,7 @@ async def probe(settings, credentials: CredentialsService, producer: RecaptchaTo
             ],
         )
         try:
-            async with httpx.AsyncClient(proxy=proxy_url, http2=True) as client:
+            async with httpx.AsyncClient(proxy=proxy_url, cookies=credentials.cookies, http2=True) as client:
                 response = await client.post(
                     url,
                     content=request.model_dump_json(exclude_none=True),

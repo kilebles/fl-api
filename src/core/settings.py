@@ -57,11 +57,11 @@ class Settings(BaseSettings):
 
     # Flow API
     api_url: str = Field(
-        default="https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText",
+        default="https://aisandbox-pa.clients6.google.com/v1/video:batchAsyncGenerateVideoText",
         description="Veo text-to-video endpoint URL",
     )
     polling_url: str = Field(
-        default="https://aisandbox-pa.googleapis.com/v1/video:batchCheckAsyncVideoGenerationStatus",
+        default="https://aisandbox-pa.clients6.google.com/v1/video:batchCheckAsyncVideoGenerationStatus",
         description="Video status polling endpoint URL",
     )
     api_timeout: float = Field(default=30.0, description="API request timeout in seconds")

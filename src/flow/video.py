@@ -10,7 +10,7 @@ from loguru import logger
 
 from src.core.errors import GenerationFilteredError
 from src.core.settings import Settings
-from src.flow.http import API_BASE, api_headers, error_reason
+from src.flow.http import API_BASE, api_endpoint, api_headers, error_reason
 from src.flow.models import (
     ClientContext,
     CropCoordinates,
@@ -77,6 +77,7 @@ class VideoGenerationService:
         recaptcha_token: str,
         proxy_url: str | None = None,
         browser_headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         model_key: str | None = None,
     ) -> VideoGenerationResponse:
         """Submit an image-to-video request with an uploaded image as the reference."""
@@ -95,7 +96,7 @@ class VideoGenerationService:
             ],
         )
         url = f"{API_BASE}/video:batchAsyncGenerateVideoReferenceImages"
-        return await self._submit(url, request.model_dump_json(), authorization, proxy_url, browser_headers, None, "I2V generation")
+        return await self._submit(url, request.model_dump_json(), authorization, proxy_url, browser_headers, cookies, "I2V generation")
 
     async def generate_from_frame(
         self,
@@ -106,6 +107,7 @@ class VideoGenerationService:
         recaptcha_token: str,
         proxy_url: str | None = None,
         browser_headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         model_key: str | None = None,
         crop_coordinates: CropCoordinates | None = None,
     ) -> VideoGenerationResponse:
@@ -125,7 +127,7 @@ class VideoGenerationService:
             ],
         )
         url = f"{API_BASE}/video:batchAsyncGenerateVideoStartImage"
-        return await self._submit(url, request.model_dump_json(), authorization, proxy_url, browser_headers, None, "F2V generation")
+        return await self._submit(url, request.model_dump_json(), authorization, proxy_url, browser_headers, cookies, "F2V generation")
 
     async def upload_image(
         self,
@@ -134,6 +136,7 @@ class VideoGenerationService:
         project_id: str,
         proxy_url: str | None = None,
         browser_headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
     ) -> str:
         """Upload an image into the Flow project and return its media id."""
         request = UploadImageRequest(
@@ -143,9 +146,10 @@ class VideoGenerationService:
             mimeType=mimetypes.guess_type(str(image_path))[0] or "image/jpeg",
         )
         headers = api_headers(self._settings.flow_base_url, authorization, browser_headers, browser_meta=False)
-        async with httpx.AsyncClient(proxy=proxy_url) as client:
+        upload_url = api_endpoint(f"{API_BASE}/flow/uploadImage", authorization)
+        async with httpx.AsyncClient(proxy=proxy_url, cookies=cookies) as client:
             response = await client.post(
-                f"{API_BASE}/flow/uploadImage",
+                upload_url,
                 content=request.model_dump_json(),
                 headers=headers,
                 timeout=self._settings.api_timeout,
@@ -174,8 +178,9 @@ class VideoGenerationService:
         label: str,
     ) -> VideoGenerationResponse:
         headers = api_headers(self._settings.flow_base_url, authorization, browser_headers)
+        target_url = api_endpoint(url, authorization)
         async with httpx.AsyncClient(proxy=proxy_url, cookies=cookies, http2=True) as client:
-            response = await client.post(url, content=body, headers=headers, timeout=self._settings.api_timeout)
+            response = await client.post(target_url, content=body, headers=headers, timeout=self._settings.api_timeout)
 
         if response.status_code != 200:
             log = logger.warning if response.status_code == 429 else logger.error
