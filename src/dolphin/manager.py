@@ -134,12 +134,47 @@ class DolphinAntyManager:
         self._was_reset = False
         return val
 
+    @staticmethod
+    def _is_proxy_alive(proxy: ProxyInfo) -> bool:
+        try:
+            resp = httpx.get("http://api.ipify.org", proxy=proxy.url, timeout=6.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _resolve_working_proxy(self, acc: AccountInfo, proxy: ProxyInfo) -> ProxyInfo:
+        """Return `proxy` if alive, else fall back to another entry in proxies.txt or Dolphin Cloud."""
+        if self._is_proxy_alive(proxy):
+            return proxy
+        for candidate in acc.proxies:
+            if candidate.key != proxy.key and self._is_proxy_alive(candidate):
+                logger.warning(f"Proxy {proxy.key} on {acc.name} is unreachable — using fallback {candidate.key}")
+                return candidate
+        try:
+            cloud_proxy = self._public_api.get_profile_proxy(acc.dolphin_id)
+        except Exception as e:
+            cloud_proxy = None
+            logger.debug(f"Could not fetch cloud proxy for {acc.name}: {e}")
+        if cloud_proxy and cloud_proxy.key != proxy.key and self._is_proxy_alive(cloud_proxy):
+            logger.warning(
+                f"Proxy {proxy.key} in {acc.name}/proxies.txt is dead — adopting working proxy "
+                f"{cloud_proxy.key} from Dolphin profile {acc.dolphin_id}"
+            )
+            acc.proxies = [cloud_proxy if p.key == proxy.key else p for p in acc.proxies]
+            try:
+                (acc.directory / "proxies.txt").write_text("\n".join(p.to_line() for p in acc.proxies) + "\n")
+            except Exception as e:
+                logger.warning(f"Could not persist updated proxies.txt for {acc.name}: {e}")
+            return cloud_proxy
+        return proxy
+
     def _apply_proxy(self, acc: AccountInfo, proxy: ProxyInfo | None = None) -> None:
         """Patch the Dolphin profile proxy to `proxy` (default: the current proxies.txt entry)."""
         if proxy is None:
             if not acc.proxies:
                 return
             proxy = acc.proxies[self._proxy_index % len(acc.proxies)]
+        proxy = self._resolve_working_proxy(acc, proxy)
         try:
             self._public_api.set_profile_proxy(acc.dolphin_id, proxy)
             logger.bind(event_type="proxy_patched", account=acc.name, proxy=proxy.key).info(
@@ -151,22 +186,27 @@ class DolphinAntyManager:
     def start_current(self, attempts: int = 3, retry_delay: float = 5.0) -> str:
         """Stop and start the current profile. Returns CDP WebSocket URL.
 
-        Dolphin answers 500 while a profile is still shutting down or syncing its
-        datadir, so a failed start is retried after a short pause.
+        Dolphin answers 500 while a profile is still shutting down, syncing its
+        datadir, or when the configured proxy fails Dolphin's pre-start check;
+        a failed start is retried (falling back to the next proxy in proxies.txt).
         """
-        self._apply_proxy(self._current)
-        self._local_api.stop(self._current.dolphin_id)
+        acc = self._current
+        self._apply_proxy(acc)
+        self._local_api.stop(acc.dolphin_id)
         for attempt in range(1, attempts + 1):
             try:
-                ws = self._local_api.start(self._current.dolphin_id)
+                ws = self._local_api.start(acc.dolphin_id)
                 break
             except httpx.HTTPStatusError as e:
                 if attempt == attempts or e.response.status_code < 500:
                     raise
-                logger.bind(event_type="dolphin_500", account=self._current.name).warning(
-                    f"Dolphin returned {e.response.status_code} starting profile {self._current.dolphin_id} "
+                logger.bind(event_type="dolphin_500", account=acc.name).warning(
+                    f"Dolphin returned {e.response.status_code} starting profile {acc.dolphin_id} "
                     f"(attempt {attempt}/{attempts}) — retrying in {retry_delay:.0f}s"
                 )
+                if len(acc.proxies) > 1:
+                    fallback = acc.proxies[(self._proxy_index + attempt) % len(acc.proxies)]
+                    self._apply_proxy(acc, fallback)
                 time.sleep(retry_delay)
         self._current_ws = ws
         return ws

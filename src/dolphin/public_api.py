@@ -4,6 +4,7 @@ from loguru import logger
 from src.accounts.proxy import ProxyInfo
 
 DOLPHIN_PUBLIC_API_BASE = "https://dolphin-anty-api.com"
+DARKWING_API_BASE = "https://darkwing.dolphin-anty-api-cf.com/api/v1"
 
 
 class DolphinPublicApi:
@@ -24,20 +25,30 @@ class DolphinPublicApi:
         Returns None if no proxy is set on the profile.
         Raises httpx.HTTPStatusError on API errors.
         """
-        resp = httpx.get(
-            f"{DOLPHIN_PUBLIC_API_BASE}/browser_profiles/{profile_id}",
-            headers=self._headers,
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        proxy = data.get("proxy") or {}
+        try:
+            resp = httpx.get(
+                f"{DARKWING_API_BASE}/start/preliminary/{profile_id}",
+                headers=self._headers,
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            proxy = resp.json().get("proxy") or {}
+        except Exception:
+            resp = httpx.get(
+                f"{DOLPHIN_PUBLIC_API_BASE}/browser_profiles/{profile_id}",
+                headers=self._headers,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            proxy = data.get("proxy") or {}
         host = proxy.get("host")
-        if not host:
+        port = proxy.get("port")
+        if not host or not port:
             return None
         return ProxyInfo(
             host=host,
-            port=int(proxy.get("port", 0)),
+            port=int(port),
             user=proxy.get("login") or "",
             password=proxy.get("password") or "",
             type=proxy.get("type", "http"),

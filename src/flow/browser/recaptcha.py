@@ -8,7 +8,7 @@ import httpx
 from loguru import logger
 from playwright.async_api import Page, async_playwright
 
-from src.core.errors import RecaptchaInterfaceError
+from src.core.errors import GoogleNotSignedInError, RecaptchaInterfaceError
 from src.core.settings import Settings
 from src.flow.browser.human_behavior import HumanBehavior
 from src.flow.browser.timing import HumanTiming
@@ -385,6 +385,11 @@ class RecaptchaTokenProducer:
                         f"Producer stopped: {e} — page/script problem, not reconnecting"
                     )
                     raise
+                except GoogleNotSignedInError as e:
+                    logger.bind(event_type="producer_crashed").error(
+                        f"Producer stopped: {e} — Google account not signed in, not reconnecting"
+                    )
+                    raise
                 except Exception as e:
                     if not self._ever_connected:
                         logger.bind(event_type="producer_crashed").error(
@@ -643,7 +648,18 @@ class RecaptchaTokenProducer:
                 self._publish_authorization(sapisid_auth, source="Google cookies (SAPISIDHASH)")
                 return
 
-            raise RuntimeError(
+            for page in list(context.pages):
+                if not page.is_closed() and "accounts.google.com" in page.url:
+                    await self._click_through_google_prompt(page)
+                    await self._extract_cookies(context)
+                    self._publish_cookies()
+                    sapisid_auth = sapisidhash_header(self._cookies, self._settings.flow_base_url)
+                    if sapisid_auth:
+                        self._last_session_refresh = asyncio.get_event_loop().time()
+                        self._publish_authorization(sapisid_auth, source="Google cookies (SAPISIDHASH)")
+                        return
+
+            raise GoogleNotSignedInError(
                 "Google account is not signed in on flow.google.com "
                 f"(no SAPISID cookies in browser; cookies={sorted(self._cookies)})"
             )

@@ -45,3 +45,11 @@ class RecaptchaInterfaceError(Exception):
 
     A page/script problem, not an account or proxy problem — stop the batch without rotating.
     """
+
+
+class GoogleNotSignedInError(Exception):
+    """The Dolphin browser profile has no active Google session (no SAPISID cookies).
+
+    Restarting the same profile cannot fix a missing Google login, so the session
+    fails fast and puts the profile on cooldown instead of retrying browser launches.
+    """

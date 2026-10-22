@@ -17,6 +17,7 @@ from src.core.errors import (
     DiskFullError,
     GenerationFilteredError,
     GenerationTimedOutError,
+    GoogleNotSignedInError,
     ImageQuotaError,
     IpProhibitedError,
     RateLimitError,
@@ -176,6 +177,15 @@ class AccountSession:
                 logger.info(f"[{self.name}] session ready @ {self._manager.current_ws}")
                 return
             except FATAL_ERRORS:
+                raise
+            except GoogleNotSignedInError as e:
+                self._manager.mark_current_on_cooldown()
+                if self.can_rotate:
+                    logger.warning(f"[{self.name}] Google account not signed in ({e}) — rotating to next account")
+                    self._stop_generations = True
+                    await self._rotate_account()
+                    return
+                logger.error(f"[{self.name}] Google account not signed in ({e}) — skipping account")
                 raise
             except Exception as e:
                 if attempt == attempts:
@@ -606,6 +616,10 @@ class AccountSession:
                     await self._restart_producer(cdp_url, wait_ready=True)
                 except FATAL_ERRORS:
                     raise
+                except GoogleNotSignedInError as e:
+                    self._manager.mark_current_on_cooldown()
+                    logger.warning(f"Account {account.name} not signed in ({e}), rotating again")
+                    continue
                 except Exception as e:
                     logger.warning(f"New producer crashed immediately, rotating again: {e}")
                     continue
@@ -707,7 +721,7 @@ class AccountSession:
         except (asyncio.CancelledError, Exception):
             pass
         exc = None if task.cancelled() else task.exception()
-        if isinstance(exc, RecaptchaInterfaceError):
+        if isinstance(exc, (RecaptchaInterfaceError, GoogleNotSignedInError)):
             raise exc
         raise RuntimeError(f"Producer died before becoming ready: {exc}")
 
