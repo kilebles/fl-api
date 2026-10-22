@@ -9,6 +9,7 @@ from loguru import logger
 
 from src.core.errors import DiskFullError, GenerationFilteredError
 from src.core.settings import Settings
+from src.flow.google_auth import sapisidhash_header
 from src.flow.http import API_BASE, api_endpoint, api_headers, error_reason
 from src.flow.models import (
     ClientContext,
@@ -180,7 +181,22 @@ class ImageGenerationService:
         cookies: dict[str, str],
         proxy_url: str | None,
     ) -> str:
-        """Resolve the signed storage URL via the legacy Labs tRPC endpoint (needs a labs.google session)."""
+        """Resolve the signed storage URL via /v1/flowMedia/{media_id} (or legacy Labs redirect fallback)."""
+        sapisid_auth = sapisidhash_header(cookies, self._settings.flow_base_url)
+        if sapisid_auth:
+            headers = api_headers(self._settings.flow_base_url, sapisid_auth, browser_meta=False)
+            async with httpx.AsyncClient(
+                timeout=self._settings.api_timeout,
+                proxy=proxy_url,
+                cookies=cookies,
+                http2=True,
+            ) as client:
+                resp = await client.get(f"{API_BASE}/flowMedia/{media_id}", headers=headers)
+                if resp.status_code == 200:
+                    direct = _find_direct_url(resp.json())
+                    if direct:
+                        return direct
+
         url = f"{self._settings.labs_base_url}/fx/api/trpc/media.getMediaUrlRedirect"
 
         async with httpx.AsyncClient(

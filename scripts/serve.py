@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import uvicorn
+from loguru import logger
 
 from src.api.app import create_app
 from src.core.logger import setup_logger, setup_monitor
@@ -32,6 +33,7 @@ def main() -> None:
     setup_logger(settings.log_level)
     if settings.monitor_url:
         setup_monitor(settings.monitor_url)
+    logger.info(f"Starting fl-api server on http://{args.host}:{args.port}")
 
     config = uvicorn.Config(create_app(settings), host=args.host, port=args.port, loop="none", log_level="warning")
     asyncio.run(uvicorn.Server(config).serve())

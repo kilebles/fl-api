@@ -6,6 +6,9 @@ from loguru import logger
 
 from src.core.errors import DiskFullError
 from src.core.settings import Settings
+from src.flow.google_auth import sapisidhash_header
+from src.flow.http import API_BASE, api_headers
+from src.flow.polling import _find_direct_url
 
 
 class VideoDownloaderService:
@@ -52,10 +55,26 @@ class VideoDownloaderService:
             raise
 
     async def _get_redirect_url(self, media_id: str, cookies: dict[str, str] | None = None, proxy_url: str | None = None) -> str:
-        """Resolve the video URL via the legacy Labs redirect endpoint (needs a labs.google session)."""
+        """Resolve the video URL via /v1/flowMedia/{media_id} (or legacy Labs redirect fallback)."""
         effective_cookies = cookies if cookies is not None else self._cookies
         if not effective_cookies:
             raise RuntimeError("Cookies not set. Call set_cookies() first.")
+
+        sapisid_auth = sapisidhash_header(effective_cookies, self._settings.flow_base_url)
+        if sapisid_auth:
+            headers = api_headers(self._settings.flow_base_url, sapisid_auth, browser_meta=False)
+            async with httpx.AsyncClient(
+                timeout=self._settings.api_timeout,
+                proxy=proxy_url,
+                cookies=effective_cookies,
+                http2=True,
+            ) as client:
+                resp = await client.get(f"{API_BASE}/flowMedia/{media_id}", headers=headers)
+                if resp.status_code == 200:
+                    direct = _find_direct_url(resp.json())
+                    if direct:
+                        logger.debug(f"Resolved video URL via flowMedia: {direct.split('?')[0]}")
+                        return direct
 
         url = f"{self._settings.labs_base_url}/fx/api/trpc/media.getMediaUrlRedirect"
 

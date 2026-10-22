@@ -7,7 +7,7 @@ from loguru import logger
 from src.core.errors import GenerationFilteredError, GenerationTimedOutError, InputImageRejectedError, IpProhibitedError
 from src.core.settings import Settings
 from src.flow.google_auth import SCHEME_SAPISIDHASH, auth_scheme, sapisidhash_header
-from src.flow.http import api_endpoint, api_headers
+from src.flow.http import API_BASE, api_endpoint, api_headers
 from src.flow.models import MediaInfo
 
 _POLL_FIRST_DELAY = 12.5
@@ -17,15 +17,25 @@ _POLL_INTERVAL = 10.0
 _DIRECT_URL_KEYS = ("fifeUrl", "downloadUrl", "servingBaseUri", "videoUrl", "url")
 
 
-def _find_direct_url(video: dict) -> str | None:
+def _find_direct_url(media_data: dict) -> str | None:
     """Return a direct https URL for the generated video if the API included one."""
-    for key in _DIRECT_URL_KEYS:
-        value = video.get(key)
-        if isinstance(value, str) and value.startswith("https://"):
-            return value
-    for value in video.values():
-        if isinstance(value, str) and value.startswith("https://") and "/video" in value:
-            return value
+    video_root = media_data.get("video", {}) if "video" in media_data else media_data
+    generated = video_root.get("generatedVideo", {}) if isinstance(video_root, dict) else {}
+    gcs_urls = (
+        video_root.get("servingUrls", {}).get("gcsUrls", {})
+        if isinstance(video_root, dict) and isinstance(video_root.get("servingUrls"), dict)
+        else {}
+    )
+    for block in (generated, gcs_urls, video_root, media_data):
+        if not isinstance(block, dict):
+            continue
+        for key in _DIRECT_URL_KEYS:
+            value = block.get(key)
+            if isinstance(value, str) and value.startswith("https://"):
+                return value
+        for value in block.values():
+            if isinstance(value, str) and value.startswith("https://") and "/video" in value:
+                return value
     return None
 
 class PollingService:
@@ -94,7 +104,14 @@ class PollingService:
 
             if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
                 video = media_data.get("video", {}).get("generatedVideo", {})
-                video_url = _find_direct_url(video)
+                video_url = _find_direct_url(media_data)
+                if not video_url:
+                    video_url = await self._fetch_media_video_url(
+                        media_data.get("name", media_id),
+                        headers=headers,
+                        proxy_url=proxy_url,
+                        cookies=cookies,
+                    )
                 logger.debug(
                     f"Generated video fields: {sorted(video.keys())}"
                     + (f", direct url: {video_url.split('?')[0]}" if video_url else ", no direct url")
@@ -169,3 +186,26 @@ class PollingService:
         raise TimeoutError(
             f"Polling timed out after {self._settings.polling_timeout} seconds"
         )
+
+    async def _fetch_media_video_url(
+        self,
+        media_id: str,
+        headers: dict[str, str],
+        proxy_url: str | None = None,
+        cookies: dict[str, str] | None = None,
+    ) -> str | None:
+        """Fetch /v1/flowMedia/{media_id} to obtain the signed video fifeUrl/videoUrl."""
+        url = f"{API_BASE}/flowMedia/{media_id}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._settings.api_timeout,
+                proxy=proxy_url,
+                cookies=cookies,
+                http2=True,
+            ) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                return _find_direct_url(response.json())
+        except Exception as e:
+            logger.warning(f"Could not fetch flowMedia URL for {media_id}: {e}")
+            return None
