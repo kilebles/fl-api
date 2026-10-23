@@ -436,13 +436,25 @@ class AccountSession:
                 raise RateLimitError("Daily quota exhausted") from e
             if reason == TOO_MUCH_TRAFFIC:
                 self._pause_for_traffic(index)
+                if self._traffic_429s >= 3:
+                    self._manager.mark_current_on_cooldown()
+                    raise RateLimitError("TOO_MUCH_TRAFFIC") from e
                 return 0.0
             self._consecutive_429s += 1
             logger.bind(event_type="429", account=account.name).warning(
                 f"[{index}] HTTP 429 (total consecutive: {self._consecutive_429s}/{ACCOUNT_ROTATION_429_LIMIT})"
             )
             if self._consecutive_429s >= ACCOUNT_ROTATION_429_LIMIT:
-                logger.warning(f"[{index}] 429 limit reached — escalating to account rotation")
+                proxy_key = self._manager.current_proxy_key
+                failures = self._proxy_failures.get(proxy_key, 0) + 1
+                self._proxy_failures[proxy_key] = failures
+                logger.warning(
+                    f"[{index}] 429 limit reached on {account.name} / {proxy_key} "
+                    f"({failures}/{PROXY_COOLDOWN_AFTER_ROTATIONS}) — escalating to account rotation"
+                )
+                if failures >= PROXY_COOLDOWN_AFTER_ROTATIONS:
+                    self._proxy_failures.pop(proxy_key, None)
+                    self._manager.mark_current_on_cooldown()
                 self._stop_generations = True
                 await self._rotate_account()
                 raise RateLimitError("API rate limit exceeded") from e
@@ -513,6 +525,8 @@ class AccountSession:
             self._traffic_429s = 0
         self._traffic_429s += 1
         self._last_traffic_429_at = now
+        if self._producer is not None:
+            self._producer.report_failure()
         pause = DELAY_TRAFFIC_STEPS[min(self._traffic_429s, len(DELAY_TRAFFIC_STEPS)) - 1]
         self._resume_at = max(self._resume_at, now + pause)
         logger.bind(event_type="429", account=self.name).warning(
