@@ -1,0 +1,54 @@
+name: CI / CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests & Compile Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Check Python syntax
+        run: uv run python -m compileall -q src scripts tests
+
+      - name: Run pytest suite
+        run: uv run pytest -v
+
+  deploy-linux:
+    name: Deploy to Linux (89.127.192.164)
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.DEPLOY_SSH_KEY != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy /opt/fl-api via SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST || '89.127.192.164' }}
+          SSH_USER: ${{ secrets.DEPLOY_USER || 'root' }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          ssh "$SSH_USER@$SSH_HOST" '
+            set -e
+            cd /opt/fl-api
+            git fetch origin main
+            git reset --hard origin/main
+            /root/.local/bin/uv sync --frozen
+            systemctl restart fl-api-fallback.service
+          '
