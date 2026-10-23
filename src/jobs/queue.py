@@ -206,7 +206,10 @@ class JobQueue:
 
             async def on_progress(state: JobState, progress: JobProgress, message: str | None) -> None:
                 sync.kick()
-                await self._set(job_id, state, message, pass_num=progress.pass_num)
+                if not state.finished:
+                    await self._set(job_id, state, message, pass_num=progress.pass_num)
+                else:
+                    await self._repo.update(job_id, pass_num=progress.pass_num)
 
             state, _, message = await self._runner.run(spec, on_progress, output=output)
         except asyncio.CancelledError:
