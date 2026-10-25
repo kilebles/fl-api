@@ -670,7 +670,7 @@ class VoiceService:
         key = self.fish_api_key()
         if key:
             try:
-                audio = await synthesize_fish(sample_text, v.fish_id, key, model=PAID_MODEL_DEFAULT, attempts=2)
+                audio, _ = await self._synth_s2(sample_text, v.fish_id, key)
                 out.write_bytes(audio)
                 return out
             except VoiceApiError:
@@ -1481,9 +1481,11 @@ class VoiceService:
         key = self.fish_api_key()
         if not key:
             raise VoiceApiError(503, "fish_key_missing", "Нет ключа Fish Audio (FISH_API_KEY или bot_config.json переводчика)")
-        model_name = DRAMA_MODEL if job.voice_model == "drama-3" else PAID_MODEL_DEFAULT
         tts_text = with_carry(p.text, p.carried_mood) if job.voice_model == "drama-3" and job.carry_mood else p.text
-        audio = await synthesize_fish(clean_for_tts(tts_text), self.resolve_fish_id(vid), key, model=model_name, attempts=2)
+        if job.voice_model == "drama-3":
+            audio = await synthesize_fish(clean_for_tts(tts_text), self.resolve_fish_id(vid), key, model=DRAMA_MODEL, attempts=2)
+        else:
+            audio, _ = await self._synth_s2(clean_for_tts(tts_text), self.resolve_fish_id(vid), key)
         is_source = t_lang == disk_lang(job.source_lang)
         folder = self.audio_dir / (job.script if is_source else f"{job.script}_{t_lang}")
         folder.mkdir(parents=True, exist_ok=True)
@@ -1495,6 +1497,23 @@ class VoiceService:
         updated = await self._get_single_paragraph(job_id, t_lang, n)
         self._paragraph_event(job_id, t_lang, updated)
         return updated
+
+    async def _synth_s2(self, text: str, fish_id: str, key: str) -> tuple[bytes, str]:
+        """Fish S2.1 like the translator: the free model first, the paid one only if the free one refuses
+        (translator config fish.free_first / free_model / model)."""
+        fish = self.tr.config().get("fish") or {}
+        paid = fish.get("model") or PAID_MODEL_DEFAULT
+        if str(paid).startswith("drama"):
+            paid = PAID_MODEL_DEFAULT
+        free = fish.get("free_model") or FREE_MODEL_DEFAULT
+        if fish.get("free_first", True) and free != paid and str(free).startswith(paid):
+            try:
+                return await synthesize_fish(text, fish_id, key, model=free, attempts=2), free
+            except VoiceApiError as e:
+                if e.code in ("voice_missing", "fish_auth"):  # another model will not help
+                    raise
+                logger.warning(f"[voice] free Fish model {free} refused ({e.message}), using {paid}")
+        return await synthesize_fish(text, fish_id, key, model=paid, attempts=2), paid
 
     async def compare_paragraph_voices(self, job_id: int, lang: str, n: int) -> list[CompareVoiceVariant]:
         job = self.get_job(job_id)

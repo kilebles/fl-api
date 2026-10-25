@@ -412,3 +412,33 @@ def test_end_to_end_with_real_translator_workers(env):
     assert any(e["event"] == "job.done" and e["data"]["job_id"] == job_id for e in svc._event_history)
     paras = client.get(f"/api/voice/jobs/{job_id}/languages/EN/paragraphs").json()
     assert paras[0]["audio"]["slot_sec"] and paras[0]["norm"][0] > 100
+
+
+def test_single_paragraph_voiceover_tries_free_model_first(env, monkeypatch):
+    import src.voice.service as service
+    from src.voice.models import VoiceApiError
+
+    client, bot, svc = env
+    calls, refusals = [], [1]
+
+    async def fake_synth(text, fish_id, key, model, attempts=2):
+        calls.append(model)
+        if model.endswith("-free") and refusals:
+            refusals.pop()
+            raise VoiceApiError(502, "fish_error", "free tier busy")
+        return b"\xff\xfb" + b"\x00" * 30000
+
+    monkeypatch.setattr(service, "synthesize_fish", fake_synth)
+    svc._settings.fish_api_key = "k"
+    script = _upload(client, EN)
+    job_id = client.post("/api/voice/jobs", json={"script_id": script["script_id"], "mode": "translate",
+                                                  "targets": ["RU"]}).json()["id"]
+    assert client.get(f"/api/voice/jobs/{job_id}").json()["voice_model"] == "s2.1"
+    bot.translate(script["script_id"], "RU", ["Один.", "Два."])
+    bot.update(job_id, status="done", results={"RU": "50%"})
+    r = client.post(f"/api/voice/jobs/{job_id}/languages/RU/paragraphs/1/revoice")
+    assert r.status_code == 202, r.text
+    assert calls == ["s2.1-pro-free", "s2.1-pro"]  # free first, paid only after the free one refused
+    calls.clear()
+    client.post(f"/api/voice/jobs/{job_id}/languages/RU/paragraphs/2/revoice")
+    assert calls == ["s2.1-pro-free"]
