@@ -138,6 +138,7 @@ VOICE_MODELS: list[VoiceModelInfo] = [
 ALL_DISK_LANGS = ["EN", "RU", "ES", "PT_BR", "DE", "IT", "PL", "FR"]
 LANG_SUFFIX_RE = re.compile(r"_(PT_BR|RU|ES|DE|IT|PL|FR|EN)$")
 WATCH_EVERY = 1.5  # seconds between queue scans for SSE events
+LIST_LIMIT = 200  # newest web jobs in the list (the bot's history can be long)
 RETRANSLATE_TIMEOUT = 25 * 60
 
 
@@ -230,6 +231,7 @@ class VoiceService:
         self._seen: dict[int, tuple] = {}
         self._seen_queue: tuple = ()
         self._voices_cache: tuple | None = None
+        self._built: dict[int, tuple[tuple, VoiceJob]] = {}
 
     async def start(self) -> None:
         if self.tr.available:
@@ -303,6 +305,7 @@ class VoiceService:
         """Compare the queue with the last scan; emit job.status / job.done / job.failed / voice.missing."""
         chains = self._chains()
         seen: dict[int, tuple] = {}
+        by_docx: dict[str, str] = {}
         for root, chain in chains.items():
             cur = chain[-1]
             sig = tuple((j["id"], j.get("status"), json.dumps(j.get("progress"), sort_keys=True),
@@ -311,7 +314,7 @@ class VoiceService:
             seen[root] = sig
             if not emit or self._seen.get(root) == sig:
                 continue
-            job = self._build(root, chain, {})
+            job = self._build_cached(root, chain, by_docx)
             old = self._seen.get(root)
             self.emit("job.status", {"job_id": root, "status": job.status})
             for j in chain:
@@ -1097,12 +1100,38 @@ class VoiceService:
                 add("joined_mp3", lang, f"{slug}_{a}.mp3", joined.stat().st_size)
         return out
 
+    def _cache_key(self, chain: list[dict[str, Any]], slug: str) -> tuple:
+        """What a built job depends on: its translator jobs and the folders the bot writes for the script."""
+
+        def mtime(p: Path) -> int:
+            try:
+                return p.stat().st_mtime_ns
+            except OSError:
+                return 0
+
+        dirs = [self.work_dir / slug, self.audio_dir / slug, self.mix_dir / slug, self.tools_dir / "voices.json"]
+        dirs += [self.audio_dir / f"{slug}_{lang}" for lang in ALL_DISK_LANGS]
+        dirs += [self.mix_dir / slug / lang for lang in ALL_DISK_LANGS]
+        return (json.dumps(chain, sort_keys=True, ensure_ascii=False), tuple(mtime(d) for d in dirs))
+
+    def _build_cached(self, root: int, chain: list[dict[str, Any]], by_docx: dict[str, str]) -> VoiceJob:
+        key = self._cache_key(chain, self._chain_slug(chain, by_docx))
+        hit = self._built.get(root)
+        if hit and hit[0] == key:
+            return hit[1]
+        job = self._build(root, chain, by_docx)
+        self._built[root] = (key, job)
+        return job
+
     def list_jobs(self, status: str | None = None, project_id: str | None = None) -> list[VoiceJob]:
         by_docx: dict[str, str] = {}
         items = []
-        for root, chain in sorted(self._chains().items(), reverse=True):
+        chains = sorted(self._chains().items(), reverse=True)[:LIST_LIMIT]
+        for gone in set(self._built) - {root for root, _ in chains}:
+            self._built.pop(gone, None)
+        for root, chain in chains:
             try:
-                items.append(self._build(root, chain, by_docx))
+                items.append(self._build_cached(root, chain, by_docx))
             except Exception:
                 logger.exception(f"[voice] cannot show translator job #{root}")
         if status:
@@ -1112,7 +1141,7 @@ class VoiceService:
         return items
 
     def get_job(self, job_id: int) -> VoiceJob:
-        return self._build(job_id, self._chain(job_id), {})
+        return self._build_cached(job_id, self._chain(job_id), {})
 
     async def create_jobs(self, req: CreateVoiceJobRequest) -> list[VoiceJob]:
         self.tr.require()
