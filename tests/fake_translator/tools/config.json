@@ -1,0 +1,92 @@
+{
+ "language_order": [
+  "RU",
+  "ES",
+  "PT_BR",
+  "DE",
+  "IT",
+  "PL",
+  "FR"
+ ],
+ "languages": {
+  "EN": {
+   "name": "английский",
+   "min": 100,
+   "max": 100
+  },
+  "RU": {
+   "name": "русский",
+   "min": 87,
+   "max": 90
+  },
+  "ES": {
+   "name": "испанский",
+   "min": 88,
+   "max": 90
+  },
+  "PT_BR": {
+   "name": "португальский (Бразилия)",
+   "min": 75,
+   "max": 80
+  },
+  "DE": {
+   "name": "немецкий",
+   "min": 80,
+   "max": 85
+  },
+  "IT": {
+   "name": "итальянский",
+   "min": 88,
+   "max": 92
+  },
+  "PL": {
+   "name": "польский",
+   "min": 88,
+   "max": 92
+  },
+  "FR": {
+   "name": "французский",
+   "min": 85,
+   "max": 88
+  }
+ },
+ "agy": {
+  "model": "gemini-4-argon-medium",
+  "timeout_minutes": 30,
+  "binary_path": "",
+  "extra_args": []
+ },
+ "parallel": {
+  "agy": 3,
+  "claude": 3
+ },
+ "mix": {
+  "pause_sec": 0.5,
+  "max_speedup": 1.08,
+  "bitrate": "192k",
+  "paragraphs_for": [
+   "EN"
+  ]
+ },
+ "fish": {
+  "model": "s2.1-pro",
+  "free_model": "s2.1-pro-free",
+  "free_first": true,
+  "temperature": 1.0,
+  "top_p": 0.8,
+  "repetition_penalty": 1.3,
+  "mp3_bitrate": 192,
+  "latency": "normal",
+  "speed": 1.0,
+  "chunk_length": 200,
+  "parallel": 5,
+  "price_usd_per_million_bytes": 15
+ },
+ "tune": {
+  "target_time": 0.97,
+  "history": 5,
+  "min_change": 1.5,
+  "auto": false
+ },
+ "engine": "agy"
+}

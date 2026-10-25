@@ -141,17 +141,17 @@ async def get_job(job_id: int, request: Request) -> VoiceJob:
 
 @router.post("/jobs/{job_id}/stop")
 async def stop_job(job_id: int, request: Request) -> VoiceJob:
-    return _svc(request).stop_job(job_id)
+    return await _svc(request).stop_job(job_id)
 
 
 @router.post("/jobs/{job_id}/resume", status_code=202)
 async def resume_job(job_id: int, request: Request) -> VoiceJob:
-    return _svc(request).resume_job(job_id)
+    return await _svc(request).resume_job(job_id)
 
 
 @router.delete("/jobs/{job_id}", status_code=204)
 async def delete_job(job_id: int, request: Request) -> Response:
-    _svc(request).delete_job(job_id)
+    await _svc(request).delete_job(job_id)
     return Response(status_code=204)
 
 
@@ -171,7 +171,7 @@ async def get_paragraphs(
     request: Request,
     filter: ParagraphFilter = Query(default="all"),
 ) -> list[VoiceParagraph]:
-    return _svc(request).get_paragraphs(job_id, lang, filter_by=filter)
+    return await _svc(request).get_paragraphs(job_id, lang, filter_by=filter)
 
 
 @router.patch("/jobs/{job_id}/languages/{lang}/paragraphs/{n}")
@@ -182,7 +182,7 @@ async def patch_paragraph(
     body: PatchParagraphRequest,
     request: Request,
 ) -> VoiceParagraph:
-    return _svc(request).patch_paragraph(job_id, lang, n, body)
+    return await _svc(request).patch_paragraph(job_id, lang, n, body)
 
 
 @router.post("/jobs/{job_id}/languages/{lang}/paragraphs/{n}/length")
@@ -193,7 +193,7 @@ async def measure_paragraph_length(
     body: ParagraphLengthRequest,
     request: Request,
 ) -> ParagraphLengthResponse:
-    return _svc(request).measure_paragraph_length(job_id, lang, n, body.text)
+    return await _svc(request).measure_paragraph_length(job_id, lang, n, body.text)
 
 
 @router.post("/jobs/{job_id}/languages/{lang}/paragraphs/{n}/retranslate", status_code=202)
@@ -223,7 +223,7 @@ async def revert_paragraph(
     n: int,
     request: Request,
 ) -> VoiceParagraph:
-    return _svc(request).revert_paragraph(job_id, lang, n)
+    return await _svc(request).revert_paragraph(job_id, lang, n)
 
 
 @router.post("/jobs/{job_id}/languages/{lang}/paragraphs/{n}/compare-voices")

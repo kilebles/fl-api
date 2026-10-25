@@ -1,7 +1,12 @@
-"""Core service for Translation, Voiceover (Fish Audio S2.1 / Drama 3), and Audio Mixing."""
+"""Translation & voiceover for the web panel, run by fl-voice_translator.
+
+Jobs go into the translator's own queue (`queue/`), and its Telegram bot runs them exactly like jobs sent from
+Telegram: translation with the chosen model and length fitting, Fish voiceover, mixing under the original.
+This service turns the queue and the translator's files into the web API: a web job is a chain of translator
+jobs (translate → voice → mix) linked by `root`; its id is the id of the first one.
+"""
 
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -15,11 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from docx import Document
 from loguru import logger
 
 from src.core.settings import Settings
-from src.prompts.llm import LLMClient
 from src.voice.fish import (
     DRAMA_MODEL,
     FREE_MODEL_DEFAULT,
@@ -28,13 +31,10 @@ from src.voice.fish import (
     check_voice_fish,
     clean_for_tts,
     compute_waveform_peaks,
-    decode_pcm,
-    encode_pcm_bytes,
     fetch_voice_info,
     mp3_duration_sec,
     parse_voice_ref,
     synthesize_fish,
-    trim_tail,
 )
 from src.voice.models import (
     AddVoiceRequest,
@@ -74,21 +74,18 @@ from src.voice.text import (
     LANG_CONFIG,
     MAIN_LANG_ORDER,
     api_lang,
-    build_docx,
     carry_plan,
-    detect_source_lang,
     disk_lang,
     evaluate_paragraph,
     has_tags,
     list_languages,
     load_translation,
-    save_translation,
     short_name,
     spoken_len,
-    split_doc,
     strip_tags,
     with_carry,
 )
+from src.voice.translator import Translator, find_root, parse_short_time
 
 TRANSLATION_MODELS: list[TranslationModelInfo] = [
     TranslationModelInfo(
@@ -138,27 +135,42 @@ VOICE_MODELS: list[VoiceModelInfo] = [
     ),
 ]
 
+ALL_DISK_LANGS = ["EN", "RU", "ES", "PT_BR", "DE", "IT", "PL", "FR"]
+LANG_SUFFIX_RE = re.compile(r"_(PT_BR|RU|ES|DE|IT|PL|FR|EN)$")
+WATCH_EVERY = 1.5  # seconds between queue scans for SSE events
+RETRANSLATE_TIMEOUT = 25 * 60
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_short_time(val: str | None) -> str:
-    """Convert '22.10 07:42' or ISO string into ISO 8601 UTC."""
-    if not val:
-        return _now_iso()
-    if "T" in val:
-        return val
-    m = re.match(r"^(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})$", val.strip())
+def _kind(job: dict[str, Any]) -> str:
+    return job.get("kind", "translate")
+
+
+def _engine(job: dict[str, Any]) -> str:
+    return (job.get("engine") or "claude").lower()
+
+
+def _count_mp3(folder: Path) -> int:
+    try:
+        return sum(1 for p in folder.glob("*.mp3") if p.stem.isdigit() and p.stat().st_size > 500)
+    except OSError:
+        return 0
+
+
+def _voiced_counts(result: str | None) -> tuple[int, int] | None:
+    """'122 дорожек (…, озвучено сейчас 20, готовых взято 102)' → (new, reused)."""
+    if not result:
+        return None
+    m = re.search(r"озвучено сейчас (\d+), готовых взято (\d+)", result)
     if m:
-        day, month, hour, minute = map(int, m.groups())
-        year = datetime.now(timezone.utc).year
-        try:
-            dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
-            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        except ValueError:
-            pass
-    return _now_iso()
+        return int(m.group(1)), int(m.group(2))
+    if "все дорожки уже были готовы" in result:
+        n = re.match(r"(\d+)", result)
+        return (0, int(n.group(1))) if n else None
+    return None
 
 
 def _extract_channels(profile_name: str) -> list[str]:
@@ -194,69 +206,46 @@ def _infer_langs_from_name(name: str, used_langs: set[str]) -> list[str]:
 
 
 class VoiceService:
-    """Manages scripts, voice profiles, Fish Audio voices, jobs, paragraphs, and SSE events."""
+    """Scripts, voice profiles, Fish voices and jobs of fl-voice_translator; SSE events for the web panel."""
 
-    def __init__(self, settings: Settings, llm: LLMClient | None = None) -> None:
+    def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._llm = llm
-        win_translator = Path.home() / "script-translator v31"
-        if settings.voice_dir == Path("work/voice") and win_translator.exists():
-            self.root = win_translator
-        else:
-            self.root = settings.voice_dir.resolve()
-
-        self.tools_dir = self.root / "tools"
-        self.work_dir = self.root / "work"
-        self.input_dir = self.root / "input"
-        self.output_dir = self.root / "output"
-        self.audio_dir = self.output_dir / "audio"
-        self.mix_dir = self.output_dir / "mix"
-        self.queue_dir = self.root / "queue"
+        self.tr = Translator(find_root(settings.voice_dir), settings.voice_python)
+        self.root = self.tr.root
+        self.tools_dir = self.tr.tools_dir
+        self.work_dir = self.tr.work_dir
+        self.input_dir = self.tr.input_dir
+        self.output_dir = self.tr.output_dir
+        self.audio_dir = self.tr.audio_dir
+        self.mix_dir = self.tr.mix_dir
         self.samples_dir = self.output_dir / "samples"
         self.compare_dir = self.output_dir / "compare"
-        self.api_jobs_file = self.work_dir / "api_jobs.json"
-
-        for d in (
-            self.tools_dir,
-            self.work_dir,
-            self.input_dir,
-            self.output_dir,
-            self.audio_dir,
-            self.mix_dir,
-            self.queue_dir,
-            self.samples_dir,
-            self.compare_dir,
-        ):
-            d.mkdir(parents=True, exist_ok=True)
+        self.api_dir = self.work_dir / "_api"  # zip archives built for downloads
 
         self._event_seq = int(time.time() * 10) % 100000
         self._event_history: deque[dict[str, Any]] = deque(maxlen=500)
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
-        self._running_tasks: dict[int, asyncio.Task] = {}
-        self._stop_flags: set[int] = set()
-        self._busy_langs: set[tuple[int, str]] = set()
         self._file_registry: dict[str, Path] = {}
+        self._watch_task: asyncio.Task | None = None
+        self._seen: dict[int, tuple] = {}
+        self._seen_queue: tuple = ()
+        self._voices_cache: tuple | None = None
 
     async def start(self) -> None:
-        """Resume any API jobs that were interrupted by a server restart."""
-        jobs = self._read_api_jobs()
-        changed = False
-        for j in jobs.values():
-            if j.get("status") == "running":
-                j["status"] = "queued"
-                changed = True
-                self._schedule_job(j["id"])
-            elif j.get("status") == "queued":
-                self._schedule_job(j["id"])
-        if changed:
-            self._write_api_jobs(jobs)
+        if self.tr.available:
+            logger.info(f"[voice] translator: {self.root} (python: {self.tr.python()})")
+        else:
+            logger.warning(f"[voice] translator not found in {self.root}: voice jobs are unavailable")
+        self._watch_task = asyncio.create_task(self._watch(), name="voice_watch")
 
     async def stop(self) -> None:
-        for task in list(self._running_tasks.values()):
-            task.cancel()
-        if self._running_tasks:
-            await asyncio.gather(*self._running_tasks.values(), return_exceptions=True)
-        self._running_tasks.clear()
+        if self._watch_task:
+            self._watch_task.cancel()
+            try:
+                await self._watch_task
+            except asyncio.CancelledError:
+                pass
+            self._watch_task = None
 
     def fish_api_key(self) -> str:
         if self._settings.fish_api_key:
@@ -297,11 +286,72 @@ class VoiceService:
         finally:
             self._subscribers.discard(q)
 
+    async def _watch(self) -> None:
+        """Scan the translator queue and turn changes into SSE events (the bot changes it, not this process)."""
+        first = True
+        while True:
+            try:
+                self.scan(emit=not first)
+                first = False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[voice] queue scan failed")
+            await asyncio.sleep(WATCH_EVERY)
+
+    def scan(self, emit: bool = True) -> None:
+        """Compare the queue with the last scan; emit job.status / job.done / job.failed / voice.missing."""
+        chains = self._chains()
+        seen: dict[int, tuple] = {}
+        for root, chain in chains.items():
+            cur = chain[-1]
+            sig = tuple((j["id"], j.get("status"), json.dumps(j.get("progress"), sort_keys=True),
+                         json.dumps(j.get("results"), sort_keys=True, ensure_ascii=False), j.get("pause_until"),
+                         json.dumps(j.get("skipped"), sort_keys=True)) for j in chain)
+            seen[root] = sig
+            if not emit or self._seen.get(root) == sig:
+                continue
+            job = self._build(root, chain, {})
+            old = self._seen.get(root)
+            self.emit("job.status", {"job_id": root, "status": job.status})
+            for j in chain:
+                prev = next((x for x in (old or ()) if x[0] == j["id"]), None)
+                new_skips = set(j.get("skipped") or {}) - set(json.loads(prev[5] or "null") or {} if prev else {})
+                for lang in new_skips:
+                    vid = (j.get("skipped") or {})[lang]
+                    self.emit("voice.missing", {"job_id": root, "lang": api_lang(lang), "voice_id": vid,
+                                                "voice_name": self._voice_name(vid)})
+            if old and job.status == "done" and not all(x[1] == "done" for x in old):
+                self.emit("job.done", {"job_id": root, "files": [f.model_dump() for f in job.files],
+                                       "summary": job.summary.model_dump() if job.summary else {}})
+            if job.status == "failed" and (not old or old[-1][1] != "failed" or len(old) != len(sig)):
+                self.emit("job.failed", {"job_id": root, "code": job.error_code or "translator_error",
+                                         "message": job.error_message or "Ошибка задачи", "log_tail": self._log_tail(cur)})
+        if emit:
+            for gone in set(self._seen) - set(seen):
+                self.emit("job.status", {"job_id": gone, "status": "deleted"})
+        self._seen = seen
+        q = tuple(sorted((j["id"], j.get("status")) for chain in chains.values() for j in chain))
+        if emit and q != self._seen_queue:
+            self._emit_queue_changed()
+        self._seen_queue = q
+
+    def _log_tail(self, job: dict[str, Any]) -> list[str]:
+        if job.get("error"):
+            return str(job["error"]).splitlines()[-12:]
+        return [e.get("text", "") for e in self.tr.events(job["id"])[-5:]]
+
+    def _voice_name(self, ref: str) -> str:
+        sid = self.resolve_short_voice_id(ref)
+        v = next((x for x in self.list_voices() if x.id == sid), None)
+        return v.name if v else ref
+
     # ------------------------------------------------------- Voices & Profiles ---
 
     def _voices_file(self) -> Path:
         f = self.tools_dir / "voices.json"
         if not f.exists():
+            self.tools_dir.mkdir(parents=True, exist_ok=True)
             ex = self.tools_dir / "voices.example.json"
             if ex.exists():
                 shutil.copyfile(ex, f)
@@ -310,8 +360,15 @@ class VoiceService:
         return f
 
     def _read_voices_raw(self) -> dict[str, Any]:
+        f = self._voices_file()
         try:
-            return json.loads(self._voices_file().read_text(encoding="utf-8"))
+            key = (f.stat().st_mtime_ns, f.stat().st_size)
+            if self._voices_cache and self._voices_cache[0] == key:
+                return json.loads(self._voices_cache[1])
+            text = f.read_text(encoding="utf-8")
+            data = json.loads(text)
+            self._voices_cache = (key, text)
+            return data
         except Exception:
             return {"voices": [], "profiles": [], "active": "p1"}
 
@@ -430,11 +487,10 @@ class VoiceService:
             # Norms (percents)
             norms_map: dict[str, tuple[int, int]] = {}
             percents = p.get("percents") or p.get("norms") or {}
+            base = self._base_norms()
             for lang_code in MAIN_LANG_ORDER:
-                if lang_code == "EN":
-                    norms_map["EN"] = (76, 82)
-                    continue
-                pair = percents.get(lang_code) or percents.get(disk_lang(lang_code)) or LANG_CONFIG[lang_code]["norm"]
+                pair = percents.get(lang_code) or percents.get(disk_lang(lang_code)) or base.get(lang_code)
+                pair = pair or LANG_CONFIG[lang_code]["norm"]
                 norms_map[lang_code] = (int(pair[0]), int(pair[1]))
 
             out.append(
@@ -601,6 +657,7 @@ class VoiceService:
         v = next((x for x in voices if x.id == voice_id or x.fish_id == voice_id), None)
         if not v:
             raise VoiceApiError(404, "voice_not_found", "Голос не найден")
+        self.samples_dir.mkdir(parents=True, exist_ok=True)
         out = self.samples_dir / f"{v.fish_id}.mp3"
         if out.exists() and out.stat().st_size > 1000:
             return out
@@ -613,15 +670,21 @@ class VoiceService:
                 audio = await synthesize_fish(sample_text, v.fish_id, key, model=PAID_MODEL_DEFAULT, attempts=2)
                 out.write_bytes(audio)
                 return out
+            except VoiceApiError:
+                raise
             except Exception as e:
                 logger.warning(f"[voice] could not synthesize sample for {v.id}: {e}")
+                raise VoiceApiError(502, "fish_error", f"Fish не озвучил пример голоса: {e}") from e
+        raise VoiceApiError(503, "fish_key_missing", "Нет ключа Fish Audio (FISH_API_KEY или bot_config.json переводчика)")
 
-        # Fallback: copy any existing audio track or generate 2s silence MP3 via ffmpeg
-        for mp3 in self.audio_dir.rglob("1.mp3"):
-            if mp3.stat().st_size > 1000:
-                shutil.copyfile(mp3, out)
-                return out
-        encode_pcm_bytes(b"\x00" * (44100 * 4), out)
+    def _base_norms(self) -> dict[str, tuple[int, int]]:
+        """Length ranges from the translator's config (percent of an English original)."""
+        out: dict[str, tuple[int, int]] = {}
+        for code, v in (self.tr.config().get("languages") or {}).items():
+            try:
+                out[api_lang(code)] = (int(v["min"]), int(v["max"]))
+            except (KeyError, TypeError, ValueError):
+                continue
         return out
 
     # ------------------------------------------------------- Models, Languages, Scripts, Estimate ---
@@ -631,16 +694,16 @@ class VoiceService:
 
     def get_languages(self, profile_id: str | None = None) -> list[LanguageInfo]:
         prof = self.get_profile(profile_id)
-        return list_languages(prof.norms)
+        langs = list_languages(prof.norms)
+        # the translator works with these languages; the extra ones in LANG_CONFIG are not supported yet
+        return [lang for lang in langs if lang.code in MAIN_LANG_ORDER]
 
     def list_scripts(self) -> list[ScriptInfo]:
         out: list[ScriptInfo] = []
         if not self.work_dir.exists():
             return out
-        for d in sorted(self.work_dir.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
-            src_file = d / "source.json"
-            if not d.is_dir() or not src_file.exists():
-                continue
+        dirs = [d for d in self.work_dir.iterdir() if d.is_dir() and (d / "source.json").exists()]
+        for d in sorted(dirs, key=lambda p: (p / "source.json").stat().st_mtime, reverse=True):
             try:
                 out.append(self._script_info_from_dir(d))
             except Exception:
@@ -655,14 +718,13 @@ class VoiceService:
         words = len(re.findall(r"\S+", strip_tags(full_text)))
         tags_count = sum(1 for it in numbered if has_tags(it.get("text", "")))
         bytes_total = sum(len(clean_for_tts(it.get("text", "")).encode("utf-8")) for it in numbered)
-        src_lang = data.get("source_lang") or detect_source_lang(full_text)
         raw_docx = str(data.get("docx") or proj.name).replace("\\", "/")
         title = data.get("title") or Path(raw_docx).stem.replace("_", " ")
         return ScriptInfo(
             script_id=proj.name,
             name=proj.name,
             title=title,
-            source_lang=api_lang(src_lang),
+            source_lang=api_lang(data.get("source_lang") or "EN"),
             paragraphs_total=len(numbered),
             words_total=words,
             emotion_tags_count=tags_count,
@@ -671,37 +733,23 @@ class VoiceService:
         )
 
     async def upload_script(self, filename: str, content: bytes, title: str | None = None) -> ScriptInfo:
+        self.tr.require()
         stem = Path(filename).stem
-        slug = short_name(stem)
-        docx_path = self.input_dir / f"{slug}.docx"
+        # a language suffix in the name of an original would read as a translation (rome_RU = Russian track)
+        clean = LANG_SUFFIX_RE.sub("", short_name(stem)) or "script"
+        self.input_dir.mkdir(parents=True, exist_ok=True)
+        docx_path = self.input_dir / f"{clean}.docx"
         docx_path.write_bytes(content)
-        try:
-            doc = Document(str(docx_path))
-        except Exception as e:
-            raise VoiceApiError(422, "invalid_docx", f"Не удалось прочитать документ .docx: {e}") from e
+        args = ["prepare", str(docx_path)]
+        if title or stem:
+            args += ["--title", title or stem.replace("_", " ")]
+        res = await self.tr.call(*args)
+        return self._script_info_from_dir(self.work_dir / res["script_id"])
 
-        items = [{k: e[k] for k in ("key", "heading", "text")} for e in split_doc(doc)]
-        numbered = [it for it in items if not it["heading"]]
-        if not numbered:
-            raise VoiceApiError(
-                422,
-                "no_paragraphs",
-                "Абзацы должны быть списком Word или начинаться с «1.» и табуляции",
-            )
-
-        proj = self.work_dir / slug
-        proj.mkdir(parents=True, exist_ok=True)
-        full_text = "\n".join(it["text"] for it in numbered)
-        src_lang = detect_source_lang(full_text)
-        src_data = {
-            "docx": str(docx_path),
-            "name": slug,
-            "title": title or stem.replace("_", " "),
-            "source_lang": src_lang,
-            "items": items,
-        }
-        (proj / "source.json").write_text(json.dumps(src_data, ensure_ascii=False, indent=1), encoding="utf-8")
-        return self._script_info_from_dir(proj)
+    async def _set_source_lang(self, script_id: str, lang: str) -> None:
+        src = self.tr.source(script_id) or {}
+        if src and disk_lang(lang) != (src.get("source_lang") or "EN") and src.get("docx"):
+            await self.tr.call("prepare", src["docx"], "--source-lang", disk_lang(lang))
 
     def estimate(self, req: EstimateRequest) -> EstimateResponse:
         proj = self.work_dir / req.script_id
@@ -716,17 +764,16 @@ class VoiceService:
         t_model = next((m for m in TRANSLATION_MODELS if m.id == req.model), TRANSLATION_MODELS[0])
         v_model = next((m for m in VOICE_MODELS if m.id == req.voice_model), VOICE_MODELS[0])
         targets_count = max(1, len(req.targets))
+        parallel = int((self.tr.config().get("parallel") or {}).get(t_model.engine, 3))
 
-        # Estimate time
         trans_sec = 0
         if req.mode in ("all", "translate"):
-            parallel = min(3, targets_count) if req.split_by_language else 1
-            batches = max(1.0, ( targets_count / parallel ))
+            # languages of one job go one after another; split jobs run in parallel up to the engine's limit
+            batches = targets_count / max(1, min(parallel, targets_count)) if req.split_by_language else targets_count
             trans_sec = int(batches * t_model.est_minutes_per_lang * 60 * (paras / 120.0))
-        voice_sec = int(targets_count * paras * 1.5) if req.mode in ("all", "voice") else 0
+        voice_sec = int((targets_count + 1) * paras * 1.5) if req.mode in ("all", "voice") else 0
         mix_sec = int(paras * 1.2) if req.mode in ("all", "mix") else 0
 
-        # Estimate Fish cost (source + targets if mode includes voice)
         voiced_langs = (targets_count + 1) if req.mode in ("all", "voice") else 0
         total_bytes = bytes_per_lang * voiced_langs
         cost = round((total_bytes / 1_000_000.0) * v_model.price_usd_per_million_bytes, 2)
@@ -739,370 +786,325 @@ class VoiceService:
             price_usd_per_million_bytes=v_model.price_usd_per_million_bytes,
         )
 
-    # ------------------------------------------------------- Jobs & Queue ---
+    # ------------------------------------------------------- Jobs: translator queue → web jobs ---
 
-    def _read_api_jobs(self) -> dict[int, dict[str, Any]]:
-        if self.api_jobs_file.exists():
-            try:
-                raw = json.loads(self.api_jobs_file.read_text(encoding="utf-8"))
-                return {int(k): v for k, v in raw.items()}
-            except Exception:
-                pass
-        return {}
-
-    def _write_api_jobs(self, jobs: dict[int, dict[str, Any]]) -> None:
-        tmp = self.api_jobs_file.with_name(f"api_jobs.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({str(k): v for k, v in jobs.items()}, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self.api_jobs_file)
-
-    def _ensure_seeded_jobs(self) -> dict[int, dict[str, Any]]:
-        """Ensure existing scripts in work/ and legacy queue/*.json are represented in api_jobs."""
-        jobs = self._read_api_jobs()
-        if jobs:
-            return jobs
-
-        # Import scripts from work/ and legacy queue/*.json
-        legacy_by_script: dict[str, list[dict[str, Any]]] = {}
-        for qf in sorted(self.queue_dir.glob("*.json")):
-            try:
-                qdata = json.loads(qf.read_text(encoding="utf-8"))
-                raw_ref = str(qdata.get("script") or qdata.get("docx") or qdata.get("name") or "").replace("\\", "/")
-                script_slug = short_name(Path(raw_ref).stem)
-                script_slug = re.sub(r"_(PT_BR|RU|ES|DE|IT|PL|FR|EN)$", "", script_slug, flags=re.IGNORECASE)
-                if script_slug:
-                    legacy_by_script.setdefault(script_slug, []).append(qdata)
-            except Exception:
+    def _chains(self) -> dict[int, list[dict[str, Any]]]:
+        """Translator jobs grouped into web jobs: {root id: [jobs in order]}. Model tests are not shown."""
+        jobs = self.tr.jobs()
+        chains: dict[int, list[dict[str, Any]]] = {}
+        for jid in sorted(jobs):
+            j = jobs[jid]
+            if j.get("test"):
                 continue
+            j["id"] = jid
+            chains.setdefault(int(j.get("root") or jid), []).append(j)
+        return chains
 
-        next_id = 1
-        seen_slugs: set[str] = set()
-        for script_info in self.list_scripts():
-            slug = script_info.script_id
-            seen_slugs.add(slug)
-            leg = legacy_by_script.get(slug, [])
-            jid = max((int(x.get("id", 0)) for x in leg), default=0) or next_id
-            while jid in jobs:
-                jid += 1
-            next_id = max(next_id, jid + 1)
+    def _chain(self, job_id: int) -> list[dict[str, Any]]:
+        chain = self._chains().get(job_id)
+        if not chain:
+            raise VoiceApiError(404, "job_not_found", f"Задача #{job_id} не найдена")
+        return chain
 
-            prof_id = next((x.get("profile") for x in reversed(leg) if x.get("profile")), "p2")
-            prof = self.get_profile(prof_id)
-            proj = self.work_dir / slug
-            targets = [l for l in MAIN_LANG_ORDER if l != script_info.source_lang and (proj / f"{disk_lang(l)}.md").exists()]
-            if not targets:
-                targets = [l for l in MAIN_LANG_ORDER if l != script_info.source_lang]
+    def _chain_slug(self, chain: list[dict[str, Any]], by_docx: dict[str, str]) -> str:
+        for j in chain:
+            if (j.get("web") or {}).get("script"):
+                return j["web"]["script"]
+        if not by_docx:
+            by_docx.update(self.tr.slug_by_docx())
+        for j in chain:
+            if _kind(j) in ("mix", "join") and j.get("script"):
+                return j["script"]
+            if _kind(j) == "translate" and j.get("docx"):
+                stem = Path(str(j["docx"]).replace("\\", "/")).stem
+                if stem in by_docx:
+                    return by_docx[stem]
+            if _kind(j) == "voice":
+                for it in j.get("items") or []:
+                    stem = Path(str(it["docx"]).replace("\\", "/")).stem
+                    if stem in by_docx:
+                        return by_docx[stem]
+                    base = LANG_SUFFIX_RE.sub("", stem)
+                    if (self.work_dir / base / "source.json").exists():
+                        return base
+        return LANG_SUFFIX_RE.sub("", short_name(Path(str(chain[0].get("name") or chain[0]["id"])).stem))
 
-            has_drama = any("drama" in json.dumps(x, ensure_ascii=False).lower() for x in leg) or script_info.emotion_tags_count > 0
-            created = _parse_short_time(leg[0].get("added")) if leg else _now_iso()
-            finished = _parse_short_time(leg[-1].get("finished")) if leg and leg[-1].get("status") == "done" else _now_iso()
-            status = "done"
-            if any(x.get("status") == "running" for x in leg):
-                status = "running"
-            elif any(x.get("status") == "pending" for x in leg):
-                status = "queued"
-
-            jobs[jid] = {
-                "id": jid,
-                "title": script_info.title,
-                "script": slug,
-                "project_id": None,
-                "mode": "all",
-                "source_lang": script_info.source_lang,
-                "targets": targets,
-                "profile_id": prof.id,
-                "voices": dict(prof.default),
-                "model": "gemini-4-argon-medium",
-                "voice_model": "drama-3" if has_drama else "s2.1",
-                "carry_mood": bool(has_drama),
-                "status": status,
-                "created_at": created,
-                "started_at": created,
-                "finished_at": finished if status == "done" else None,
-                "skipped": {},
-                "norm_suggestions": {},
-            }
-
-        # Also import recent legacy queue items that don't have local work/ folders copied
-        for slug, leg in legacy_by_script.items():
-            if slug in seen_slugs or slug in ("1", "test"):
-                continue
-            jid = max((int(x.get("id", 0)) for x in leg), default=0) or next_id
-            while jid in jobs:
-                jid += 1
-            next_id = max(next_id, jid + 1)
-            prof_id = next((x.get("profile") for x in reversed(leg) if x.get("profile")), "p1")
-            prof = self.get_profile(prof_id)
-            raw_name = str(leg[-1].get("name") or slug).replace("\\", "/")
-            clean_title = re.sub(r"\s+(PT_BR|RU|ES|DE|IT|PL|FR|EN)$", "", Path(raw_name).stem.replace("_", " "), flags=re.IGNORECASE)
-            created = _parse_short_time(leg[0].get("added"))
-            finished = _parse_short_time(leg[-1].get("finished"))
-            jobs[jid] = {
-                "id": jid,
-                "title": clean_title.capitalize() if clean_title.islower() else clean_title,
-                "script": slug,
-                "project_id": None,
-                "mode": "all",
-                "source_lang": "EN",
-                "targets": ["RU", "ES", "PT", "DE", "IT", "PL", "FR"],
-                "profile_id": prof.id,
-                "voices": dict(prof.default),
-                "model": "gemini-4-argon-medium",
-                "voice_model": "s2.1",
-                "carry_mood": False,
-                "status": "done",
-                "paragraphs_total": 122,
-                "created_at": created,
-                "started_at": created,
-                "finished_at": finished,
-                "skipped": {},
-                "norm_suggestions": {},
-            }
-
-        if jobs:
-            self._write_api_jobs(jobs)
-        return jobs
-
-    def _build_job_model(self, raw_job: dict[str, Any]) -> VoiceJob:
-        jid = int(raw_job["id"])
-        slug = raw_job["script"]
-        proj = self.work_dir / slug
-        prof = self.get_profile(raw_job.get("profile_id"))
-        voices_by_id = {v.id: v for v in self.list_voices()}
-
-        if (proj / "source.json").exists():
-            s_info = self._script_info_from_dir(proj)
-            paras_total = s_info.paragraphs_total
-            tags_count = s_info.emotion_tags_count
+    def _targets(self, chain: list[dict[str, Any]], src_lang: str, slug: str) -> list[str]:
+        """Target languages (disk codes) of a web job."""
+        first = chain[0]
+        order = [src_lang] + [lang for lang in ALL_DISK_LANGS if lang != src_lang]
+        if _kind(first) == "translate":
+            langs = first.get("langs") or [lang for lang in ALL_DISK_LANGS if lang != src_lang]
+            if src_lang == "EN" and not first.get("langs"):
+                langs = [lang for lang in (self.tr.config().get("language_order") or ALL_DISK_LANGS[1:]) if lang != "EN"]
+        elif _kind(first) == "voice":
+            langs = [it["lang"] for it in first.get("items") or [] if not it.get("source") and it["lang"] != src_lang]
         else:
-            paras_total = int(raw_job.get("paragraphs_total") or 120)
-            tags_count = 0
+            done = (first.get("mix") or {}).get("stats") or {}
+            langs = [lang for lang in done if lang != src_lang] or [
+                lang for lang in ALL_DISK_LANGS if lang != src_lang and _count_mp3(self.audio_dir / f"{slug}_{lang}")
+            ]
+        return sorted({lang for lang in langs if lang != src_lang}, key=lambda x: order.index(x) if x in order else 99)
 
-        src_lang = api_lang(raw_job.get("source_lang", "EN"))
-        targets = [api_lang(t) for t in (raw_job.get("targets") or [])]
-        mode = raw_job.get("mode", "all")
-        v_model: Any = raw_job.get("voice_model", "s2.1")
-        job_status: Any = raw_job.get("status", "done")
-        skipped_map: dict[str, dict[str, str]] = raw_job.get("skipped") or {}
-        stage_overrides: dict[str, dict[str, Any]] = raw_job.get("lang_progress") or {}
+    def _build(self, root: int, chain: list[dict[str, Any]], by_docx: dict[str, str]) -> VoiceJob:
+        first, cur = chain[0], chain[-1]
+        web = next((j.get("web") for j in chain if j.get("web")), None) or {}
+        slug = self._chain_slug(chain, by_docx)
+        src = self.tr.source(slug) or {}
+        src_lang = disk_lang(src.get("source_lang") or "EN")
+        numbered = [it for it in src.get("items") or [] if not it.get("heading")]
+        paras_total = len(numbered)
+        tags_count = sum(1 for it in numbered if has_tags(it.get("text", "")))
 
-        # Estimate source duration (~11.5s per paragraph)
-        src_dur = round(paras_total * 11.8, 1)
+        kind0 = _kind(first)
+        mode = web.get("mode") or ("all" if first.get("pipeline") and kind0 == "translate" else
+                                   {"translate": "translate", "voice": "voice"}.get(kind0, "mix"))
+        targets = self._targets(chain, src_lang, slug)
+        tr_job = next((j for j in chain if _kind(j) == "translate"), None)
+        v_job = next((j for j in reversed(chain) if _kind(j) == "voice"), None)
+        v_jobs = [j for j in chain if _kind(j) == "voice"]
+        m_job = next((j for j in reversed(chain) if _kind(j) in ("mix", "join")), None)
+
+        prof = self.get_profile(first.get("profile"))
+        chosen = next((j.get("voices") for j in chain if j.get("voices")), None) or {}
+        voices = dict(prof.default)
+        for lang, ref in chosen.items():
+            voices[api_lang(lang)] = self.resolve_short_voice_id(ref)
+        cfg = self.tr.config()
+        if web.get("model"):
+            model = web["model"]
+        elif tr_job and _engine(tr_job) == "claude":
+            model = "claude-code"
+        elif tr_job:
+            model = tr_job.get("agy_model") or (cfg.get("agy") or {}).get("model") or "gemini-4-argon-medium"
+        else:
+            model = "gemini-4-argon-medium"
+        fish = next((j.get("voice_model") for j in chain if j.get("voice_model")), None) or (cfg.get("fish") or {}).get("model", "")
+        voice_model = web.get("voice_model") or ("drama-3" if str(fish).startswith("drama") else "s2.1")
+        carry = next((bool(j["carry_mood"]) for j in chain if "carry_mood" in j), bool((cfg.get("fish") or {}).get("drama_carry_mood")))
+
+        # ---- status of the whole chain
+        error_code = error_message = pause_until = pause_reason = None
+        running = next((j for j in chain if j.get("status") == "running"), None)
+        status: Any
+        if running:
+            status = "paused" if running.get("pause_until") else "running"
+            pause_until = parse_short_time(running.get("pause_until"))
+            pause_reason = running.get("pause_reason")
+        elif cur.get("status") == "pending":
+            status = "queued" if all(j.get("status") == "pending" for j in chain) else "running"
+        elif cur.get("status") == "failed":
+            status = "failed"
+            error_code = "translator_error"
+            error_message = (str(cur.get("error") or "").strip().splitlines() or ["Ошибка, подробности — в журнале задачи"])[-1]
+        elif cur.get("status") == "stopped":
+            status = "stopped"
+        elif mode == "all" and _kind(cur) != "mix" and cur.get("status") == "done":
+            if _kind(cur) == "voice" and src_lang in (cur.get("skipped") or {}):
+                status, error_code = "failed", "voice_missing"
+                error_message = f"Голос оригинала ({api_lang(src_lang)}) недоступен в Fish Audio — сводить не с чем"
+            else:
+                status = "running"  # the next step is being queued
+        else:
+            status = "done"
+
+        skipped: dict[str, dict[str, str]] = {}
+        for j in v_jobs:
+            for lang, vid in (j.get("skipped") or {}).items():
+                skipped[api_lang(lang)] = {"code": "voice_missing", "voice_id": self.resolve_short_voice_id(vid)}
+        for j in v_jobs:  # languages voiced again later are no longer missing
+            for lang, res in (j.get("results") or {}).items():
+                if res != "голос недоступен" and j is not next((x for x in v_jobs if lang in (x.get("skipped") or {})), None):
+                    skipped.pop(api_lang(lang), None)
+
+        mix_info = (m_job or {}).get("mix") or {}
+        duration = mix_info.get("duration")
+        if duration is None and paras_total:
+            duration = round(sum(max(4.5, spoken_len(it["text"], src_lang) / 15.5) for it in numbered), 1)
 
         langs_out: list[VoiceJobLanguage] = []
         summary_langs: dict[str, VoiceJobSummaryLang] = {}
-        norm_suggestions: dict[str, tuple[int, int]] = {}
 
-        # 1. Source language entry (only voice)
-        src_vid = raw_job.get("voices", {}).get(src_lang) or prof.default.get(src_lang, "v1")
-        src_v_entry = voices_by_id.get(src_vid)
-        src_audio_dir = self.audio_dir / slug
-        src_mp3_count = len(list(src_audio_dir.glob("*.mp3"))) if src_audio_dir.exists() else (paras_total if job_status == "done" else 0)
-        langs_out.append(
-            VoiceJobLanguage(
-                lang=src_lang,
-                stage="done" if src_mp3_count >= paras_total or job_status == "done" else "voice",
-                translate=None,
-                voice=VoiceStageStatus(
-                    state="done" if src_mp3_count >= paras_total or job_status == "done" else ("running" if job_status == "running" else "waiting"),
-                    done=src_mp3_count or (paras_total if job_status == "done" else 0),
-                    total=paras_total,
-                    new=paras_total,
-                    reused=0,
-                    fish_model="drama" if v_model == "drama-3" else "free",
-                    voice_id=src_vid,
-                    voice_name=src_v_entry.name if src_v_entry else src_vid,
-                ),
-                mix=None,
-            )
-        )
-
-        # 2. Target languages
-        src_items = []
-        if (proj / "source.json").exists():
-            src_items = [it for it in json.loads((proj / "source.json").read_text(encoding="utf-8")).get("items", []) if not it.get("heading")]
-
-        for t_lang in targets:
-            vid = raw_job.get("voices", {}).get(t_lang) or prof.default.get(t_lang, "v1")
-            v_entry = voices_by_id.get(vid)
-            is_voice_missing = t_lang in skipped_map or (v_entry is not None and v_entry.status == "missing")
-            norm_bounds = prof.norms.get(t_lang) or LANG_CONFIG.get(t_lang, LANG_CONFIG["RU"])["norm"]
-
-            tr_blocks = load_translation(proj, t_lang) if proj.exists() else {}
-            tr_done_count = sum(1 for it in src_items if it["key"] in tr_blocks)
-
-            # Calculate average length_pct and in_norm count
-            pcts: list[float] = []
-            in_norm_count = 0
-            tags_issues = 0
-            sped_up_count = 0
-            max_speedup = 1.0
-            for it in src_items:
-                t_text = tr_blocks.get(it["key"])
-                if not t_text:
-                    continue
-                pct, ok, t_ok, _, delta = evaluate_paragraph(it["text"], t_text, src_lang, t_lang, norm_bounds)
-                pcts.append(pct)
-                if ok:
-                    in_norm_count += 1
-                if not t_ok:
-                    tags_issues += 1
-                if delta > 0:
-                    sped_up_count += 1
-                    sp = round(min(1.15, 1.0 + (delta / max(40, len(t_text))) * 0.6), 2)
-                    max_speedup = max(max_speedup, sp)
-
-            avg_pct = round(sum(pcts) / len(pcts), 1) if pcts else None
-            parts_total = max(1, (paras_total + 15) // 16)
-            parts_done = parts_total if tr_done_count >= paras_total and paras_total > 0 else int(parts_total * (tr_done_count / max(1, paras_total)))
-
-            ov = stage_overrides.get(t_lang, {})
-            if job_status == "done" or (tr_done_count >= paras_total and paras_total > 0 and job_status != "running"):
-                t_state: Any = "skipped" if mode in ("voice", "mix") else "done"
-                v_state: Any = "voice_missing" if is_voice_missing else ("skipped" if mode == "translate" else "done")
-                m_state: Any = "skipped" if (mode in ("translate", "voice") or is_voice_missing) else "done"
-                cur_stage: Any = "done"
+        def voice_status(lang: str) -> VoiceStageStatus:
+            vid = voices.get(api_lang(lang))
+            name = self._voice_name(vid) if vid else None
+            folder = self.audio_dir / (slug if lang == src_lang else f"{slug}_{lang}")
+            have = _count_mp3(folder)
+            fish_model: Any = "drama" if voice_model == "drama-3" else "free"
+            if mode == "translate" or (mode == "mix" and not v_job):
+                state: Any = "done" if have >= paras_total > 0 else "skipped"
+                return VoiceStageStatus(state=state, done=have, total=paras_total, voice_id=vid, voice_name=name, fish_model=fish_model)
+            if api_lang(lang) in skipped:
+                return VoiceStageStatus(state="voice_missing", done=have, total=paras_total, voice_id=vid, voice_name=name)
+            j = next((x for x in reversed(v_jobs) if lang in (x.get("results") or {}) or
+                      any(it["lang"] == lang for it in x.get("items") or [])), None)
+            if not j:
+                return VoiceStageStatus(state="waiting", done=have, total=paras_total, voice_id=vid, voice_name=name, fish_model=fish_model)
+            res = (j.get("results") or {}).get(lang)
+            prog = j.get("progress") or {}
+            counts = _voiced_counts(res)
+            new, reused = counts if counts else (have, 0)
+            if res and res != "голос недоступен":
+                state = "done"
+            elif j.get("status") == "running" and prog.get("lang") == lang:
+                state = "running"
+                have = int(prog.get("done", have))
+            elif j.get("status") == "failed" and prog.get("lang") == lang:
+                state = "failed"
             else:
-                cur_stage = ov.get("stage", "translate")
-                t_state = ov.get("translate_state", "running" if cur_stage == "translate" and job_status == "running" else ("done" if tr_done_count >= paras_total else "waiting"))
-                v_state = "voice_missing" if is_voice_missing else ov.get("voice_state", "running" if cur_stage == "voice" else "waiting")
-                m_state = ov.get("mix_state", "running" if cur_stage == "mix" else "waiting")
+                state = "waiting"
+            if res and "Drama" not in res and voice_model != "drama-3":
+                fish_model = "paid" if "платн" in res or "s2.1-pro:" in res else "free"
+            return VoiceStageStatus(state=state, done=have, total=paras_total, new=new, reused=reused,
+                                    fish_model=fish_model, voice_id=vid, voice_name=name)
 
-            v_done = paras_total if v_state == "done" else int(ov.get("voice_done", 0))
-            v_reused = int(ov.get("voice_reused", 0))
-            v_new = max(0, v_done - v_reused)
-            m_done = paras_total if m_state == "done" else int(ov.get("mix_done", 0))
+        def mix_status(lang: str, voice_state: str) -> MixStageStatus:
+            have = _count_mp3(self.mix_dir / slug / lang)
+            st = (mix_info.get("stats") or {}).get(lang) or {}
+            if mode in ("translate", "voice") or voice_state == "voice_missing":
+                return MixStageStatus(state="skipped", done=have, total=paras_total)
+            if not m_job:
+                return MixStageStatus(state="waiting", done=have, total=paras_total)
+            ms = m_job.get("status")
+            prog = m_job.get("progress") or {}
+            if ms == "done":
+                return MixStageStatus(state="done", done=have, total=paras_total, duration_sec=duration,
+                                      sped_up=st.get("sped"), max_speedup=st.get("max_speed"))
+            if ms == "running":
+                return MixStageStatus(state="running", done=int(prog.get("done", 0)), total=paras_total)
+            return MixStageStatus(state="failed" if ms == "failed" else "waiting", done=have, total=paras_total)
 
-            carried_count = len(carry_plan([tr_blocks[it["key"]] for it in src_items if it["key"] in tr_blocks])) if raw_job.get("carry_mood") else 0
+        # source language: voiceover only
+        src_voice = voice_status(src_lang)
+        langs_out.append(VoiceJobLanguage(lang=api_lang(src_lang), stage="done" if src_voice.state in ("done", "skipped") else "voice",
+                                          translate=None, voice=src_voice, mix=None))
 
+        for lang in targets:
+            stats = self.tr.stats(slug, lang) or {}
+            paras = stats.get("paragraphs") or {}
+            translated = int(stats.get("translated") or 0)
+            if tr_job is None:
+                t_state: Any = "done" if translated >= paras_total > 0 else "skipped"
+            elif lang in (tr_job.get("results") or {}):
+                t_state = "done"
+            else:
+                prog = tr_job.get("progress") or {}
+                ts = tr_job.get("status")
+                if ts == "running":
+                    t_state = "running" if prog.get("lang") == lang else "waiting"
+                elif ts == "failed" and prog.get("lang") == lang:
+                    t_state = "failed"
+                elif ts == "done":
+                    t_state = "done"
+                else:
+                    t_state = "waiting"
+            prog = (tr_job or {}).get("progress") or {}
+            parts_total = int(prog.get("parts") or 1) if prog.get("lang") == lang else 1
+            parts_done = parts_total if t_state == "done" else (int(prog.get("part", 1)) - 1 if prog.get("lang") == lang else 0)
+            tags_issues = sum(1 for p in paras.values() if p.get("tags_problem"))
+            v = voice_status(lang)
+            m = mix_status(lang, v.state)
+            stage: Any = "done"
+            for name, state in (("translate", t_state), ("voice", v.state), ("mix", m.state)):
+                if state not in ("done", "skipped", "voice_missing"):
+                    stage = name
+                    break
             langs_out.append(
                 VoiceJobLanguage(
-                    lang=t_lang,
-                    stage=cur_stage if cur_stage in ("translate", "voice", "mix", "done") else "translate",
-                    translate=TranslateStageStatus(
-                        state=t_state,
-                        parts_done=parts_done,
-                        parts_total=parts_total,
-                        length_pct=avg_pct,
-                        in_norm=in_norm_count,
-                        total=paras_total,
-                        tags_issues=tags_issues,
-                    ),
-                    voice=VoiceStageStatus(
-                        state=v_state,
-                        done=v_done,
-                        total=paras_total,
-                        new=v_new,
-                        reused=v_reused,
-                        fish_model="drama" if v_model == "drama-3" else "free",
-                        voice_id=vid,
-                        voice_name=v_entry.name if v_entry else vid,
-                    ),
-                    mix=MixStageStatus(
-                        state=m_state,
-                        done=m_done,
-                        total=paras_total,
-                        duration_sec=src_dur if m_state == "done" else None,
-                        sped_up=sped_up_count if m_state == "done" else None,
-                        max_speedup=max_speedup if m_state == "done" else None,
-                    ),
+                    lang=api_lang(lang),
+                    stage=stage,
+                    translate=TranslateStageStatus(state=t_state, parts_done=max(0, parts_done), parts_total=parts_total,
+                                                   length_pct=stats.get("total"), in_norm=int(stats.get("in_norm") or 0),
+                                                   total=paras_total, tags_issues=tags_issues),
+                    voice=v,
+                    mix=m,
                 )
             )
-
-            summary_langs[t_lang] = VoiceJobSummaryLang(
-                length_pct=avg_pct,
-                in_norm=in_norm_count,
+            mst = (mix_info.get("stats") or {}).get(lang) or {}
+            summary_langs[api_lang(lang)] = VoiceJobSummaryLang(
+                length_pct=stats.get("total"),
+                in_norm=int(stats.get("in_norm") or 0),
                 total=paras_total,
-                sped_up=sped_up_count,
-                max_speedup=max_speedup,
-                fish_model="drama" if v_model == "drama-3" else "free",
-                voice_model=v_model,
-                voice_new=v_new,
-                voice_reused=v_reused,
-                carried=carried_count,
+                sped_up=int(mst.get("sped") or 0),
+                max_speedup=float(mst.get("max_speed") or 1.0),
+                fish_model=v.fish_model,
+                voice_model=voice_model,
+                voice_new=v.new,
+                voice_reused=v.reused,
+                carried=len(carry_plan([t for t in load_translation(self.work_dir / slug, lang).values()])) if carry else 0,
             )
-            if sped_up_count >= 5 and norm_bounds[0] > 60:
-                norm_suggestions[t_lang] = (norm_bounds[0] - 1, norm_bounds[1] - 1)
 
-        files = self._collect_job_files(jid, slug, src_lang, targets)
-        summary = VoiceJobSummary(
-            duration_sec=src_dur,
-            languages=summary_langs,
-            norm_suggestions=raw_job.get("norm_suggestions") or norm_suggestions,
-            skipped=skipped_map,
-        )
-
+        title = web.get("title") or src.get("title") or Path(str(first.get("name") or slug)).stem.replace("_", " ")
+        created = parse_short_time(first.get("added")) or _now_iso()
         return VoiceJob(
-            id=jid,
-            title=raw_job.get("title") or slug,
+            id=root,
+            title=title,
             script=slug,
-            project_id=raw_job.get("project_id"),
+            project_id=web.get("project_id"),
             mode=mode,
-            source_lang=src_lang,
-            targets=targets,
+            source_lang=api_lang(src_lang),
+            targets=[api_lang(t) for t in targets],
             profile_id=prof.id,
             profile_name=prof.name,
-            voices=raw_job.get("voices") or dict(prof.default),
-            model=raw_job.get("model", "gemini-4-argon-medium"),
-            voice_model=v_model,
-            carry_mood=bool(raw_job.get("carry_mood", False)),
-            status=job_status,
+            voices=voices,
+            model=model,
+            voice_model=voice_model,
+            carry_mood=carry,
+            status=status,
             paragraphs_total=paras_total,
             emotion_tags_count=tags_count,
-            source_duration_sec=src_dur,
-            created_at=raw_job.get("created_at", _now_iso()),
-            started_at=raw_job.get("started_at"),
-            finished_at=raw_job.get("finished_at"),
-            pause_until=raw_job.get("pause_until"),
-            pause_reason=raw_job.get("pause_reason"),
-            error_code=raw_job.get("error_code"),
-            error_message=raw_job.get("error_message"),
-            waiting_for_job_id=raw_job.get("waiting_for_job_id"),
+            source_duration_sec=duration,
+            created_at=created,
+            started_at=parse_short_time(first.get("started")),
+            finished_at=parse_short_time(cur.get("finished")) if status == "done" else None,
+            pause_until=pause_until,
+            pause_reason=pause_reason,
+            error_code=error_code,
+            error_message=error_message,
+            waiting_for_job_id=None,
             languages=langs_out,
-            summary=summary,
-            files=files,
+            summary=VoiceJobSummary(duration_sec=duration, languages=summary_langs, norm_suggestions={}, skipped=skipped),
+            files=self._collect_job_files(root, slug, src_lang, targets),
         )
 
     def _collect_job_files(self, job_id: int, slug: str, src_lang: str, targets: list[str]) -> list[VoiceJobFile]:
+        """Only files that exist (sizes are real; zip size = the tracks inside)."""
         out: list[VoiceJobFile] = []
-        proj = self.work_dir / slug
-        for lang in targets:
-            d_lang = disk_lang(lang)
-            docx_p = self.output_dir / f"{slug}_{d_lang}.docx"
-            has_md = (proj / f"{d_lang}.md").exists()
-            if docx_p.exists() or has_md:
-                fid = f"f_{job_id}_{lang}_docx"
-                size = docx_p.stat().st_size if docx_p.exists() else 48200
-                out.append(
-                    VoiceJobFile(
-                        id=fid,
-                        kind="docx",
-                        lang=lang,
-                        name=f"{slug}_{lang}.docx",
-                        size=size,
-                        url=f"/api/voice/files/{fid}",
-                    )
-                )
-            for kind, suffix, default_sz in (
-                ("raw_zip", f"{slug}_{lang}_audio.zip", 34_500_000),
-                ("mixed_zip", f"{slug}_{lang}.zip", 42_100_000),
-                ("joined_mp3", f"{slug}_{lang}.mp3", 38_900_000),
-            ):
-                fid = f"f_{job_id}_{lang}_{kind}"
-                out.append(
-                    VoiceJobFile(
-                        id=fid,
-                        kind=kind,  # type: ignore[arg-type]
-                        lang=lang,
-                        name=suffix,
-                        size=default_sz,
-                        url=f"/api/voice/files/{fid}",
-                    )
-                )
+
+        def add(kind: Any, lang: str, name: str, size: int) -> None:
+            fid = f"f_{job_id}_{api_lang(lang)}_{kind}"
+            out.append(VoiceJobFile(id=fid, kind=kind, lang=api_lang(lang), name=name, size=size, url=f"/api/voice/files/{fid}"))
+
+        def tracks_size(folder: Path) -> int:
+            try:
+                return sum(p.stat().st_size for p in folder.glob("*.mp3") if p.stem.isdigit())
+            except OSError:
+                return 0
+
+        for lang in [src_lang] + targets:
+            a = api_lang(lang)
+            docx_p = self.output_dir / f"{slug}_{lang}.docx"
+            if lang != src_lang and docx_p.exists():
+                add("docx", lang, f"{slug}_{a}.docx", docx_p.stat().st_size)
+            raw = self.audio_dir / (slug if lang == src_lang else f"{slug}_{lang}")
+            if _count_mp3(raw):
+                add("raw_zip", lang, f"{slug}_{a}_audio.zip", tracks_size(raw))
+            mixed = self.mix_dir / slug / lang
+            if _count_mp3(mixed):
+                add("mixed_zip", lang, f"{slug}_{a}.zip", tracks_size(mixed))
+            joined = self.mix_dir / slug / f"{slug}_{lang}.mp3"
+            if joined.exists():
+                add("joined_mp3", lang, f"{slug}_{a}.mp3", joined.stat().st_size)
         return out
 
     def list_jobs(self, status: str | None = None, project_id: str | None = None) -> list[VoiceJob]:
-        jobs = self._ensure_seeded_jobs()
-        items = [self._build_job_model(j) for j in sorted(jobs.values(), key=lambda x: int(x["id"]), reverse=True)]
+        by_docx: dict[str, str] = {}
+        items = []
+        for root, chain in sorted(self._chains().items(), reverse=True):
+            try:
+                items.append(self._build(root, chain, by_docx))
+            except Exception:
+                logger.exception(f"[voice] cannot show translator job #{root}")
         if status:
             items = [j for j in items if j.status == status]
         if project_id:
@@ -1110,287 +1112,114 @@ class VoiceService:
         return items
 
     def get_job(self, job_id: int) -> VoiceJob:
-        jobs = self._ensure_seeded_jobs()
-        if job_id not in jobs:
-            raise VoiceApiError(404, "job_not_found", f"Задача #{job_id} не найдена")
-        return self._build_job_model(jobs[job_id])
+        return self._build(job_id, self._chain(job_id), {})
 
     async def create_jobs(self, req: CreateVoiceJobRequest) -> list[VoiceJob]:
+        self.tr.require()
         proj = self.work_dir / req.script_id
         if not (proj / "source.json").exists():
             raise VoiceApiError(404, "script_not_found", f"Сценарий {req.script_id} не найден")
-        s_info = self._script_info_from_dir(proj)
+        if req.source_lang:
+            await self._set_source_lang(req.script_id, req.source_lang)
+        src_lang = disk_lang((self.tr.source(req.script_id) or {}).get("source_lang") or "EN")
         prof = self.get_profile(req.profile_id)
+        t_model = next((m for m in TRANSLATION_MODELS if m.id == req.model), None)
+        if not t_model:
+            raise VoiceApiError(422, "unknown_model", f"Неизвестная модель перевода {req.model}")
 
-        merged_voices = dict(prof.default)
-        for l_code, vid in (req.voices or {}).items():
-            merged_voices[api_lang(l_code)] = self.resolve_short_voice_id(vid)
+        targets = [disk_lang(t) for t in req.targets if disk_lang(t) != src_lang]
+        voices: dict[str, str] = {}
+        for lang in [src_lang] + targets:
+            ref = req.voices.get(api_lang(lang)) or req.voices.get(lang) or prof.default.get(api_lang(lang))
+            if ref:
+                voices[lang] = self.resolve_fish_id(ref)
+        missing_voice = [api_lang(lang) for lang in [src_lang] + targets if lang not in voices]
+        if req.mode in ("all", "voice") and missing_voice:
+            raise VoiceApiError(422, "voice_missing", "Не выбран голос: " + ", ".join(missing_voice))
+        spec = {
+            "mode": req.mode,
+            "script": req.script_id,
+            "langs": targets,
+            "engine": t_model.engine,
+            "agy_model": t_model.id if t_model.engine == "agy" else None,
+            "profile": prof.id,
+            "voices": voices,
+            "voice_model": req.voice_model,
+            "carry_mood": req.carry_mood if req.voice_model == "drama-3" else False,
+            "split": req.split_by_language,
+            "web": {"title": req.title or None, "project_id": req.project_id, "model": req.model,
+                    "voice_model": req.voice_model, "mode": req.mode, "script": req.script_id},
+        }
+        res = await self.tr.call("submit", stdin=json.dumps(spec, ensure_ascii=False))
+        ids = [int(j["id"]) for j in res.get("jobs") or []]
+        self.scan()
+        return [self.get_job(i) for i in ids]
 
-        targets = [api_lang(t) for t in req.targets if api_lang(t) != api_lang(req.source_lang)]
-        if not targets and req.mode != "voice":
-            targets = [l for l in MAIN_LANG_ORDER if l != api_lang(req.source_lang)]
-
-        jobs = self._ensure_seeded_jobs()
-        next_id = max(jobs.keys(), default=0) + 1
-        created_ids: list[int] = []
-
-        target_groups = [[t] for t in targets] if (req.split_by_language and len(targets) > 1) else [targets]
-        for group in target_groups:
-            jid = next_id
-            next_id += 1
-            raw_job = {
-                "id": jid,
-                "title": req.title or s_info.title,
-                "script": req.script_id,
-                "project_id": req.project_id,
-                "mode": req.mode,
-                "source_lang": api_lang(req.source_lang),
-                "targets": group,
-                "profile_id": prof.id,
-                "voices": merged_voices,
-                "model": req.model,
-                "voice_model": req.voice_model,
-                "carry_mood": req.carry_mood if req.voice_model == "drama-3" else False,
-                "status": "queued",
-                "paragraphs_total": s_info.paragraphs_total,
-                "created_at": _now_iso(),
-                "started_at": None,
-                "finished_at": None,
-                "skipped": {},
-                "norm_suggestions": {},
-                "lang_progress": {},
-            }
-            jobs[jid] = raw_job
-            created_ids.append(jid)
-
-        self._write_api_jobs(jobs)
-        for jid in created_ids:
-            self.emit("job.status", {"job_id": jid, "status": "queued"})
-            self._schedule_job(jid)
-        self._emit_queue_changed()
-        return [self.get_job(jid) for jid in created_ids]
-
-    def _schedule_job(self, job_id: int) -> None:
-        if job_id in self._running_tasks and not self._running_tasks[job_id].done():
-            return
-        self._stop_flags.discard(job_id)
-        self._running_tasks[job_id] = asyncio.create_task(self._run_job_pipeline(job_id), name=f"voice_job_{job_id}")
-
-    async def _run_job_pipeline(self, job_id: int) -> None:
-        try:
-            await asyncio.sleep(0.2)
-            jobs = self._ensure_seeded_jobs()
-            raw = jobs.get(job_id)
-            if not raw or job_id in self._stop_flags:
-                return
-
-            raw["status"] = "running"
-            raw["started_at"] = raw.get("started_at") or _now_iso()
-            self._write_api_jobs(jobs)
-            self.emit("job.status", {"job_id": job_id, "status": "running"})
-            self._emit_queue_changed()
-
-            slug = raw["script"]
-            proj = self.work_dir / slug
-            targets = [api_lang(t) for t in raw.get("targets", [])]
-            voices_map = {v.id: v for v in self.list_voices()}
-            skipped: dict[str, dict[str, str]] = {}
-
-            for lang in targets:
-                if job_id in self._stop_flags:
-                    raw["status"] = "stopped"
-                    self._write_api_jobs(jobs)
-                    self.emit("job.status", {"job_id": job_id, "status": "stopped"})
-                    return
-
-                vid = raw.get("voices", {}).get(lang)
-                v_entry = voices_map.get(vid or "")
-                if raw.get("mode") in ("all", "voice") and v_entry and v_entry.status == "missing":
-                    skipped[lang] = {"code": "voice_missing", "voice_id": vid or ""}
-                    raw.setdefault("skipped", {})[lang] = skipped[lang]
-                    self._write_api_jobs(jobs)
-                    self.emit(
-                        "voice.missing",
-                        {"job_id": job_id, "lang": lang, "voice_id": vid, "voice_name": v_entry.name},
-                    )
-                    continue
-
-                # If translation doesn't exist yet for this target language, copy or synthesize blocks
-                tr_blocks = load_translation(proj, lang)
-                if not tr_blocks and (proj / "source.json").exists():
-                    src_items = [it for it in json.loads((proj / "source.json").read_text(encoding="utf-8")).get("items", []) if not it.get("heading")]
-                    self.emit("lang.stage", {"job_id": job_id, "lang": lang, "stage": "translate", "state": "running"})
-                    # Use existing translation if present, or translate via LLM if configured
-                    await self._translate_missing_blocks(job_id, proj, raw.get("source_lang", "EN"), lang, src_items, raw.get("profile_id", "p1"))
-                    self.emit("lang.stage", {"job_id": job_id, "lang": lang, "stage": "translate", "state": "done"})
-
-            if raw.get("mode") in ("all", "voice") and len(skipped) == len(targets) and targets:
-                raw["status"] = "failed"
-                raw["error_code"] = "voice_missing"
-                raw["error_message"] = "Ни один голос не доступен в библиотеке Fish Audio"
-                self._write_api_jobs(jobs)
-                self.emit("job.failed", {"job_id": job_id, "code": "voice_missing", "message": raw["error_message"], "log_tail": []})
-                return
-
-            raw["status"] = "done"
-            raw["finished_at"] = _now_iso()
-            self._write_api_jobs(jobs)
-            built = self._build_job_model(raw)
-            self.emit(
-                "job.done",
-                {
-                    "job_id": job_id,
-                    "files": [f.model_dump() for f in built.files],
-                    "summary": built.summary.model_dump() if built.summary else {},
-                },
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception(f"[voice] job {job_id} failed")
-            jobs = self._ensure_seeded_jobs()
-            if job_id in jobs:
-                jobs[job_id]["status"] = "failed"
-                jobs[job_id]["error_code"] = "internal"
-                jobs[job_id]["error_message"] = str(e)
-                self._write_api_jobs(jobs)
-            self.emit("job.failed", {"job_id": job_id, "code": "internal", "message": str(e), "log_tail": []})
-        finally:
-            self._emit_queue_changed()
-
-    async def _translate_missing_blocks(
-        self,
-        job_id: int,
-        proj: Path,
-        source_lang: str,
-        target_lang: str,
-        src_items: list[dict],
-        profile_id: str,
-    ) -> None:
-        prof = self.get_profile(profile_id)
-        norm = prof.norms.get(target_lang) or LANG_CONFIG.get(target_lang, LANG_CONFIG["RU"])["norm"]
-        lang_name = LANG_CONFIG.get(target_lang, LANG_CONFIG["RU"])["name"]
-        blocks: dict[str, str] = {}
-        total = len(src_items)
-        for idx, it in enumerate(src_items, 1):
-            key = it["key"]
-            text = it["text"]
-            if self._llm is not None:
-                try:
-                    prompt = (
-                        f"Переведи абзац сценария с {source_lang} на {lang_name} ({target_lang}). "
-                        f"Сохрани все теги в [квадратных] и <угловых> скобках без изменений и без перевода. "
-                        f"Числа пиши словами. Длина должна быть {norm[0]}–{norm[1]}% от оригинала. "
-                        f"Верни ТОЛЬКО текст перевода:\n\n{text}"
-                    )
-                    res = await self._llm.complete("gemini-2.5-flash", prompt)
-                    blocks[key] = res.strip()
-                except Exception:
-                    blocks[key] = text
-            else:
-                blocks[key] = text
-            if idx % 10 == 0 or idx == total:
-                save_translation(proj, target_lang, blocks)
-                self.emit(
-                    "lang.progress",
-                    {"job_id": job_id, "lang": target_lang, "stage": "translate", "done": idx, "total": total},
-                )
-        save_translation(proj, target_lang, blocks)
-        build_docx(proj, self.output_dir, target_lang)
-
-    def stop_job(self, job_id: int) -> VoiceJob:
-        jobs = self._ensure_seeded_jobs()
-        if job_id not in jobs:
-            raise VoiceApiError(404, "job_not_found", f"Задача #{job_id} не найдена")
-        raw = jobs[job_id]
-        built = self._build_job_model(raw)
-        if built.status == "running" and any(l.stage == "mix" and l.mix and l.mix.state == "running" for l in built.languages):
+    async def stop_job(self, job_id: int) -> VoiceJob:
+        chain = self._chain(job_id)
+        active = [j for j in chain if j.get("status") in ("running", "pending")]
+        if any(_kind(j) in ("mix", "join") and j.get("status") == "running" for j in active):
             raise VoiceApiError(409, "not_stoppable", "Сведение дойдёт до конца — оно занимает несколько минут")
-        self._stop_flags.add(job_id)
-        task = self._running_tasks.get(job_id)
-        if task and not task.done():
-            task.cancel()
-        raw["status"] = "stopped"
-        self._write_api_jobs(jobs)
-        self.emit("job.status", {"job_id": job_id, "status": "stopped"})
-        self._emit_queue_changed()
-        return self._build_job_model(raw)
+        for j in active:
+            await self.tr.call("stop", str(j["id"]))
+        self.scan()
+        return self.get_job(job_id)
 
-    def resume_job(self, job_id: int) -> VoiceJob:
-        jobs = self._ensure_seeded_jobs()
-        if job_id not in jobs:
-            raise VoiceApiError(404, "job_not_found", f"Задача #{job_id} не найдена")
-        raw = jobs[job_id]
-        raw["status"] = "running"
-        raw["error_code"] = None
-        raw["error_message"] = None
-        self._write_api_jobs(jobs)
-        self._schedule_job(job_id)
-        return self._build_job_model(raw)
+    async def resume_job(self, job_id: int) -> VoiceJob:
+        chain = self._chain(job_id)
+        cur = chain[-1]
+        if cur.get("status") in ("stopped", "failed"):
+            await self.tr.call("resume", str(cur["id"]))
+        self.scan()
+        return self.get_job(job_id)
 
-    def delete_job(self, job_id: int) -> None:
-        jobs = self._ensure_seeded_jobs()
-        if job_id not in jobs:
-            raise VoiceApiError(404, "job_not_found", f"Задача #{job_id} не найдена")
-        self._stop_flags.add(job_id)
-        task = self._running_tasks.pop(job_id, None)
-        if task and not task.done():
-            task.cancel()
-        jobs.pop(job_id, None)
-        self._write_api_jobs(jobs)
-        self._emit_queue_changed()
+    async def delete_job(self, job_id: int) -> None:
+        for j in self._chain(job_id):
+            await self.tr.call("drop", str(j["id"]))
+        self.scan()
 
     async def revoice_skipped(self, job_id: int, req: RevoiceSkippedRequest) -> VoiceJob:
-        jobs = self._ensure_seeded_jobs()
-        if job_id not in jobs:
-            raise VoiceApiError(404, "job_not_found", f"Задача #{job_id} не найдена")
-        raw = jobs[job_id]
-        prof = self.get_profile(raw.get("profile_id"))
+        chain = self._chain(job_id)
+        v_job = next((j for j in reversed(chain) if _kind(j) == "voice" and j.get("skipped")), None)
+        if not v_job:
+            raise VoiceApiError(409, "nothing_to_revoice", "Пропущенных языков нет")
+        prof = self.get_profile(chain[0].get("profile"))
         voices_by_id = {v.id: v for v in self.list_voices()}
-
-        skipped_langs = list((raw.get("skipped") or {}).keys())
-        for l_obj in self._build_job_model(raw).languages:
-            if l_obj.voice.state == "voice_missing" and l_obj.lang not in skipped_langs:
-                skipped_langs.append(l_obj.lang)
-
-        for lang in skipped_langs:
-            new_vid = req.voices.get(lang) or prof.default.get(lang) or raw.get("voices", {}).get(lang)
-            if not new_vid:
-                raise VoiceApiError(422, "voice_missing", f"Для языка {lang} не выбран доступный голос")
-            sid = self.resolve_short_voice_id(new_vid)
-            v_entry = voices_by_id.get(sid)
-            if v_entry and v_entry.status == "missing":
-                raise VoiceApiError(422, "voice_missing", f"Голос «{v_entry.name}» для {lang} всё ещё недоступен в Fish Audio")
-            raw.setdefault("voices", {})[lang] = sid
-            (raw.get("skipped") or {}).pop(lang, None)
-
-        raw["status"] = "running"
-        self._write_api_jobs(jobs)
-        self._schedule_job(job_id)
-        return self._build_job_model(raw)
+        voices: dict[str, str] = {}
+        for lang in v_job["skipped"]:
+            ref = req.voices.get(api_lang(lang)) or req.voices.get(lang) or prof.default.get(api_lang(lang))
+            if not ref:
+                raise VoiceApiError(422, "voice_missing", f"Для языка {api_lang(lang)} не выбран доступный голос")
+            entry = voices_by_id.get(self.resolve_short_voice_id(ref))
+            if entry and entry.status == "missing":
+                raise VoiceApiError(422, "voice_missing", f"Голос «{entry.name}» для {api_lang(lang)} всё ещё недоступен в Fish Audio")
+            voices[lang] = self.resolve_fish_id(ref)
+        await self.tr.call("revoice", str(v_job["id"]), stdin=json.dumps({"voices": voices}))
+        self.scan()
+        return self.get_job(job_id)
 
     def queue_status(self) -> QueueStatusResponse:
-        jobs = self.list_jobs()
-        running = [j for j in jobs if j.status == "running"]
-        queued = [j for j in jobs if j.status == "queued"]
-        gemini_used = sum(1 for j in running if j.model.startswith("gemini"))
-        claude_used = sum(1 for j in running if j.model.startswith("claude"))
-        voice_used = sum(1 for j in running if any(l.stage == "voice" for l in j.languages))
-        mix_used = sum(1 for j in running if any(l.stage == "mix" for l in j.languages))
+        jobs = [j for chain in self._chains().values() for j in chain]
+        running = [j for j in jobs if j.get("status") == "running"]
+        par = self.tr.config().get("parallel") or {}
+        roots = {int(j.get("root") or j["id"]) for j in running}
+        queued_roots = {int(j.get("root") or j["id"]) for j in jobs if j.get("status") == "pending"} - roots
         return QueueStatusResponse(
-            running=len(running),
-            queued=len(queued),
+            running=len(roots),
+            queued=len(queued_roots),
             slots={
-                "gemini": SlotUsage(used=min(3, gemini_used), total=3),
-                "claude": SlotUsage(used=min(3, claude_used), total=3),
-                "voice": SlotUsage(used=min(1, voice_used), total=1),
-                "mix": SlotUsage(used=min(1, mix_used), total=1),
+                "gemini": SlotUsage(used=sum(1 for j in running if _kind(j) == "translate" and _engine(j) == "agy"),
+                                    total=int(par.get("agy", 3))),
+                "claude": SlotUsage(used=sum(1 for j in running if _kind(j) == "translate" and _engine(j) == "claude"),
+                                    total=int(par.get("claude", 3))),
+                "voice": SlotUsage(used=sum(1 for j in running if _kind(j) == "voice"), total=1),
+                "mix": SlotUsage(used=sum(1 for j in running if _kind(j) in ("mix", "join")), total=1),
             },
+            worker_online=self.tr.worker_online(),
         )
 
     def _emit_queue_changed(self) -> None:
-        qs = self.queue_status()
-        self.emit("queue.changed", qs.model_dump())
+        self.emit("queue.changed", self.queue_status().model_dump())
 
     # ------------------------------------------------------- Paragraphs ---
 
@@ -1408,31 +1237,56 @@ class VoiceService:
 
     def _write_edits(self, proj: Path, data: dict[str, Any]) -> None:
         f = self._edits_file(proj)
-        f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = f.with_name(f"edits.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, f)
 
-    def get_paragraphs(
+    def _busy(self, job_id: int, lang: str) -> bool:
+        """The bot is working on this language of this job (translating, voicing or mixing it)."""
+        for j in self._chain(job_id):
+            if j.get("status") != "running":
+                continue
+            prog = j.get("progress") or {}
+            if _kind(j) in ("mix", "join") or prog.get("lang") in (None, lang):
+                return True
+        return False
+
+    async def _stats(self, job: VoiceJob, lang: str) -> dict[str, Any]:
+        """Length stats of a translation, refreshed by the translator when the translation file is newer."""
+        proj = self.work_dir / job.script
+        md = proj / f"{lang}.md"
+        stats_f = proj / f"{lang}.stats.json"
+        if md.exists() and (not stats_f.exists() or stats_f.stat().st_mtime < md.stat().st_mtime):
+            try:
+                return await self.tr.call("stats", job.script, lang, "--profile", job.profile_id)
+            except VoiceApiError as e:
+                logger.warning(f"[voice] stats {job.script} {lang}: {e.message}")
+        return self.tr.stats(job.script, lang) or {}
+
+    async def get_paragraphs(
         self,
         job_id: int,
         lang: str,
         filter_by: ParagraphFilter = "all",
     ) -> list[VoiceParagraph]:
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
+        t_lang = disk_lang(lang)
+        src_lang = disk_lang(job.source_lang)
         proj = self.work_dir / job.script
-        if not (proj / "source.json").exists():
+        src = self.tr.source(job.script)
+        if not src:
             return []
+        numbered = [it for it in src.get("items", []) if not it.get("heading")]
+        is_source = t_lang == src_lang
+        tr_blocks = {it["key"]: it["text"] for it in numbered} if is_source else load_translation(proj, t_lang)
+        stats = {} if is_source else await self._stats(job, t_lang)
+        p_stats = stats.get("paragraphs") or {}
+        lang_range = tuple(stats.get("range") or job_norm(self, job, t_lang))
+        edits = self._read_edits(proj).get(api_lang(t_lang), {})
 
-        src_data = json.loads((proj / "source.json").read_text(encoding="utf-8"))
-        numbered = [it for it in src_data.get("items", []) if not it.get("heading")]
-        tr_blocks = load_translation(proj, t_lang) if t_lang != job.source_lang else {it["key"]: it["text"] for it in numbered}
-        edits = self._read_edits(proj).get(t_lang, {})
-
-        prof = self.get_profile(job.profile_id)
-        norm = prof.norms.get(t_lang) or LANG_CONFIG.get(t_lang, LANG_CONFIG["RU"])["norm"]
-
-        # Carry mood plan across paragraphs
-        ordered_texts = [tr_blocks.get(it["key"], it["text"]) for it in numbered]
-        carried_map = carry_plan(ordered_texts) if job.carry_mood else {}
+        ordered_texts = [tr_blocks.get(it["key"], "") for it in numbered]
+        carried_map = carry_plan(ordered_texts) if job.carry_mood and job.voice_model == "drama-3" else {}
+        pause = float((self.tr.config().get("mix") or {}).get("pause_sec", 0.5))
 
         out: list[VoiceParagraph] = []
         elapsed_sec = 0.0
@@ -1442,55 +1296,50 @@ class VoiceService:
             src_text = it["text"]
             tr_text = tr_blocks.get(key, "")
             meta = edits.get(str(n), {})
-            version = int(meta.get("version", 1))
-            edited = bool(meta.get("edited", False))
-
-            pct, in_norm, t_ok, t_prob, delta = evaluate_paragraph(
-                src_text, tr_text, job.source_lang, t_lang, norm
-            )
-
-            # Audio timing (real file if present, otherwise deterministic from spoken_len)
-            src_mp3 = self.audio_dir / job.script / f"{n}.mp3"
-            raw_mp3 = self.audio_dir / f"{job.script}_{disk_lang(t_lang)}" / f"{n}.mp3"
-            src_sec = mp3_duration_sec(src_mp3) or round(max(4.5, spoken_len(src_text, job.source_lang) / 15.5), 1)
-            slot_sec = round(src_sec + 0.5, 1)
-            raw_sec = mp3_duration_sec(raw_mp3) or round(max(4.0, spoken_len(tr_text or src_text, t_lang) / 14.8), 1)
-
-            if raw_sec > slot_sec:
-                speedup = round(min(1.15, raw_sec / slot_sec), 2)
-                track_sec = raw_sec
+            st = p_stats.get(key)
+            if is_source:
+                pct, in_norm, t_ok, t_prob, delta, norm = 100.0, True, True, None, 0, (100, 100)
+            elif st and tr_text:
+                norm = (int(round(st["lo"])), int(round(st["hi"])))
+                pct, in_norm, delta = float(st["pct"]), bool(st["in_norm"]), int(st.get("delta") or 0)
+                t_prob = st.get("tags_problem")
+                t_ok = not t_prob
             else:
-                speedup = 1.0
-                track_sec = round(min(slot_sec, raw_sec), 1)
+                norm = (int(lang_range[0]), int(lang_range[1]))
+                pct, in_norm, t_ok, t_prob, delta = evaluate_paragraph(src_text, tr_text, src_lang, t_lang, norm)
+                in_norm = in_norm and bool(tr_text)
 
+            src_mp3 = self.audio_dir / job.script / f"{n}.mp3"
+            raw_mp3 = self.audio_dir / (job.script if is_source else f"{job.script}_{t_lang}") / f"{n}.mp3"
+            mixed_mp3 = self.mix_dir / job.script / t_lang / f"{n}.mp3"
+            src_sec = mp3_duration_sec(src_mp3)
+            raw_sec = mp3_duration_sec(raw_mp3)
+            slot_sec = mp3_duration_sec(mixed_mp3) or (round(src_sec + pause, 2) if src_sec else None)
+            audio = None
+            if src_sec or raw_sec:
+                speedup = round(raw_sec / slot_sec, 2) if raw_sec and slot_sec and raw_sec > slot_sec else 1.0
+                audio = ParagraphAudioTiming(source_sec=src_sec, slot_sec=slot_sec, track_sec=raw_sec, speedup=speedup)
             mins, secs = divmod(int(elapsed_sec), 60)
-            timecode = f"{mins}:{secs:02d}"
-            elapsed_sec += slot_sec
+            elapsed_sec += slot_sec or max(4.5, spoken_len(src_text, src_lang) / 15.5) + pause
 
             p_obj = VoiceParagraph(
                 n=n,
-                timecode=timecode,
+                timecode=f"{mins}:{secs:02d}",
                 source=src_text,
                 text=tr_text,
                 length_pct=pct,
                 norm=norm,
                 in_norm=in_norm,
-                edited=edited,
+                edited=bool(meta.get("edited", False)),
                 tags_ok=t_ok,
                 tags_problem=t_prob,
                 carried_mood=carried_map.get(idx),
                 chars_delta=delta,
-                audio=ParagraphAudioTiming(
-                    source_sec=src_sec,
-                    slot_sec=slot_sec,
-                    track_sec=track_sec,
-                    speedup=speedup,
-                ),
-                audio_url=f"/api/voice/jobs/{job_id}/languages/{t_lang}/paragraphs/{n}/audio?track=mixed",
-                source_audio_url=f"/api/voice/jobs/{job_id}/languages/{t_lang}/paragraphs/{n}/audio?track=source",
-                version=version,
+                audio=audio,
+                audio_url=f"/api/voice/jobs/{job_id}/languages/{api_lang(t_lang)}/paragraphs/{n}/audio?track=mixed",
+                source_audio_url=f"/api/voice/jobs/{job_id}/languages/{api_lang(t_lang)}/paragraphs/{n}/audio?track=source",
+                version=int(meta.get("version", 1)),
             )
-
             if filter_by == "off_norm" and p_obj.in_norm:
                 continue
             if filter_by == "sped_up" and (not p_obj.audio or p_obj.audio.speedup <= 1.0):
@@ -1499,192 +1348,134 @@ class VoiceService:
                 continue
             if filter_by == "tags" and p_obj.tags_ok:
                 continue
-
             out.append(p_obj)
-
         return out
 
-    def _get_single_paragraph(self, job_id: int, lang: str, n: int) -> VoiceParagraph:
-        paras = self.get_paragraphs(job_id, lang, filter_by="all")
+    async def _get_single_paragraph(self, job_id: int, lang: str, n: int) -> VoiceParagraph:
+        paras = await self.get_paragraphs(job_id, lang, filter_by="all")
         p = next((x for x in paras if x.n == n), None)
         if not p:
             raise VoiceApiError(404, "paragraph_not_found", f"Абзац #{n} не найден")
         return p
 
-    def measure_paragraph_length(self, job_id: int, lang: str, n: int, text: str) -> ParagraphLengthResponse:
+    async def measure_paragraph_length(self, job_id: int, lang: str, n: int, text: str) -> ParagraphLengthResponse:
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        p = self._get_single_paragraph(job_id, t_lang, n)
-        pct, in_norm, t_ok, t_prob, delta = evaluate_paragraph(
-            p.source, text, job.source_lang, t_lang, p.norm
-        )
+        t_lang = disk_lang(lang)
+        st = await self.tr.call("measure", job.script, t_lang, str(n), "--profile", job.profile_id, stdin=text)
         return ParagraphLengthResponse(
-            length_pct=pct,
-            norm=p.norm,
-            in_norm=in_norm,
-            tags_ok=t_ok,
-            tags_problem=t_prob,
-            chars_delta=delta,
+            length_pct=float(st["pct"]),
+            norm=(int(round(st["lo"])), int(round(st["hi"]))),
+            in_norm=bool(st["in_norm"]),
+            tags_ok=not st.get("tags_problem"),
+            tags_problem=st.get("tags_problem"),
+            chars_delta=int(st.get("delta") or 0),
         )
 
-    def patch_paragraph(self, job_id: int, lang: str, n: int, req: PatchParagraphRequest) -> VoiceParagraph:
-        job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        if (job_id, t_lang) in self._busy_langs:
-            raise VoiceApiError(409, "language_busy", "Язык сейчас в работе — дождитесь окончания этапа")
+    def _paragraph_event(self, job_id: int, lang: str, p: VoiceParagraph) -> None:
+        self.emit("paragraph.updated", {"job_id": job_id, "lang": api_lang(lang), "n": p.n, "version": p.version,
+                                        "length_pct": p.length_pct, "in_norm": p.in_norm,
+                                        "speedup": p.audio.speedup if p.audio else 1.0})
+
+    async def _write_paragraph(self, job: VoiceJob, lang: str, n: int, text: str, edited: bool,
+                               version: int | None = None) -> VoiceParagraph:
         proj = self.work_dir / job.script
         edits_all = self._read_edits(proj)
-        lang_edits = edits_all.setdefault(t_lang, {})
-        p_meta = lang_edits.setdefault(str(n), {"version": 1, "edited": False})
-
-        cur_version = int(p_meta.get("version", 1))
-        if req.version != cur_version:
+        meta = edits_all.setdefault(api_lang(lang), {}).setdefault(str(n), {"version": 1, "edited": False})
+        if version is not None and version != int(meta.get("version", 1)):
             raise VoiceApiError(409, "version_conflict", "Абзац уже изменили, обновите")
-
-        tr_blocks = load_translation(proj, t_lang)
-        if "model_text" not in p_meta and str(n) in tr_blocks:
-            p_meta["model_text"] = tr_blocks[str(n)]
-
-        save_translation(proj, t_lang, {str(n): req.text.strip()})
-        build_docx(proj, self.output_dir, t_lang)
-
-        p_meta["version"] = cur_version + 1
-        p_meta["edited"] = True
+        current = load_translation(proj, lang).get(str(n))
+        if edited and "model_text" not in meta and current:
+            meta["model_text"] = current
+        if not edited:
+            meta["model_text"] = text
+        await self.tr.call("set-paragraph", job.script, lang, str(n), "--profile", job.profile_id, stdin=text)
+        meta["version"] = int(meta.get("version", 1)) + 1
+        meta["edited"] = edited
         self._write_edits(proj, edits_all)
-
-        updated = self._get_single_paragraph(job_id, t_lang, n)
-        self.emit(
-            "paragraph.updated",
-            {
-                "job_id": job_id,
-                "lang": t_lang,
-                "n": n,
-                "version": updated.version,
-                "length_pct": updated.length_pct,
-                "in_norm": updated.in_norm,
-                "speedup": updated.audio.speedup if updated.audio else 1.0,
-            },
-        )
+        updated = await self._get_single_paragraph(job.id, lang, n)
+        self._paragraph_event(job.id, lang, updated)
         return updated
 
-    def revert_paragraph(self, job_id: int, lang: str, n: int) -> VoiceParagraph:
+    async def patch_paragraph(self, job_id: int, lang: str, n: int, req: PatchParagraphRequest) -> VoiceParagraph:
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        proj = self.work_dir / job.script
-        edits_all = self._read_edits(proj)
-        lang_edits = edits_all.setdefault(t_lang, {})
-        p_meta = lang_edits.get(str(n), {})
-        model_text = p_meta.get("model_text")
-        if model_text:
-            save_translation(proj, t_lang, {str(n): model_text})
-            build_docx(proj, self.output_dir, t_lang)
-            p_meta["version"] = int(p_meta.get("version", 1)) + 1
-            p_meta["edited"] = False
-            self._write_edits(proj, edits_all)
-        updated = self._get_single_paragraph(job_id, t_lang, n)
-        self.emit(
-            "paragraph.updated",
-            {
-                "job_id": job_id,
-                "lang": t_lang,
-                "n": n,
-                "version": updated.version,
-                "length_pct": updated.length_pct,
-                "in_norm": updated.in_norm,
-                "speedup": updated.audio.speedup if updated.audio else 1.0,
-            },
-        )
-        return updated
+        t_lang = disk_lang(lang)
+        if t_lang == disk_lang(job.source_lang):
+            raise VoiceApiError(409, "source_readonly", "Оригинал не редактируется")
+        if self._busy(job_id, t_lang):
+            raise VoiceApiError(409, "language_busy", "Язык сейчас в работе — дождитесь окончания этапа")
+        return await self._write_paragraph(job, t_lang, n, req.text.strip(), edited=True, version=req.version)
+
+    async def revert_paragraph(self, job_id: int, lang: str, n: int) -> VoiceParagraph:
+        job = self.get_job(job_id)
+        t_lang = disk_lang(lang)
+        meta = self._read_edits(self.work_dir / job.script).get(api_lang(t_lang), {}).get(str(n), {})
+        if not meta.get("model_text") or not meta.get("edited"):
+            return await self._get_single_paragraph(job_id, t_lang, n)
+        if self._busy(job_id, t_lang):
+            raise VoiceApiError(409, "language_busy", "Язык сейчас в работе — дождитесь окончания этапа")
+        return await self._write_paragraph(job, t_lang, n, meta["model_text"], edited=False)
 
     async def retranslate_paragraph(self, job_id: int, lang: str, n: int) -> VoiceParagraph:
+        """Translate one paragraph again with the job's model, rules and length counter (takes 1–3 min)."""
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        p = self._get_single_paragraph(job_id, t_lang, n)
+        t_lang = disk_lang(lang)
+        if t_lang == disk_lang(job.source_lang):
+            raise VoiceApiError(409, "source_readonly", "Оригинал не переводится")
+        if self._busy(job_id, t_lang):
+            raise VoiceApiError(409, "language_busy", "Язык сейчас в работе — дождитесь окончания этапа")
+        t_model = next((m for m in TRANSLATION_MODELS if m.id == job.model), TRANSLATION_MODELS[0])
+        args = ["retranslate", job.script, t_lang, str(n), "--engine", t_model.engine, "--profile", job.profile_id]
+        if t_model.engine == "agy":
+            args += ["--model", t_model.id]
+        res = await self.tr.call(*args, timeout=RETRANSLATE_TIMEOUT)
         proj = self.work_dir / job.script
-        new_text = p.text
-        if self._llm is not None:
-            try:
-                lang_name = LANG_CONFIG.get(t_lang, LANG_CONFIG["RU"])["name"]
-                prompt = (
-                    f"Переведи заново абзац #{n} с {job.source_lang} на {lang_name} ({t_lang}) строго в пределах "
-                    f"{p.norm[0]}–{p.norm[1]}% от длины оригинала. Сохрани все теги в [скобках] и <тегах> без изменений. "
-                    f"Числа запиши словами. Верни ТОЛЬКО текст перевода:\n\nОригинал:\n{p.source}"
-                )
-                res = await self._llm.complete("gemini-2.5-flash", prompt)
-                if res.strip():
-                    new_text = res.strip()
-            except Exception as e:
-                logger.warning(f"[voice] LLM retranslate fallback: {e}")
-
         edits_all = self._read_edits(proj)
-        lang_edits = edits_all.setdefault(t_lang, {})
-        p_meta = lang_edits.setdefault(str(n), {"version": p.version, "edited": False})
-        p_meta["model_text"] = new_text
-        p_meta["version"] = int(p_meta.get("version", p.version)) + 1
-        p_meta["edited"] = False
-        save_translation(proj, t_lang, {str(n): new_text})
-        build_docx(proj, self.output_dir, t_lang)
+        meta = edits_all.setdefault(api_lang(t_lang), {}).setdefault(str(n), {"version": 1, "edited": False})
+        meta.update(model_text=res["text"], edited=False, version=int(meta.get("version", 1)) + 1)
         self._write_edits(proj, edits_all)
-
-        updated = self._get_single_paragraph(job_id, t_lang, n)
-        self.emit(
-            "paragraph.updated",
-            {
-                "job_id": job_id,
-                "lang": t_lang,
-                "n": n,
-                "version": updated.version,
-                "length_pct": updated.length_pct,
-                "in_norm": updated.in_norm,
-                "speedup": updated.audio.speedup if updated.audio else 1.0,
-            },
-        )
+        updated = await self._get_single_paragraph(job_id, t_lang, n)
+        self._paragraph_event(job_id, t_lang, updated)
         return updated
 
     async def revoice_paragraph(self, job_id: int, lang: str, n: int) -> VoiceParagraph:
+        """Voice one paragraph again with the job's voice and model, then mix this paragraph again."""
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        p = self._get_single_paragraph(job_id, t_lang, n)
-        vid = job.voices.get(t_lang) or self.get_profile(job.profile_id).default.get(t_lang, "v1")
-        fish_id = self.resolve_fish_id(vid)
+        t_lang = disk_lang(lang)
+        if self._busy(job_id, t_lang):
+            raise VoiceApiError(409, "language_busy", "Язык сейчас в работе — дождитесь окончания этапа")
+        p = await self._get_single_paragraph(job_id, t_lang, n)
+        if not p.text:
+            raise VoiceApiError(409, "no_translation", f"Абзац #{n} ещё не переведён")
+        vid = job.voices.get(api_lang(t_lang)) or self.get_profile(job.profile_id).default.get(api_lang(t_lang))
+        if not vid:
+            raise VoiceApiError(422, "voice_missing", f"Для {api_lang(t_lang)} не выбран голос")
         key = self.fish_api_key()
-        if key:
-            model_name = DRAMA_MODEL if job.voice_model == "drama-3" else PAID_MODEL_DEFAULT
-            tts_text = with_carry(p.text, p.carried_mood) if (job.voice_model == "drama-3" and job.carry_mood) else p.text
-            audio = await synthesize_fish(tts_text, fish_id, key, model=model_name, attempts=2)
-            out_folder = self.audio_dir / f"{job.script}_{disk_lang(t_lang)}"
-            out_folder.mkdir(parents=True, exist_ok=True)
-            raw_path = out_folder / f"{n}.mp3"
-            raw_path.write_bytes(audio)
-
-            # Mix against source paragraph if present
-            mix_folder = self.mix_dir / job.script / disk_lang(t_lang)
-            mix_folder.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(raw_path, mix_folder / f"{n}.mp3")
-
-        updated = self._get_single_paragraph(job_id, t_lang, n)
-        self.emit(
-            "paragraph.updated",
-            {
-                "job_id": job_id,
-                "lang": t_lang,
-                "n": n,
-                "version": updated.version,
-                "length_pct": updated.length_pct,
-                "in_norm": updated.in_norm,
-                "speedup": updated.audio.speedup if updated.audio else 1.0,
-            },
-        )
+        if not key:
+            raise VoiceApiError(503, "fish_key_missing", "Нет ключа Fish Audio (FISH_API_KEY или bot_config.json переводчика)")
+        model_name = DRAMA_MODEL if job.voice_model == "drama-3" else PAID_MODEL_DEFAULT
+        tts_text = with_carry(p.text, p.carried_mood) if job.voice_model == "drama-3" and job.carry_mood else p.text
+        audio = await synthesize_fish(clean_for_tts(tts_text), self.resolve_fish_id(vid), key, model=model_name, attempts=2)
+        is_source = t_lang == disk_lang(job.source_lang)
+        folder = self.audio_dir / (job.script if is_source else f"{job.script}_{t_lang}")
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / f"{n}.mp3.part"
+        tmp.write_bytes(audio)
+        tmp.replace(folder / f"{n}.mp3")
+        if (self.mix_dir / job.script).exists() and (self.audio_dir / job.script / f"{n}.mp3").exists():
+            await self.tr.call("mix-one", job.script, str(n), timeout=300)
+        updated = await self._get_single_paragraph(job_id, t_lang, n)
+        self._paragraph_event(job_id, t_lang, updated)
         return updated
 
     async def compare_paragraph_voices(self, job_id: int, lang: str, n: int) -> list[CompareVoiceVariant]:
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        p = self._get_single_paragraph(job_id, t_lang, n)
-        vid = job.voices.get(t_lang) or self.get_profile(job.profile_id).default.get(t_lang, "v1")
+        t_lang = disk_lang(lang)
+        p = await self._get_single_paragraph(job_id, t_lang, n)
+        vid = job.voices.get(api_lang(t_lang)) or self.get_profile(job.profile_id).default.get(api_lang(t_lang), "")
         fish_id = self.resolve_fish_id(vid)
         key = self.fish_api_key()
-
+        if not key:
+            raise VoiceApiError(503, "fish_key_missing", "Нет ключа Fish Audio (FISH_API_KEY или bot_config.json переводчика)")
         specs: list[tuple[str, str, str, str]] = [
             ("S2.1 Free", FREE_MODEL_DEFAULT, p.text, "s2_free"),
             ("S2.1 Pro", PAID_MODEL_DEFAULT, p.text, "s2_pro"),
@@ -1692,138 +1483,119 @@ class VoiceService:
         ]
         if p.carried_mood:
             specs.append((f"Drama 3 + перенос {p.carried_mood}", DRAMA_MODEL, with_carry(p.text, p.carried_mood), "drama3_carry"))
-
+        self.compare_dir.mkdir(parents=True, exist_ok=True)
         out: list[CompareVoiceVariant] = []
         for label, model_id, text_val, tag in specs:
-            fname = f"cmp_{job.script}_{t_lang}_{n}_{tag}.mp3"
-            fpath = self.compare_dir / fname
-            fid = f"cmp_{job_id}_{t_lang}_{n}_{tag}"
+            fpath = self.compare_dir / f"cmp_{job.script}_{t_lang}_{n}_{tag}_v{p.version}.mp3"
+            fid = f"cmp_{job_id}_{api_lang(t_lang)}_{n}_{tag}"
             self._file_registry[fid] = fpath
-            if not fpath.exists() and key:
+            if not fpath.exists():
                 try:
-                    audio = await synthesize_fish(text_val, fish_id, key, model=model_id, attempts=2)
-                    fpath.write_bytes(audio)
+                    fpath.write_bytes(await synthesize_fish(clean_for_tts(text_val), fish_id, key, model=model_id, attempts=2))
                 except Exception as e:
                     out.append(CompareVoiceVariant(label=label, model=model_id, error=str(e)))
                     continue
-            elif not fpath.exists():
-                sample = await self.ensure_voice_sample(vid)
-                shutil.copyfile(sample, fpath)
-
-            dur = mp3_duration_sec(fpath) or round(max(4.0, spoken_len(text_val, t_lang) / 14.8), 2)
-            out.append(
-                CompareVoiceVariant(
-                    label=label,
-                    model=model_id,
-                    audio_url=f"/api/voice/files/{fid}",
-                    sec=dur,
-                )
-            )
+            out.append(CompareVoiceVariant(label=label, model=model_id, audio_url=f"/api/voice/files/{fid}",
+                                           sec=mp3_duration_sec(fpath)))
         return out
 
     async def get_paragraph_audio_path(self, job_id: int, lang: str, n: int, track: str = "mixed") -> Path:
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        d_lang = disk_lang(t_lang)
-        candidates: list[Path] = []
+        t_lang = disk_lang(lang)
+        src_lang = disk_lang(job.source_lang)
+        raw_dir = self.audio_dir / (job.script if t_lang == src_lang else f"{job.script}_{t_lang}")
         if track == "source":
-            candidates.append(self.audio_dir / job.script / f"{n}.mp3")
-            candidates.append(self.mix_dir / job.script / "EN" / f"{n}.mp3")
+            candidates = [self.mix_dir / job.script / src_lang / f"{n}.mp3", self.audio_dir / job.script / f"{n}.mp3"]
         elif track == "raw":
-            candidates.append(self.audio_dir / f"{job.script}_{d_lang}" / f"{n}.mp3")
+            candidates = [raw_dir / f"{n}.mp3"]
         else:
-            candidates.append(self.mix_dir / job.script / d_lang / f"{n}.mp3")
-            candidates.append(self.audio_dir / f"{job.script}_{d_lang}" / f"{n}.mp3")
-
+            candidates = [self.mix_dir / job.script / t_lang / f"{n}.mp3", raw_dir / f"{n}.mp3"]
         for c in candidates:
             if c.exists() and c.stat().st_size > 500:
                 return c
-
-        # Fallback to voice sample so ▶ button in UI always plays audio cleanly
-        vid = job.voices.get(job.source_lang if track == "source" else t_lang) or "v1"
-        return await self.ensure_voice_sample(vid)
+        raise VoiceApiError(404, "audio_not_found", f"Дорожки абзаца #{n} ({api_lang(t_lang)}) ещё нет")
 
     def get_language_peaks(self, job_id: int, lang: str) -> dict[int, list[float]]:
         job = self.get_job(job_id)
-        t_lang = api_lang(lang)
-        d_lang = disk_lang(t_lang)
-        paras = self.get_paragraphs(job_id, t_lang, filter_by="all")
-        peaks_out: dict[int, list[float]] = {}
-        for p in paras:
-            mp3 = self.mix_dir / job.script / d_lang / f"{p.n}.mp3"
-            if not mp3.exists():
-                mp3 = self.audio_dir / f"{job.script}_{d_lang}" / f"{p.n}.mp3"
-            if mp3.exists():
-                peaks_out[p.n] = compute_waveform_peaks(mp3, bars=32)
-            else:
-                h = int(hashlib.md5(f"{job.script}:{t_lang}:{p.n}:{p.text[:40]}".encode()).hexdigest()[:8], 16)
-                peaks_out[p.n] = [round(0.18 + ((h * (i + 5) * 31) % 78) / 100.0, 2) for i in range(32)]
-        return peaks_out
+        t_lang = disk_lang(lang)
+        raw_dir = self.audio_dir / (job.script if t_lang == disk_lang(job.source_lang) else f"{job.script}_{t_lang}")
+        out: dict[int, list[float]] = {}
+        for folder in (raw_dir, self.mix_dir / job.script / t_lang):  # mixed tracks win
+            if not folder.exists():
+                continue
+            for mp3 in folder.glob("*.mp3"):
+                if mp3.stem.isdigit():
+                    peaks = compute_waveform_peaks(mp3, bars=32)
+                    if peaks:
+                        out[int(mp3.stem)] = peaks
+        return out
+
+    # ------------------------------------------------------- Downloads ---
+
+    def _zip_folder(self, folder: Path, name: str) -> Path:
+        """Zip of the tracks in folder; rebuilt when a track is newer than the archive."""
+        self.api_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = self.api_dir / name
+        files = sorted((p for p in folder.glob("*.mp3") if p.stem.isdigit()), key=lambda p: int(p.stem))
+        if not files:
+            raise VoiceApiError(404, "file_not_found", "Дорожек ещё нет")
+        newest = max(p.stat().st_mtime for p in files)
+        if not zip_path.exists() or zip_path.stat().st_mtime < newest:
+            tmp = zip_path.with_suffix(".zip.part")
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+                for mp3 in files:
+                    zf.write(mp3, mp3.name)
+            os.replace(tmp, zip_path)
+        return zip_path
 
     async def resolve_download_file(self, file_id: str) -> tuple[Path, str]:
         if file_id in self._file_registry and self._file_registry[file_id].exists():
             p = self._file_registry[file_id]
             return p, p.name
-
         m = re.match(r"^f_(\d+)_([A-Z_]+)_(docx|raw_zip|mixed_zip|joined_mp3)$", file_id)
         if not m:
             raise VoiceApiError(404, "file_not_found", "Файл не найден")
-        job_id = int(m.group(1))
-        lang = api_lang(m.group(2))
-        d_lang = disk_lang(lang)
-        kind = m.group(3)
-        job = self.get_job(job_id)
-        slug = job.script
-        proj = self.work_dir / slug
-
+        job = self.get_job(int(m.group(1)))
+        lang, kind = disk_lang(m.group(2)), m.group(3)
+        a, slug = api_lang(lang), job.script
         if kind == "docx":
-            out_docx = self.output_dir / f"{slug}_{d_lang}.docx"
-            if not out_docx.exists() and (proj / "source.json").exists():
-                built = build_docx(proj, self.output_dir, lang)
-                if built and built.exists():
-                    return built, f"{slug}_{lang}.docx"
-                # Build a clean .docx from markdown blocks if source .docx is on remote machine
-                doc = Document()
-                tr_blocks = load_translation(proj, lang)
-                for k, txt in tr_blocks.items():
-                    doc.add_paragraph(f"{k}.\t{txt}" if k.isdigit() else txt)
-                doc.save(str(out_docx))
-            if out_docx.exists():
-                return out_docx, f"{slug}_{lang}.docx"
-
-        if kind in ("raw_zip", "mixed_zip"):
-            folder = (self.audio_dir / f"{slug}_{d_lang}") if kind == "raw_zip" else (self.mix_dir / slug / d_lang)
-            zip_path = self.output_dir / f"{slug}_{lang}_{kind}.zip"
-            if not zip_path.exists():
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-                    if folder.exists() and any(folder.glob("*.mp3")):
-                        for mp3 in sorted(folder.glob("*.mp3")):
-                            zf.write(mp3, mp3.name)
-                    else:
-                        sample = await self.ensure_voice_sample(job.voices.get(lang, "v1"))
-                        zf.write(sample, "1.mp3")
-            return zip_path, f"{slug}_{lang}.zip"
-
-        if kind == "joined_mp3":
-            joined = self.mix_dir / slug / f"{slug}_{d_lang}.mp3"
-            if joined.exists():
-                return joined, f"{slug}_{lang}.mp3"
-            sample = await self.ensure_voice_sample(job.voices.get(lang, "v1"))
-            return sample, f"{slug}_{lang}.mp3"
-
-        raise VoiceApiError(404, "file_not_found", "Файл не найден")
+            p = self.output_dir / f"{slug}_{lang}.docx"
+            if p.exists():
+                return p, f"{slug}_{a}.docx"
+        elif kind == "raw_zip":
+            folder = self.audio_dir / (slug if lang == disk_lang(job.source_lang) else f"{slug}_{lang}")
+            return self._zip_folder(folder, f"{slug}_{a}_audio.zip"), f"{slug}_{a}_audio.zip"
+        elif kind == "mixed_zip":
+            return self._zip_folder(self.mix_dir / slug / lang, f"{slug}_{a}.zip"), f"{slug}_{a}.zip"
+        elif kind == "joined_mp3":
+            p = self.mix_dir / slug / f"{slug}_{lang}.mp3"
+            if p.exists():
+                return p, f"{slug}_{a}.mp3"
+        raise VoiceApiError(404, "file_not_found", "Файл ещё не готов")
 
     async def build_job_zip(self, job_id: int) -> tuple[Path, str]:
+        """All translations (docx) and mixed tracks of a job in one archive."""
         job = self.get_job(job_id)
-        slug = job.script
-        zip_path = self.output_dir / f"{slug}_all_{job_id}.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-            for f in job.files:
+        files = [f for f in job.files if f.kind in ("docx", "mixed_zip")]
+        if not files:
+            raise VoiceApiError(404, "file_not_found", "Готовых файлов ещё нет")
+        self.api_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = self.api_dir / f"{job.script}_all_{job_id}.zip"
+        tmp = zip_path.with_suffix(".zip.part")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+            for f in files:
+                p, name = await self.resolve_download_file(f.id)
                 if f.kind == "docx":
-                    try:
-                        p, name = await self.resolve_download_file(f.id)
-                        if p.exists():
-                            zf.write(p, f"docx/{name}")
-                    except Exception:
-                        pass
-        return zip_path, f"{slug}_all.zip"
+                    zf.write(p, f"docx/{name}")
+                else:
+                    folder = self.mix_dir / job.script / disk_lang(f.lang)
+                    for mp3 in sorted(folder.glob("*.mp3"), key=lambda x: int(x.stem) if x.stem.isdigit() else 0):
+                        zf.write(mp3, f"mix/{f.lang}/{mp3.name}")
+        os.replace(tmp, zip_path)
+        return zip_path, f"{job.script}_all.zip"
+
+
+def job_norm(svc: VoiceService, job: VoiceJob, lang: str) -> tuple[int, int]:
+    """Profile range of a language (percent of an English original) — used before the translator wrote stats."""
+    prof = svc.get_profile(job.profile_id)
+    return prof.norms.get(api_lang(lang)) or LANG_CONFIG.get(api_lang(lang), LANG_CONFIG["RU"])["norm"]

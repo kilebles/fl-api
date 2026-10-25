@@ -131,6 +131,18 @@ Wikimedia images picked by Gemini; slow — Wikimedia 429s are waited out) then 
 (rendering, ~1 min per 10 s card). Clips go to the store as they appear (`infographics/{id}/videos/`); a restart resumes
 (scenario.json present → no new search, uploaded clips are not rendered again). Remotion may need a company license for SaaS.
 
+## Voice (`/api/voice`)
+
+Translation + Fish voiceover + mixing are done by `../fl-voice_translator` (`VOICE_DIR`), not here: `src/voice/translator.py`
+calls its `tools/api.py` (JSON commands: prepare, submit, stop/drop/resume, revoice, stats, measure, set-paragraph,
+retranslate, mix-one) with its own Python and reads its files (`queue/NNNN.json` + `.events.jsonl`, `work/<script>/source.json`,
+`<LANG>.md`, `<LANG>.stats.json`, `output/audio|mix`). The translator's Telegram bot runs the queue (`queue/bot.alive` →
+`worker_online`). A web job = a chain of translator jobs (translate → voice → mix) linked by `root`; its id is the first
+one's. `VoiceService.scan()` (every 1.5 s) turns queue changes into SSE events. Lengths/norms come from the translator's
+stats, so they match its counter; the original can be in any of its languages. `tests/fake_translator` stands in for it in
+CI; `FL_TRANSLATOR_REPO=../fl-voice_translator FL_TRANSLATOR_PYTHON=<python with its requirements> uv run pytest
+tests/test_voice_api.py` runs the same tests against the real one, including real workers end to end.
+
 ## Usage
 
 ```bash

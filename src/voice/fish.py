@@ -238,10 +238,8 @@ def mp3_duration_sec(path: Path) -> float | None:
 def compute_waveform_peaks(path: Path, bars: int = 36) -> list[float]:
     """Compute normalized amplitude peaks [0.1..1.0] for an MP3 file."""
     pcm = decode_pcm(path)
-    if not pcm:
-        # Deterministic fallback based on file size so UI waveform always renders cleanly
-        seed = path.stat().st_size if path.exists() else 12345
-        return [round(0.2 + ((seed * (i + 3) * 37) % 75) / 100.0, 2) for i in range(bars)]
+    if not pcm:  # no ffmpeg or unreadable file: no waveform rather than a made-up one
+        return []
     a = array.array("h")
     a.frombytes(pcm[: len(pcm) // 2 * 2])
     if sys.byteorder == "big":

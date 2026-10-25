@@ -57,7 +57,7 @@ def create_app(
             settings.prompt_template_model,
             parallel_runs=settings.prompt_parallel_runs,
         )
-        voice = VoiceService(settings, llm=llm_client)
+        voice = VoiceService(settings)
         app.state.accounts = accounts
         app.state.objects = store
         app.state.queue = queue

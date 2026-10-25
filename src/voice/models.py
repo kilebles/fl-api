@@ -315,3 +315,4 @@ class QueueStatusResponse(BaseModel):
     running: int
     queued: int
     slots: dict[str, SlotUsage]
+    worker_online: bool = False  # the translator bot that runs the jobs is up (queue/bot.alive is fresh)
