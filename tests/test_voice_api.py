@@ -3,7 +3,7 @@
 By default the translator is the stand-in in tests/fake_translator (same protocol and files). To check the real
 contract, point FL_TRANSLATOR_REPO at a checkout of fl-voice_translator: the tests then run against a copy of it,
 and FL_TRANSLATOR_PYTHON at a Python with its requirements for the end-to-end test with the real workers.
-The bot is not started: tests change queue/*.json the way the bot does.
+The translator's worker is not started: tests change queue/*.json the way it does.
 """
 
 import json
@@ -168,7 +168,7 @@ def test_translate_job_goes_to_translator_queue_and_follows_the_bot(env):
 
     svc.scan()
     bot.update(job_id, status="running", progress={"stage": "translate", "lang": "RU", "part": 1, "parts": 1})
-    (bot.root / "queue" / "bot.alive").write_text("{}")
+    (bot.root / "queue" / "worker.alive").write_text("{}")
     job = client.get(f"/api/voice/jobs/{job_id}").json()
     ru = next(lang for lang in job["languages"] if lang["lang"] == "RU")
     assert job["status"] == "running" and ru["translate"]["state"] == "running" and ru["voice"]["state"] == "skipped"
@@ -320,7 +320,7 @@ def test_stop_resume_delete_and_errors(env):
     assert client.post(f"/api/voice/jobs/{job_id}/resume").json()["status"] == "queued"
     bot.update(job_id, status="running")
     assert client.post(f"/api/voice/jobs/{job_id}/stop").status_code == 200
-    assert json.loads((bot.root / "queue" / f"{job_id:04d}.cmd").read_text())["cmd"] == "stop"  # the bot will stop it
+    assert json.loads((bot.root / "queue" / f"{job_id:04d}.cmd").read_text())["cmd"] == "stop"  # the worker will stop it
     bot.update(job_id, status="failed", error="line 1\nagy не записал перевод после 6 попыток")
     failed = client.get(f"/api/voice/jobs/{job_id}").json()
     assert failed["status"] == "failed" and "agy не записал" in failed["error_message"]
@@ -331,6 +331,8 @@ def test_stop_resume_delete_and_errors(env):
     assert bad.status_code == 404
     unknown = client.post("/api/voice/jobs", json={"script_id": script["script_id"], "model": "gpt-9"})
     assert unknown.status_code == 422
+    same = client.post("/api/voice/jobs", json={"script_id": script["script_id"], "mode": "translate", "targets": ["EN"]})
+    assert same.status_code == 422 and same.json()["error"]["code"] == "no_targets"
 
 
 def test_translator_missing_gives_clear_error(tmp_path):
@@ -354,7 +356,7 @@ def tone(sec):
 voice.synthesize = lambda text, vid, key, model=None, attempts=6: tone(1.0 + len(text) / 300)
 voice.missing_voices = lambda items, key=None: []
 say = lambda job, text, files=None: None
-for _ in range(4):  # translate → voice → mix, the way the bot's workers pick them up
+for _ in range(4):  # translate → voice → mix, the way worker.py picks them up
     for engine in ("agy", "claude"):
         jobs.TranslatePool(say, engine).run_once()
     jobs.VoiceWorker(say).loop(once=True)
@@ -442,3 +444,36 @@ def test_single_paragraph_voiceover_tries_free_model_first(env, monkeypatch):
     calls.clear()
     client.post(f"/api/voice/jobs/{job_id}/languages/RU/paragraphs/2/revoice")
     assert calls == ["s2.1-pro-free"]
+
+
+@pytest.mark.skipif(not os.environ.get("FL_TRANSLATOR_REPO"), reason="needs the real translator (FL_TRANSLATOR_REPO)")
+def test_real_worker_process_runs_web_job(env):
+    """The translator's worker.py (a separate process, no Telegram bot) picks up a web job; the site sees it online."""
+    client, bot, svc = env
+    py = os.environ.get("FL_TRANSLATOR_PYTHON") or sys.executable
+    fake = bot.root / "fake_agy"
+    fake.write_text(FAKE_AGY, encoding="utf-8")
+    fake.chmod(0o755)
+    (bot.root / "tools" / "config.local.json").write_text(json.dumps({"agy": {"binary_path": str(fake)},
+                                                                       "usage_tracking": False}), encoding="utf-8")
+    script = _upload(client, RU, name="Отступление.docx")
+    job_id = client.post("/api/voice/jobs", json={"script_id": script["script_id"], "mode": "translate",
+                                                  "targets": ["EN"], "model": "gemini-4-argon-medium"}).json()["id"]
+    worker = subprocess.Popen([py, "-u", "worker.py", "--run-for", "15"], cwd=bot.root, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, env=dict(os.environ, PYTHONUTF8="1"))
+    try:
+        import time
+
+        deadline = time.time() + 30
+        online = False
+        while time.time() < deadline:
+            online = online or client.get("/api/voice/queue").json()["worker_online"]
+            if client.get(f"/api/voice/jobs/{job_id}").json()["status"] == "done":
+                break
+            time.sleep(0.3)
+        assert online
+        job = client.get(f"/api/voice/jobs/{job_id}").json()
+        assert job["status"] == "done", worker.stdout.read() if worker.poll() is not None else job
+        assert ("EN", "docx") in {(f["lang"], f["kind"]) for f in job["files"]}
+    finally:
+        worker.kill()

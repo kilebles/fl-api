@@ -1,7 +1,7 @@
 """Translation & voiceover for the web panel, run by fl-voice_translator.
 
-Jobs go into the translator's own queue (`queue/`), and its Telegram bot runs them exactly like jobs sent from
-Telegram: translation with the chosen model and length fitting, Fish voiceover, mixing under the original.
+Jobs go into the translator's own queue (`queue/`), and its worker (worker.py) runs them exactly like jobs sent
+from its Telegram bot: translation with the chosen model and length fitting, Fish voiceover, mixing under the original.
 This service turns the queue and the translator's files into the web API: a web job is a chain of translator
 jobs (translate → voice → mix) linked by `root`; its id is the id of the first one.
 """
@@ -138,7 +138,7 @@ VOICE_MODELS: list[VoiceModelInfo] = [
 ALL_DISK_LANGS = ["EN", "RU", "ES", "PT_BR", "DE", "IT", "PL", "FR"]
 LANG_SUFFIX_RE = re.compile(r"_(PT_BR|RU|ES|DE|IT|PL|FR|EN)$")
 WATCH_EVERY = 1.5  # seconds between queue scans for SSE events
-LIST_LIMIT = 200  # newest web jobs in the list (the bot's history can be long)
+LIST_LIMIT = 200  # newest web jobs in the list (the queue history can be long)
 RETRANSLATE_TIMEOUT = 25 * 60
 
 
@@ -289,7 +289,7 @@ class VoiceService:
             self._subscribers.discard(q)
 
     async def _watch(self) -> None:
-        """Scan the translator queue and turn changes into SSE events (the bot changes it, not this process)."""
+        """Scan the translator queue and turn changes into SSE events (the translator's worker changes it, not this process)."""
         first = True
         while True:
             try:
@@ -1101,7 +1101,7 @@ class VoiceService:
         return out
 
     def _cache_key(self, chain: list[dict[str, Any]], slug: str) -> tuple:
-        """What a built job depends on: its translator jobs and the folders the bot writes for the script."""
+        """What a built job depends on: its translator jobs and the folders the worker writes for the script."""
 
         def mtime(p: Path) -> int:
             try:
@@ -1157,6 +1157,8 @@ class VoiceService:
             raise VoiceApiError(422, "unknown_model", f"Неизвестная модель перевода {req.model}")
 
         targets = [disk_lang(t) for t in req.targets if disk_lang(t) != src_lang]
+        if req.targets and not targets and req.mode != "voice":
+            raise VoiceApiError(422, "no_targets", f"Языки перевода совпадают с языком оригинала ({api_lang(src_lang)})")
         voices: dict[str, str] = {}
         for lang in [src_lang] + targets:
             ref = req.voices.get(api_lang(lang)) or req.voices.get(lang) or prof.default.get(api_lang(lang))

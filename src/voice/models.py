@@ -240,7 +240,7 @@ class CreateVoiceJobRequest(BaseModel):
     title: str | None = None
     project_id: str | None = None
     mode: JobMode = "all"
-    source_lang: str = "EN"
+    source_lang: str | None = None  # None: the language detected on upload
     targets: list[str] = Field(default_factory=list)
     profile_id: str = "p1"
     voices: dict[str, str] = Field(default_factory=dict)
@@ -315,4 +315,4 @@ class QueueStatusResponse(BaseModel):
     running: int
     queued: int
     slots: dict[str, SlotUsage]
-    worker_online: bool = False  # the translator bot that runs the jobs is up (queue/bot.alive is fresh)
+    worker_online: bool = False  # the translator worker that runs the jobs is up (queue/worker.alive is fresh)

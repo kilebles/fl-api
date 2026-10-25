@@ -1,6 +1,6 @@
 """Bridge to fl-voice_translator: its queue and files on disk, its `tools/api.py` commands for changes.
 
-The translator's Telegram bot runs the jobs (translation with length fitting, Fish voiceover, mixing);
+The translator's worker (worker.py) runs the jobs (translation with length fitting, Fish voiceover, mixing);
 the web panel puts jobs into the same queue and reads progress back from `queue/*.json`.
 """
 
@@ -19,7 +19,7 @@ from loguru import logger
 from src.voice.models import VoiceApiError
 
 JOB_FILE_RE = re.compile(r"^(\d{4})\.json$")
-ALIVE_SEC = 30  # the bot touches queue/bot.alive every 2 s
+ALIVE_SEC = 30  # the worker touches queue/worker.alive every 2 s
 
 ERROR_STATUS = {
     "script_not_found": 404,
@@ -133,7 +133,7 @@ class Translator:
         return cfg
 
     def worker_online(self) -> bool:
-        f = self.queue_dir / "bot.alive"
+        f = self.queue_dir / "worker.alive"
         try:
             return time.time() - f.stat().st_mtime < ALIVE_SEC
         except OSError:
