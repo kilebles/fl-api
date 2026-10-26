@@ -50,12 +50,6 @@ class Settings(BaseSettings):
     infographics_model: str = Field(default="gemini-2.5-flash", description="Gemini model of the infographics pipeline")
     renderer_dir: Path = Field(default=Path("renderer"), description="Remotion project that renders infographic cards")
     render_concurrency: int | None = Field(default=None, description="Chrome tabs per render (None = Remotion default; 1 on a small server)")
-    voice_dir: Path = Field(
-        default=Path("work/voice"),
-        description="fl-voice_translator folder (its bot runs voice jobs); the default looks for it in the home folder",
-    )
-    voice_python: str = Field(default="", description="Python of the translator (default: its .venv, else this one)")
-    fish_api_key: str = Field(default="", description="Fish Audio API key (fallback: voice_dir/bot_config.json)")
 
     # Web API
     api_token: str = Field(default="", description="Bearer token required by the web API; empty disables the check")
