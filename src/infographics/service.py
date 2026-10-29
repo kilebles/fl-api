@@ -238,7 +238,11 @@ class InfographicsService:
                     args.append("--one-per-person")
                 await self._stage(run_id, "search", args, PROJECT_ROOT, log_path)
 
+            raw_subjects = json.loads(scenario_json.read_text(encoding="utf-8"))
             entries = _entries(scenario_json)
+            if raw_subjects and not entries:
+                scenario_json.unlink(missing_ok=True)
+                raise StageError(f"0 of {len(raw_subjects)} detected subjects got an image — see {log_path}")
             stored = {e["id"]: e for e in (await self.run(run_id)).entries}
             for entry in entries:
                 previous = stored.get(entry["id"], {})
