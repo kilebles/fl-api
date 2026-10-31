@@ -91,32 +91,6 @@ class ResendMailer:
             logger.error(f"[mail] Resend HTTP {resp.status_code} for {message.to}: {resp.text[:300]}")
             raise MailDeliveryError("Не удалось отправить письмо. Проверьте адрес почты или попробуйте позже.")
 
-    async def send_login_code(self, to: str, code: str) -> None:
-        safe_code = html.escape(code)
-        body = (
-            '<p style="margin:0 0 18px;font-size:14px;line-height:1.55;color:#3D3D3A;">'
-            "Введите этот одноразовый код на странице входа. Код действует 10 минут:"
-            "</p>"
-            '<div style="background:#FAF9F5;border:1px solid #E5E1D6;border-radius:10px;'
-            'padding:16px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
-            f'font-size:28px;font-weight:700;letter-spacing:0.22em;color:#141413;">{safe_code}</div>'
-        )
-        await self.send(
-            EmailMessage(
-                to=to,
-                subject=f"{code} — код входа в Motion Pr",
-                html=_wrap_html(
-                    "Код для входа",
-                    body,
-                    "Если вы не запрашивали вход в Motion Pr, просто проигнорируйте это письмо.",
-                ),
-                text=(
-                    f"Ваш одноразовый код для входа в Motion Pr: {code}\n\n"
-                    "Код действует 10 минут. Если вы не запрашивали вход, проигнорируйте это письмо."
-                ),
-            )
-        )
-
     async def send_password_reset(self, to: str, reset_url: str) -> None:
         safe_url = html.escape(reset_url, quote=True)
         body = (
@@ -152,11 +126,11 @@ class ResendMailer:
         safe_code = html.escape(code)
         body = (
             '<p style="margin:0 0 16px;font-size:14px;line-height:1.55;color:#3D3D3A;">'
-            "Подтвердите адрес электронной почты по кнопке ниже или введите код в настройках аккаунта:"
+            "Введите этот 6-значный код на странице регистрации/входа или нажмите кнопку ниже, чтобы активировать аккаунт:"
             "</p>"
             '<div style="background:#FAF9F5;border:1px solid #E5E1D6;border-radius:10px;'
-            'padding:13px;margin:0 0 18px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
-            f'font-size:24px;font-weight:700;letter-spacing:0.2em;color:#141413;">{safe_code}</div>'
+            'padding:14px;margin:0 0 18px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
+            f'font-size:26px;font-weight:700;letter-spacing:0.22em;color:#141413;">{safe_code}</div>'
             f'<p style="margin:0 0 16px;"><a href="{safe_url}" '
             'style="display:inline-block;background:#B85A3A;color:#FFFFFF;text-decoration:none;'
             'font-size:14px;font-weight:500;padding:11px 20px;border-radius:8px;">Подтвердить почту</a></p>'
@@ -166,15 +140,38 @@ class ResendMailer:
         await self.send(
             EmailMessage(
                 to=to,
-                subject="Подтверждение почты в Motion Pr",
+                subject=f"{code} — подтверждение почты в Motion Pr",
                 html=_wrap_html(
                     "Подтвердите почту",
                     body,
-                    "Ссылка и код действительны 24 часа.",
+                    "Код и ссылка действительны 24 часа. Если вы не регистрировались в Motion Pr, просто проигнорируйте это письмо.",
                 ),
                 text=(
                     f"Код подтверждения почты в Motion Pr: {code}\n\n"
                     f"Или подтвердите в один клик по ссылке:\n{verify_url}\n"
                 ),
+            )
+        )
+
+    async def send_email_change_code(self, to: str, code: str) -> None:
+        safe_code = html.escape(code)
+        body = (
+            '<p style="margin:0 0 16px;font-size:14px;line-height:1.55;color:#3D3D3A;">'
+            "Введите этот код в настройках аккаунта, чтобы подтвердить смену адреса электронной почты (код действует 15 минут):"
+            "</p>"
+            '<div style="background:#FAF9F5;border:1px solid #E5E1D6;border-radius:10px;'
+            'padding:14px;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
+            f'font-size:26px;font-weight:700;letter-spacing:0.22em;color:#141413;">{safe_code}</div>'
+        )
+        await self.send(
+            EmailMessage(
+                to=to,
+                subject=f"{code} — подтверждение новой почты в Motion Pr",
+                html=_wrap_html(
+                    "Подтверждение новой почты",
+                    body,
+                    "Если вы не запрашивали смену почты в Motion Pr, проигнорируйте это письмо.",
+                ),
+                text=f"Код для подтверждения новой почты в Motion Pr: {code}\n",
             )
         )

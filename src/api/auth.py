@@ -1,4 +1,4 @@
-"""Authentication, session management, Google OAuth 2.0 (PKCE), and admin user endpoints."""
+"""Authentication, mandatory email verification (Resend), Google OAuth 2.0 (PKCE), and admin user endpoints."""
 
 import secrets
 import time
@@ -8,25 +8,21 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from src.auth.mailer import ResendMailer
 from src.auth.service import (
-    AccountDisabledError,
     AuthError,
     AuthService,
-    EmailAlreadyExistsError,
-    InvalidCredentialsError,
+    EmailNotVerifiedError,
     Principal,
-    RateLimitedError,
-    SessionNotFoundError,
     SessionRecord,
-    UserNotFoundError,
     UserRecord,
     build_pkce_pair,
     describe_user_agent,
+    display_username,
     sign_oauth_state,
     verify_oauth_state,
 )
@@ -113,7 +109,6 @@ def _verify_csrf(request: Request, settings: Settings, method: str | None = None
     trusted = _trusted_origins(request, settings)
     if origin in trusted:
         return
-    # Allow localhost <-> 127.0.0.1 equivalence in local loopback development
     if _is_loopback(origin[1]) and any(_is_loopback(t[1]) and t[2] == origin[2] for t in trusted):
         return
     raise HTTPException(403, "Межсайтовый запрос отклонён (CSRF)")
@@ -158,9 +153,8 @@ async def get_principal(request: Request) -> Principal:
                 user = await auth.ensure_gateway_user(
                     user_id=uid,
                     email=email,
-                    name=str(gw_data.get("name") or ""),
+                    username=str(gw_data.get("username") or gw_data.get("name") or ""),
                     role=str(gw_data.get("role") or "user"),
-                    email_verified=bool(gw_data.get("verified")),
                 )
                 return Principal(user=user, session=None, is_service=False)
 
@@ -215,18 +209,18 @@ Mailer = Annotated[ResendMailer, Depends(get_mailer)]
 class ProvidersOut(BaseModel):
     email: bool = True
     google: bool
-    email_code: bool = False
     password_reset: bool = False
 
 
 class UserOut(BaseModel):
     id: str
+    username: str
     email: str
     name: str
     avatar_url: str | None
     avatar_key: str | None = None
     role: Literal["user", "admin"]
-    email_verified: bool = False
+    email_verified: bool = True
     has_password: bool
     has_google: bool
     created_at: datetime
@@ -234,22 +228,36 @@ class UserOut(BaseModel):
 
 
 class RegisterIn(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
     email: str = Field(max_length=320)
     password: str = Field(min_length=8, max_length=128)
-    name: str = Field(default="", max_length=120)
+
+
+class RegisterPendingOut(BaseModel):
+    verification_required: Literal[True] = True
+    email: str
+    username: str
 
 
 class LoginIn(BaseModel):
-    email: str = Field(max_length=320)
+    login: str = Field(default="", max_length=320)
+    email: str = Field(default="", max_length=320)
     password: str = Field(min_length=1, max_length=256)
 
 
 class ProfilePatch(BaseModel):
-    name: str | None = Field(default=None, max_length=120)
-    email: str | None = Field(default=None, max_length=320)
-    current_password: str | None = Field(default=None, max_length=256)
+    username: str | None = Field(default=None, max_length=32)
     avatar_key: str | None = Field(default=None, max_length=300)
     clear_avatar: bool = False
+
+
+class EmailChangeRequestIn(BaseModel):
+    new_email: str = Field(max_length=320)
+    current_password: str | None = Field(default=None, max_length=256)
+
+
+class EmailChangeConfirmIn(BaseModel):
+    code: str = Field(min_length=4, max_length=16)
 
 
 class PasswordChangeIn(BaseModel):
@@ -276,6 +284,7 @@ class SessionOut(BaseModel):
 
 class AdminUserOut(BaseModel):
     id: str
+    username: str
     email: str
     name: str
     avatar_url: str | None
@@ -292,11 +301,6 @@ class EmailRequestIn(BaseModel):
     email: str = Field(max_length=320)
 
 
-class EmailCodeVerifyIn(BaseModel):
-    email: str = Field(max_length=320)
-    code: str = Field(min_length=4, max_length=16)
-
-
 class PasswordResetConfirmIn(BaseModel):
     token: str = Field(min_length=16, max_length=256)
     new_password: str = Field(min_length=8, max_length=128)
@@ -304,6 +308,7 @@ class PasswordResetConfirmIn(BaseModel):
 
 class EmailVerifyConfirmIn(BaseModel):
     token: str | None = Field(default=None, max_length=256)
+    email: str | None = Field(default=None, max_length=320)
     code: str | None = Field(default=None, max_length=16)
 
 
@@ -322,10 +327,12 @@ def _resolve_avatar(raw: str | None, request: Request) -> tuple[str | None, str 
 
 def _user_out(user: UserRecord, request: Request, session_id: str | None = None) -> UserOut:
     avatar_url, avatar_key = _resolve_avatar(user.avatar_url, request)
+    uname = display_username(user)
     return UserOut(
         id=user.id,
+        username=uname,
         email=user.email,
-        name=user.name,
+        name=uname,
         avatar_url=avatar_url,
         avatar_key=avatar_key,
         role="admin" if user.role == "admin" else "user",
@@ -364,7 +371,9 @@ def _frontend_base(request: Request, settings: Settings) -> str:
     if referer:
         tup = _origin_tuple(referer)
         trusted = _trusted_origins(request, settings)
-        if tup and (tup in trusted or (_is_loopback(tup[1]) and any(_is_loopback(t[1]) and t[2] == tup[2] for t in trusted))):
+        if tup and (
+            tup in trusted or (_is_loopback(tup[1]) and any(_is_loopback(t[1]) and t[2] == tup[2] for t in trusted))
+        ):
             port_part = f":{tup[2]}" if tup[2] else ""
             return f"{tup[0]}://{tup[1]}{port_part}"
     return settings.frontend_url.rstrip("/")
@@ -423,7 +432,6 @@ async def auth_providers(
     return ProvidersOut(
         email=True,
         google=bool(settings.google_client_id and settings.google_client_secret),
-        email_code=mailer.enabled,
         password_reset=mailer.enabled,
     )
 
@@ -466,9 +474,8 @@ async def verify_gateway_auth(
                 {
                     "uid": user.id,
                     "email": user.email,
-                    "name": user.name,
+                    "username": display_username(user),
                     "role": user.role,
-                    "verified": bool(user.email_verified_at),
                     "iat": int(time.time()),
                 },
                 secret,
@@ -501,66 +508,117 @@ async def current_session(
     return SessionCheckOut(user=_user_out(user, request, sess.id))
 
 
-async def _try_send_verification(
-    user: UserRecord,
-    request: Request,
-    auth: AuthService,
-    mailer: ResendMailer,
-    settings: Settings,
-) -> None:
-    if not mailer.enabled or user.email_verified_at is not None:
-        return
-    try:
-        _, verify_token, code = await auth.issue_email_verification(
-            user.id,
-            ip_address=_client_ip(request),
-            enforce_cooldown=False,
-        )
-        frontend = _frontend_base(request, settings)
-        url = f"{frontend}/verify-email?{urlencode({'token': verify_token})}"
-        await mailer.send_email_verification(user.email, url, code)
-    except Exception as exc:
-        logger.warning(f"[auth] could not send verification email to {user.email}: {exc}")
-
-
-@auth_router.post("/register", status_code=201)
+@auth_router.post("/register", status_code=202)
 async def register(
     body: RegisterIn,
     request: Request,
-    response: Response,
     auth: Auth,
     mailer: Mailer,
     settings: Annotated[Settings, Depends(get_settings_dep)],
-) -> UserOut:
+) -> RegisterPendingOut:
     _verify_csrf(request, settings)
-    user, sess, raw_token = await auth.register(
+    if not mailer.enabled:
+        raise HTTPException(503, "Отправка писем не настроена на сервере (RESEND_API_KEY)")
+
+    user, verify_token, code = await auth.register(
         email=body.email,
+        username=body.username,
         password=body.password,
-        name=body.name,
         ip_address=_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
     )
-    await _try_send_verification(user, request, auth, mailer, settings)
-    set_session_cookie(response, request, settings, raw_token)
-    return _user_out(user, request, sess.id)
+    frontend = _frontend_base(request, settings)
+    verify_url = f"{frontend}/verify-email?{urlencode({'token': verify_token})}"
+    await mailer.send_email_verification(user.email, verify_url, code)
+    return RegisterPendingOut(email=user.email, username=display_username(user))
 
 
-@auth_router.post("/login")
+@auth_router.post("/login", response_model=UserOut)
 async def login(
     body: LoginIn,
     request: Request,
     response: Response,
     auth: Auth,
+    mailer: Mailer,
+    settings: Annotated[Settings, Depends(get_settings_dep)],
+) -> UserOut | JSONResponse:
+    _verify_csrf(request, settings)
+    identifier = (body.login or body.email).strip()
+    if not identifier:
+        raise HTTPException(422, "Введите username или почту")
+
+    try:
+        user, sess, raw_token = await auth.login(
+            identifier=identifier,
+            password=body.password,
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+    except EmailNotVerifiedError as exc:
+        if mailer.enabled:
+            try:
+                issued = await auth.issue_unverified_email_challenge(
+                    exc.email,
+                    ip_address=_client_ip(request),
+                    enforce_cooldown=False,
+                )
+                if issued is not None:
+                    _, verify_token, code = issued
+                    frontend = _frontend_base(request, settings)
+                    verify_url = f"{frontend}/verify-email?{urlencode({'token': verify_token})}"
+                    await mailer.send_email_verification(exc.email, verify_url, code)
+            except Exception as mail_err:
+                logger.warning(f"[auth] could not resend verification on login for {exc.email}: {mail_err}")
+        return JSONResponse(
+            status_code=403,
+            content={"detail": str(exc), "code": "email_not_verified", "email": exc.email},
+        )
+
+    set_session_cookie(response, request, settings, raw_token)
+    return _user_out(user, request, sess.id)
+
+
+@auth_router.post("/email/verify/resend")
+async def resend_email_verification(
+    body: EmailRequestIn,
+    request: Request,
+    auth: Auth,
+    mailer: Mailer,
+    settings: Annotated[Settings, Depends(get_settings_dep)],
+) -> dict[str, bool]:
+    _verify_csrf(request, settings)
+    if not mailer.enabled:
+        raise HTTPException(503, "Отправка писем не настроена на сервере (RESEND_API_KEY)")
+
+    issued = await auth.issue_unverified_email_challenge(
+        body.email,
+        ip_address=_client_ip(request),
+        enforce_cooldown=True,
+    )
+    if issued is not None:
+        user, verify_token, code = issued
+        frontend = _frontend_base(request, settings)
+        verify_url = f"{frontend}/verify-email?{urlencode({'token': verify_token})}"
+        await mailer.send_email_verification(user.email, verify_url, code)
+    return {"ok": True}
+
+
+@auth_router.post("/email/verify/confirm")
+async def confirm_email_verification(
+    body: EmailVerifyConfirmIn,
+    request: Request,
+    response: Response,
+    auth: Auth,
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> UserOut:
     _verify_csrf(request, settings)
-    user, sess, raw_token = await auth.login(
+    user, sess, raw_session = await auth.confirm_email_verification(
+        token=body.token,
         email=body.email,
-        password=body.password,
+        code=body.code,
         ip_address=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
-    set_session_cookie(response, request, settings, raw_token)
+    set_session_cookie(response, request, settings, raw_session)
     return _user_out(user, request, sess.id)
 
 
@@ -589,11 +647,8 @@ async def patch_me(
     principal: LoggedUser,
     request: Request,
     auth: Auth,
-    mailer: Mailer,
-    settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> UserOut:
     assert principal.user is not None
-    prev_email = principal.user.email
     avatar_key = body.avatar_key
     if avatar_key is not None:
         expected_prefix = f"inputs/{principal.user.id}/"
@@ -604,50 +659,44 @@ async def patch_me(
 
     user = await auth.update_profile(
         user_id=principal.user.id,
-        name=body.name,
-        email=body.email,
-        current_password=body.current_password,
+        username=body.username,
         avatar_url=avatar_key,
         clear_avatar=body.clear_avatar,
     )
-    if user.email != prev_email:
-        await _try_send_verification(user, request, auth, mailer, settings)
     return _user_out(user, request, principal.session.id if principal.session else None)
 
 
-@auth_router.post("/email-code/send")
-async def send_email_code(
-    body: EmailRequestIn,
+@auth_router.post("/email/change/request")
+async def request_email_change(
+    body: EmailChangeRequestIn,
+    principal: LoggedUser,
     request: Request,
     auth: Auth,
     mailer: Mailer,
-    settings: Annotated[Settings, Depends(get_settings_dep)],
-) -> dict[str, bool]:
-    _verify_csrf(request, settings)
+) -> dict[str, Any]:
+    assert principal.user is not None
     if not mailer.enabled:
-        raise HTTPException(503, "Вход по коду из письма не настроен на сервере (RESEND_API_KEY)")
-    norm_email, code = await auth.issue_login_otp(body.email, ip_address=_client_ip(request))
-    await mailer.send_login_code(norm_email, code)
-    return {"ok": True}
-
-
-@auth_router.post("/email-code/verify")
-async def verify_email_code(
-    body: EmailCodeVerifyIn,
-    request: Request,
-    response: Response,
-    auth: Auth,
-    settings: Annotated[Settings, Depends(get_settings_dep)],
-) -> UserOut:
-    _verify_csrf(request, settings)
-    user, sess, raw_token = await auth.verify_login_otp(
-        email=body.email,
-        code=body.code,
+        raise HTTPException(503, "Отправка писем не настроена на сервере (RESEND_API_KEY)")
+    target_email, code = await auth.request_email_change(
+        user_id=principal.user.id,
+        new_email=body.new_email,
+        current_password=body.current_password,
         ip_address=_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
     )
-    set_session_cookie(response, request, settings, raw_token)
-    return _user_out(user, request, sess.id)
+    await mailer.send_email_change_code(target_email, code)
+    return {"ok": True, "email": target_email}
+
+
+@auth_router.post("/email/change/confirm")
+async def confirm_email_change(
+    body: EmailChangeConfirmIn,
+    principal: LoggedUser,
+    request: Request,
+    auth: Auth,
+) -> UserOut:
+    assert principal.user is not None
+    user = await auth.confirm_email_change(principal.user.id, body.code)
+    return _user_out(user, request, principal.session.id if principal.session else None)
 
 
 @auth_router.post("/password/forgot")
@@ -687,49 +736,6 @@ async def reset_password(
     )
     set_session_cookie(response, request, settings, raw_token)
     return _user_out(user, request, sess.id)
-
-
-@auth_router.post("/email/verify/send")
-async def send_email_verification(
-    principal: LoggedUser,
-    request: Request,
-    auth: Auth,
-    mailer: Mailer,
-    settings: Annotated[Settings, Depends(get_settings_dep)],
-) -> dict[str, bool]:
-    assert principal.user is not None
-    if not mailer.enabled:
-        raise HTTPException(503, "Отправка писем не настроена на сервере (RESEND_API_KEY)")
-    user, verify_token, code = await auth.issue_email_verification(
-        principal.user.id,
-        ip_address=_client_ip(request),
-        enforce_cooldown=True,
-    )
-    frontend = _frontend_base(request, settings)
-    verify_url = f"{frontend}/verify-email?{urlencode({'token': verify_token})}"
-    await mailer.send_email_verification(user.email, verify_url, code)
-    return {"ok": True}
-
-
-@auth_router.post("/email/verify/confirm")
-async def confirm_email_verification(
-    body: EmailVerifyConfirmIn,
-    request: Request,
-    auth: Auth,
-    settings: Annotated[Settings, Depends(get_settings_dep)],
-) -> dict[str, Any]:
-    _verify_csrf(request, settings)
-    if body.token:
-        user = await auth.confirm_email_verification_token(body.token)
-        return {"ok": True, "email": user.email}
-    if body.code:
-        raw_cookie = request.cookies.get(settings.auth_cookie_name, "")
-        resolved = await auth.authenticate_session(raw_cookie) if raw_cookie else None
-        if resolved is None:
-            raise HTTPException(401, "Требуется авторизация")
-        user = await auth.confirm_email_verification_code(resolved[0].id, body.code)
-        return {"ok": True, "email": user.email}
-    raise HTTPException(422, "Укажите токен или код подтверждения")
 
 
 @auth_router.post("/password")
@@ -921,11 +927,13 @@ async def admin_list_users(_admin: AdminCaller, request: Request, auth: Auth) ->
     for item in rows:
         u: UserRecord = item["user"]
         avatar_url, _ = _resolve_avatar(u.avatar_url, request)
+        uname = display_username(u)
         out.append(
             AdminUserOut(
                 id=u.id,
+                username=uname,
                 email=u.email,
-                name=u.name,
+                name=uname,
                 avatar_url=avatar_url,
                 role="admin" if u.role == "admin" else "user",
                 is_active=u.is_active,
@@ -956,10 +964,12 @@ async def admin_patch_user(
     rows = await auth.list_users()
     active_sessions = next((r["active_sessions"] for r in rows if r["user"].id == user.id), 0)
     avatar_url, _ = _resolve_avatar(user.avatar_url, request)
+    uname = display_username(user)
     return AdminUserOut(
         id=user.id,
+        username=uname,
         email=user.email,
-        name=user.name,
+        name=uname,
         avatar_url=avatar_url,
         role="admin" if user.role == "admin" else "user",
         is_active=user.is_active,

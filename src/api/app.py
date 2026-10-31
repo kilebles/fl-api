@@ -31,6 +31,7 @@ from src.auth.service import (
     InvalidCredentialsError,
     RateLimitedError,
     SessionNotFoundError,
+    UsernameAlreadyExistsError,
     UserNotFoundError,
 )
 from src.avatars.service import AvatarNotFoundError, AvatarService
@@ -162,7 +163,8 @@ def create_app(
         return JSONResponse({"detail": str(exc)}, status_code=403)
 
     @app.exception_handler(EmailAlreadyExistsError)
-    async def _email_exists(request: Request, exc: EmailAlreadyExistsError) -> JSONResponse:
+    @app.exception_handler(UsernameAlreadyExistsError)
+    async def _conflict_exists(request: Request, exc: AuthError) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=409)
 
     @app.exception_handler(RateLimitedError)

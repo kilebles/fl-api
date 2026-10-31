@@ -1,4 +1,4 @@
-"""Authentication, password hashing (Argon2id), opaque sessions, and user accounts."""
+"""Authentication, password hashing (Argon2id), mandatory email verification, opaque sessions, and user accounts."""
 
 import base64
 import hashlib
@@ -16,13 +16,14 @@ from typing import Any
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from loguru import logger
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, delete, func, select, text, update
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db import Base, Database
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_USERNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$")
 _HASHER = PasswordHasher(time_cost=2, memory_cost=65536, parallelism=2)
 _DUMMY_HASH = _HASHER.hash("dummy-timing-guard-password")
 _LAST_SEEN_THROTTLE = timedelta(minutes=5)
@@ -38,6 +39,16 @@ class InvalidCredentialsError(AuthError):
 
 class EmailAlreadyExistsError(AuthError):
     pass
+
+
+class UsernameAlreadyExistsError(AuthError):
+    pass
+
+
+class EmailNotVerifiedError(AuthError):
+    def __init__(self, email: str, message: str = "Подтвердите почту кодом из письма") -> None:
+        super().__init__(message)
+        self.email = email
 
 
 class AccountDisabledError(AuthError):
@@ -60,6 +71,7 @@ class UserRecord(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(32), unique=True, index=True, default=None)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(120))
     avatar_url: Mapped[str | None] = mapped_column(String(500), default=None)
@@ -101,7 +113,7 @@ class SessionRecord(Base):
 
 @dataclass(slots=True)
 class Principal:
-    """Caller identity resolved from a session cookie or service API token."""
+    """Caller identity resolved from a session cookie, gateway header, or service API token."""
 
     user: UserRecord | None = None
     session: SessionRecord | None = None
@@ -122,6 +134,21 @@ def normalize_email(email: str) -> str:
     if not cleaned or len(cleaned) > 320 or not _EMAIL_RE.match(cleaned):
         raise AuthError("Некорректный адрес электронной почты")
     return cleaned
+
+
+def normalize_username(username: str) -> str:
+    """Validate and normalize an account username (`3..32` lowercase `[a-z0-9._-]`)."""
+    cleaned = username.strip().lstrip("@").lower()
+    if len(cleaned) < 3 or len(cleaned) > 32 or ".." in cleaned or not _USERNAME_RE.match(cleaned):
+        raise AuthError("Username должен содержать от 3 до 32 символов (a-z, 0-9, ., _, -)")
+    return cleaned
+
+
+def display_username(user: UserRecord) -> str:
+    if user.username:
+        return user.username
+    fallback = re.sub(r"[^a-z0-9._-]", "", (user.name or user.email.split("@", 1)[0]).lower()).strip("._-")
+    return fallback[:32] if len(fallback) >= 3 else f"user_{user.id[:6]}"
 
 
 def validate_password(password: str) -> str:
@@ -182,7 +209,7 @@ def build_pkce_pair() -> tuple[str, str]:
 
 
 def sign_oauth_state(payload: dict[str, Any], secret: str) -> str:
-    """Encode and HMAC-sign an OAuth state dictionary."""
+    """Encode and HMAC-sign an OAuth / gateway state dictionary."""
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     body = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
     sig = hmac.new(secret.encode("utf-8"), body.encode("ascii"), hashlib.sha256).hexdigest()
@@ -190,7 +217,7 @@ def sign_oauth_state(payload: dict[str, Any], secret: str) -> str:
 
 
 def verify_oauth_state(token: str, secret: str, max_age_seconds: int = 600) -> dict[str, Any] | None:
-    """Verify an HMAC-signed OAuth state token and enforce `iat` freshness."""
+    """Verify an HMAC-signed OAuth / gateway state token and enforce `iat` freshness."""
     if "." not in token:
         return None
     body, sig = token.rsplit(".", 1)
@@ -228,7 +255,7 @@ class LoginRateLimiter:
             while bucket and bucket[0] < cutoff:
                 bucket.popleft()
             if len(bucket) >= self._limit:
-                raise RateLimitedError("Слишком много попыток входа. Подождите несколько минут.")
+                raise RateLimitedError("Слишком много попыток. Подождите несколько минут.")
 
     def record_failure(self, *keys: str) -> None:
         now = time.monotonic()
@@ -247,7 +274,7 @@ class LoginRateLimiter:
 
 
 class AuthService:
-    """User accounts, Argon2id credentials, Google OAuth linking, and opaque sessions."""
+    """User accounts (`username` + verified `email` + Argon2id / Google OAuth) and opaque sessions."""
 
     def __init__(
         self,
@@ -267,71 +294,124 @@ class AuthService:
     async def register(
         self,
         email: str,
+        username: str,
         password: str,
-        name: str | None = None,
         ip_address: str | None = None,
-        user_agent: str | None = None,
-    ) -> tuple[UserRecord, SessionRecord, str]:
-        """Register a new user with email + password and issue an initial session."""
+    ) -> tuple[UserRecord, str, str]:
+        """Create (or refresh unverified) account and issue a mandatory email verification code + URL token."""
         norm_email = normalize_email(email)
+        norm_username = normalize_username(username)
         validate_password(password)
-        self.limiter.check(f"reg_ip:{ip_address or 'local'}")
-        clean_name = (name or "").strip()[:120] or norm_email.split("@", 1)[0]
+        ip_key = f"reg_ip:{ip_address or 'local'}"
+        self.limiter.check(ip_key)
         pw_hash = _HASHER.hash(password)
         now = datetime.now()
+        raw_token = secrets.token_urlsafe(32)
+        code = f"{secrets.randbelow(1_000_000):06d}"
 
         async with self._session() as session:
-            existing = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
-            if existing is not None:
-                self.limiter.record_failure(f"reg_ip:{ip_address or 'local'}")
+            await self._prune_expired_challenges(session, now)
+            # Reclaim abandoned unverified registrations older than 24h
+            await session.execute(
+                delete(UserRecord).where(
+                    UserRecord.email_verified_at.is_(None),
+                    UserRecord.google_sub.is_(None),
+                    UserRecord.created_at <= now - timedelta(hours=24),
+                )
+            )
+
+            existing_email = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
+            if existing_email is not None and existing_email.email_verified_at is not None:
+                self.limiter.record_failure(ip_key)
                 raise EmailAlreadyExistsError("Аккаунт с такой почтой уже зарегистрирован")
 
-            total_users = await session.scalar(select(func.count()).select_from(UserRecord)) or 0
-            is_first = total_users == 0
-            role = "admin" if (norm_email in self._admin_emails or (is_first and self._first_user_admin)) else "user"
+            existing_username = await session.scalar(select(UserRecord).where(UserRecord.username == norm_username))
+            if existing_username is not None and (existing_email is None or existing_username.id != existing_email.id):
+                if (
+                    existing_username.email_verified_at is None
+                    and existing_username.google_sub is None
+                    and existing_username.created_at <= now - timedelta(minutes=30)
+                ):
+                    await session.delete(existing_username)
+                    await session.flush()
+                else:
+                    self.limiter.record_failure(ip_key)
+                    raise UsernameAlreadyExistsError("Этот username уже занят")
 
-            user = UserRecord(
-                id=uuid.uuid4().hex[:16],
-                email=norm_email,
-                name=clean_name,
-                password_hash=pw_hash,
-                role=role,
-                is_active=True,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(user)
+            await self._enforce_cooldown(session, "verify_email", norm_email, now)
+
+            if existing_email is not None:
+                user = existing_email
+                user.username = norm_username
+                user.name = norm_username
+                user.password_hash = pw_hash
+                user.updated_at = now
+            else:
+                user = UserRecord(
+                    id=uuid.uuid4().hex[:16],
+                    username=norm_username,
+                    email=norm_email,
+                    name=norm_username,
+                    password_hash=pw_hash,
+                    role="admin" if norm_email in self._admin_emails else "user",
+                    is_active=True,
+                    email_verified_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(user)
+
             try:
                 await session.flush()
             except IntegrityError:
                 await session.rollback()
-                raise EmailAlreadyExistsError("Аккаунт с такой почтой уже зарегистрирован") from None
+                raise UsernameAlreadyExistsError("Этот username или почта уже используются") from None
 
-            if is_first and role == "admin":
-                await self._claim_unowned_records(session, user.id)
-
-            sess, raw_token = self._build_session(user.id, ip_address, user_agent, now)
-            session.add(sess)
+            await session.execute(
+                delete(EmailChallengeRecord).where(
+                    EmailChallengeRecord.purpose == "verify_email",
+                    EmailChallengeRecord.user_id == user.id,
+                )
+            )
+            session.add(
+                EmailChallengeRecord(
+                    id=uuid.uuid4().hex[:16],
+                    purpose="verify_email",
+                    email=norm_email,
+                    user_id=user.id,
+                    secret_hash=hash_token(f"verify_email:{norm_email}:{code}"),
+                    aux_hash=hash_token(raw_token),
+                    attempts=0,
+                    created_at=now,
+                    expires_at=now + timedelta(hours=24),
+                )
+            )
             await session.commit()
 
-        logger.info(f"[auth] registered user {user.id} ({user.email}, role={user.role})")
-        return user, sess, raw_token
+        logger.info(f"[auth] pending registration {user.id} (@{user.username}, {user.email}) awaiting email verification")
+        return user, raw_token, code
 
     async def login(
         self,
-        email: str,
+        identifier: str,
         password: str,
         ip_address: str | None = None,
         user_agent: str | None = None,
     ) -> tuple[UserRecord, SessionRecord, str]:
-        """Authenticate with email + password in constant time and issue a session."""
-        norm_email = email.strip().lower()
+        """Authenticate with `username` or `email` + `password`; blocks unverified emails."""
+        raw_ident = identifier.strip().lower()
         ip_key = f"login_ip:{ip_address or 'local'}"
-        acct_key = f"login_acct:{norm_email}"
+        acct_key = f"login_acct:{raw_ident}"
         self.limiter.check(ip_key, acct_key)
 
         async with self._session() as session:
-            user = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
+            if "@" in raw_ident and not raw_ident.startswith("@"):
+                stmt = select(UserRecord).where(UserRecord.email == raw_ident)
+            else:
+                clean_u = raw_ident.lstrip("@")
+                stmt = select(UserRecord).where((UserRecord.username == clean_u) | (UserRecord.email == clean_u))
+
+            user = await session.scalar(stmt)
             target_hash = user.password_hash if (user and user.password_hash) else _DUMMY_HASH
             valid = False
             try:
@@ -341,16 +421,23 @@ class AuthService:
 
             if user is None or not user.password_hash or not valid:
                 self.limiter.record_failure(ip_key, acct_key)
-                raise InvalidCredentialsError("Неверная почта или пароль")
+                raise InvalidCredentialsError("Неверный логин, почта или пароль")
 
             if not user.is_active:
                 raise AccountDisabledError("Аккаунт заблокирован администратором")
+
+            if user.email_verified_at is None:
+                raise EmailNotVerifiedError(user.email)
 
             now = datetime.now()
             if _HASHER.check_needs_rehash(user.password_hash):
                 user.password_hash = _HASHER.hash(password)
                 user.updated_at = now
-            if norm_email in self._admin_emails and user.role != "admin":
+            if user.username is None:
+                user.username = await self._generate_unique_username(session, user.name or user.email.split("@", 1)[0])
+                user.name = user.username
+                user.updated_at = now
+            if user.email in self._admin_emails and user.role != "admin":
                 user.role = "admin"
 
             sess, raw_token = self._build_session(user.id, ip_address, user_agent, now)
@@ -359,6 +446,142 @@ class AuthService:
 
         self.limiter.clear(acct_key)
         return user, sess, raw_token
+
+    async def issue_unverified_email_challenge(
+        self,
+        email: str,
+        ip_address: str | None = None,
+        enforce_cooldown: bool = True,
+    ) -> tuple[UserRecord, str, str] | None:
+        """Issue (or refresh) a 24h email verification code + URL token for an unverified account."""
+        norm_email = normalize_email(email)
+        self.limiter.check(f"verify_send_ip:{ip_address or 'local'}")
+        now = datetime.now()
+        raw_token = secrets.token_urlsafe(32)
+        code = f"{secrets.randbelow(1_000_000):06d}"
+
+        async with self._session() as session:
+            await self._prune_expired_challenges(session, now)
+            user = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
+            if user is None or not user.is_active or user.email_verified_at is not None:
+                self.limiter.record_failure(f"verify_send_ip:{ip_address or 'local'}")
+                return None
+
+            if self._email_cooldown.total_seconds() > 0:
+                recent = await session.scalar(
+                    select(EmailChallengeRecord).where(
+                        EmailChallengeRecord.purpose == "verify_email",
+                        EmailChallengeRecord.email == norm_email,
+                        EmailChallengeRecord.created_at > now - self._email_cooldown,
+                    )
+                )
+                if recent is not None:
+                    if enforce_cooldown:
+                        raise RateLimitedError("Код уже отправлен — подождите минуту перед повторной отправкой")
+                    return None
+
+            await session.execute(
+                delete(EmailChallengeRecord).where(
+                    EmailChallengeRecord.purpose == "verify_email",
+                    EmailChallengeRecord.user_id == user.id,
+                )
+            )
+            session.add(
+                EmailChallengeRecord(
+                    id=uuid.uuid4().hex[:16],
+                    purpose="verify_email",
+                    email=norm_email,
+                    user_id=user.id,
+                    secret_hash=hash_token(f"verify_email:{norm_email}:{code}"),
+                    aux_hash=hash_token(raw_token),
+                    attempts=0,
+                    created_at=now,
+                    expires_at=now + timedelta(hours=24),
+                )
+            )
+            await session.commit()
+            return user, raw_token, code
+
+    async def confirm_email_verification(
+        self,
+        token: str | None = None,
+        email: str | None = None,
+        code: str | None = None,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> tuple[UserRecord, SessionRecord, str]:
+        """Confirm email via 6-digit code (`email` + `code`) or 1-click URL `token`, and issue a session."""
+        ip_key = f"verify_confirm_ip:{ip_address or 'local'}"
+        self.limiter.check(ip_key)
+        now = datetime.now()
+
+        async with self._session() as session:
+            if token:
+                cleaned_tok = token.strip()
+                if not cleaned_tok or len(cleaned_tok) > 256:
+                    raise InvalidCredentialsError("Ссылка подтверждения недействительна или истекла")
+                challenge = await session.scalar(
+                    select(EmailChallengeRecord).where(
+                        EmailChallengeRecord.purpose == "verify_email",
+                        EmailChallengeRecord.aux_hash == hash_token(cleaned_tok),
+                        EmailChallengeRecord.expires_at > now,
+                    )
+                )
+                if challenge is None or not challenge.user_id:
+                    self.limiter.record_failure(ip_key)
+                    raise InvalidCredentialsError("Ссылка подтверждения недействительна или истекла")
+            elif email and code:
+                norm_email = normalize_email(email)
+                clean_code = re.sub(r"\s+", "", code.strip())
+                challenge = await session.scalar(
+                    select(EmailChallengeRecord).where(
+                        EmailChallengeRecord.purpose == "verify_email",
+                        EmailChallengeRecord.email == norm_email,
+                        EmailChallengeRecord.expires_at > now,
+                    )
+                )
+                if challenge is None or not challenge.user_id:
+                    self.limiter.record_failure(ip_key)
+                    raise InvalidCredentialsError("Код недействителен или истёк — запросите новый")
+                expected = hash_token(f"verify_email:{norm_email}:{clean_code}")
+                if not secrets.compare_digest(challenge.secret_hash, expected):
+                    challenge.attempts += 1
+                    exhausted = challenge.attempts >= 5
+                    if exhausted:
+                        await session.delete(challenge)
+                    await session.commit()
+                    self.limiter.record_failure(ip_key)
+                    if exhausted:
+                        raise InvalidCredentialsError("Превышено число попыток — запросите новый код")
+                    raise InvalidCredentialsError("Неверный код подтверждения")
+            else:
+                raise AuthError("Укажите код подтверждения или токен ссылки")
+
+            user = await session.get(UserRecord, challenge.user_id)
+            if user is None or user.email != challenge.email:
+                await session.delete(challenge)
+                await session.commit()
+                raise InvalidCredentialsError("Запрос подтверждения устарел — войдите снова")
+            if not user.is_active:
+                await session.delete(challenge)
+                await session.commit()
+                raise AccountDisabledError("Аккаунт заблокирован администратором")
+
+            if user.username is None:
+                user.username = await self._generate_unique_username(session, user.name or user.email.split("@", 1)[0])
+                user.name = user.username
+
+            user.email_verified_at = now
+            user.updated_at = now
+            await self._finalize_verified_role_and_claims(session, user)
+            await session.delete(challenge)
+
+            sess, raw_session = self._build_session(user.id, ip_address, user_agent, now)
+            session.add(sess)
+            await session.commit()
+
+        logger.info(f"[auth] verified email for user {user.id} (@{user.username}, role={user.role})")
+        return user, sess, raw_session
 
     async def login_or_register_google(
         self,
@@ -385,23 +608,25 @@ class AuthService:
                     if user.google_sub and user.google_sub != google_sub:
                         raise AuthError("К этой почте уже привязан другой аккаунт Google")
                     user.google_sub = google_sub
+                    if user.username is None:
+                        user.username = await self._generate_unique_username(session, norm_email.split("@", 1)[0])
+                        user.name = user.username
                     if user.email_verified_at is None:
                         user.email_verified_at = now
+                        await self._finalize_verified_role_and_claims(session, user)
                     if not user.avatar_url and clean_picture:
                         user.avatar_url = clean_picture
                     user.updated_at = now
                 else:
-                    total_users = await session.scalar(select(func.count()).select_from(UserRecord)) or 0
-                    is_first = total_users == 0
-                    role = "admin" if (norm_email in self._admin_emails or (is_first and self._first_user_admin)) else "user"
-                    clean_name = (name or "").strip()[:120] or norm_email.split("@", 1)[0]
+                    uname = await self._generate_unique_username(session, norm_email.split("@", 1)[0])
                     user = UserRecord(
                         id=uuid.uuid4().hex[:16],
+                        username=uname,
                         email=norm_email,
-                        name=clean_name,
+                        name=uname,
                         avatar_url=clean_picture,
                         google_sub=google_sub,
-                        role=role,
+                        role="admin" if norm_email in self._admin_emails else "user",
                         is_active=True,
                         email_verified_at=now,
                         created_at=now,
@@ -409,12 +634,16 @@ class AuthService:
                     )
                     session.add(user)
                     await session.flush()
-                    if is_first and role == "admin":
-                        await self._claim_unowned_records(session, user.id)
-                    logger.info(f"[auth] registered Google user {user.id} ({user.email}, role={user.role})")
+                    await self._finalize_verified_role_and_claims(session, user)
+                    logger.info(f"[auth] registered Google user {user.id} (@{user.username}, {user.email}, role={user.role})")
             else:
+                if user.username is None:
+                    user.username = await self._generate_unique_username(session, norm_email.split("@", 1)[0])
+                    user.name = user.username
+                    user.updated_at = now
                 if user.email_verified_at is None and user.email == norm_email:
                     user.email_verified_at = now
+                    await self._finalize_verified_role_and_claims(session, user)
                     user.updated_at = now
                 if not user.avatar_url and clean_picture:
                     user.avatar_url = clean_picture
@@ -450,7 +679,6 @@ class AuthService:
             await session.commit()
             return user
 
-
     async def unlink_google(self, user_id: str) -> UserRecord:
         """Unlink Google OAuth if the user still has a password set."""
         async with self._session() as session:
@@ -463,7 +691,6 @@ class AuthService:
             user.updated_at = datetime.now()
             await session.commit()
             return user
-
 
     async def authenticate_session(self, raw_token: str) -> tuple[UserRecord, SessionRecord, bool] | None:
         """Validate a raw session token; returns `(user, session, renewed)` or `None`."""
@@ -482,13 +709,17 @@ class AuthService:
                 await session.commit()
                 return None
             user = await session.get(UserRecord, sess.user_id)
-            if user is None or not user.is_active:
+            if user is None or not user.is_active or user.email_verified_at is None:
                 await session.delete(sess)
                 await session.commit()
                 return None
 
             remaining = sess.expires_at - now
             dirty = False
+            if user.username is None:
+                user.username = await self._generate_unique_username(session, user.name or user.email.split("@", 1)[0])
+                user.name = user.username
+                dirty = True
             if remaining < self._lifetime / 2:
                 sess.expires_at = now + self._lifetime
                 sess.last_seen_at = now
@@ -522,13 +753,11 @@ class AuthService:
         self,
         user_id: str,
         email: str,
-        name: str = "",
+        username: str = "",
         role: str = "user",
-        email_verified: bool = False,
     ) -> UserRecord:
         """Upsert a shadow user authenticated by the upstream auth gateway (`X-Fl-Gateway-Auth`)."""
         norm_email = normalize_email(email)
-        clean_name = (name or "").strip()[:120] or norm_email.split("@", 1)[0]
         clean_role = "admin" if (role == "admin" or norm_email in self._admin_emails) else "user"
 
         async with self._session() as session:
@@ -537,16 +766,20 @@ class AuthService:
                 user = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
 
             if user is None:
-                total_users = await session.scalar(select(func.count()).select_from(UserRecord)) or 0
+                total_users = await session.scalar(
+                    select(func.count()).select_from(UserRecord).where(UserRecord.email_verified_at.is_not(None))
+                ) or 0
                 is_first = total_users == 0
                 now = datetime.now()
+                uname = await self._generate_unique_username(session, username or norm_email.split("@", 1)[0])
                 user = UserRecord(
                     id=user_id,
+                    username=uname,
                     email=norm_email,
-                    name=clean_name,
+                    name=uname,
                     role=clean_role,
                     is_active=True,
-                    email_verified_at=now if email_verified else None,
+                    email_verified_at=now,
                     created_at=now,
                     updated_at=now,
                 )
@@ -555,7 +788,7 @@ class AuthService:
                 if is_first and clean_role == "admin":
                     await self._claim_unowned_records(session, user.id)
                 await session.commit()
-                logger.info(f"[auth] provisioned gateway shadow user {user.id} ({user.email}, role={user.role})")
+                logger.info(f"[auth] provisioned gateway shadow user {user.id} (@{user.username}, role={user.role})")
                 return user
 
             if not user.is_active:
@@ -567,13 +800,22 @@ class AuthService:
                 if taken is None:
                     user.email = norm_email
                     dirty = True
-            if clean_name and user.name != clean_name:
-                user.name = clean_name
+            if username:
+                cand = username.strip().lstrip("@").lower()[:32]
+                if cand and user.username != cand:
+                    taken_u = await session.scalar(select(UserRecord).where(UserRecord.username == cand))
+                    if taken_u is None:
+                        user.username = cand
+                        user.name = cand
+                        dirty = True
+            elif user.username is None:
+                user.username = await self._generate_unique_username(session, norm_email.split("@", 1)[0])
+                user.name = user.username
                 dirty = True
             if user.role != clean_role:
                 user.role = clean_role
                 dirty = True
-            if email_verified and user.email_verified_at is None:
+            if user.email_verified_at is None:
                 user.email_verified_at = datetime.now()
                 dirty = True
             if dirty:
@@ -584,40 +826,25 @@ class AuthService:
     async def update_profile(
         self,
         user_id: str,
-        name: str | None = None,
-        email: str | None = None,
-        current_password: str | None = None,
+        username: str | None = None,
         avatar_url: str | None = None,
         clear_avatar: bool = False,
     ) -> UserRecord:
-        """Update display name, avatar, or email (email change verifies current password if set)."""
+        """Update `username` or avatar (`email` changes go through `request_email_change` + `confirm_email_change`)."""
         now = datetime.now()
         async with self._session() as session:
             user = await session.get(UserRecord, user_id)
             if user is None:
                 raise UserNotFoundError(user_id)
 
-            if name is not None:
-                clean_name = name.strip()[:120]
-                if not clean_name:
-                    raise AuthError("Имя не может быть пустым")
-                user.name = clean_name
-
-            if email is not None:
-                norm_email = normalize_email(email)
-                if norm_email != user.email:
-                    if user.password_hash:
-                        if not current_password:
-                            raise InvalidCredentialsError("Для смены почты введите текущий пароль")
-                        try:
-                            _HASHER.verify(user.password_hash, current_password)
-                        except (VerifyMismatchError, VerificationError, InvalidHashError):
-                            raise InvalidCredentialsError("Неверный текущий пароль") from None
-                    taken = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
+            if username is not None:
+                norm_username = normalize_username(username)
+                if norm_username != user.username:
+                    taken = await session.scalar(select(UserRecord).where(UserRecord.username == norm_username))
                     if taken is not None and taken.id != user_id:
-                        raise EmailAlreadyExistsError("Эта почта уже используется другим аккаунтом")
-                    user.email = norm_email
-                    user.email_verified_at = None
+                        raise UsernameAlreadyExistsError("Этот username уже занят")
+                    user.username = norm_username
+                    user.name = norm_username
 
             if clear_avatar:
                 user.avatar_url = None
@@ -625,6 +852,110 @@ class AuthService:
                 user.avatar_url = avatar_url.strip()[:500] or None
 
             user.updated_at = now
+            await session.commit()
+            return user
+
+    async def request_email_change(
+        self,
+        user_id: str,
+        new_email: str,
+        current_password: str | None = None,
+        ip_address: str | None = None,
+    ) -> tuple[str, str]:
+        """Send a 6-digit confirmation code to `new_email` before updating `user.email`."""
+        norm_email = normalize_email(new_email)
+        self.limiter.check(f"email_chg_ip:{ip_address or 'local'}")
+        now = datetime.now()
+        code = f"{secrets.randbelow(1_000_000):06d}"
+
+        async with self._session() as session:
+            await self._prune_expired_challenges(session, now)
+            user = await session.get(UserRecord, user_id)
+            if user is None:
+                raise UserNotFoundError(user_id)
+            if norm_email == user.email:
+                raise AuthError("Этот адрес уже привязан к вашему аккаунту")
+
+            if user.password_hash:
+                if not current_password:
+                    raise InvalidCredentialsError("Для смены почты введите текущий пароль")
+                try:
+                    _HASHER.verify(user.password_hash, current_password)
+                except (VerifyMismatchError, VerificationError, InvalidHashError):
+                    raise InvalidCredentialsError("Неверный текущий пароль") from None
+
+            taken = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
+            if taken is not None and taken.id != user_id and taken.email_verified_at is not None:
+                raise EmailAlreadyExistsError("Эта почта уже используется другим аккаунтом")
+
+            await self._enforce_cooldown(session, "change_email", norm_email, now)
+            await session.execute(
+                delete(EmailChallengeRecord).where(
+                    EmailChallengeRecord.purpose == "change_email",
+                    EmailChallengeRecord.user_id == user_id,
+                )
+            )
+            session.add(
+                EmailChallengeRecord(
+                    id=uuid.uuid4().hex[:16],
+                    purpose="change_email",
+                    email=norm_email,
+                    user_id=user_id,
+                    secret_hash=hash_token(f"change_email:{user_id}:{norm_email}:{code}"),
+                    attempts=0,
+                    created_at=now,
+                    expires_at=now + timedelta(minutes=15),
+                )
+            )
+            await session.commit()
+
+        return norm_email, code
+
+    async def confirm_email_change(self, user_id: str, code: str) -> UserRecord:
+        """Verify the 6-digit code sent to the new address and atomically switch `user.email`."""
+        clean_code = re.sub(r"\s+", "", code.strip())
+        now = datetime.now()
+
+        async with self._session() as session:
+            user = await session.get(UserRecord, user_id)
+            if user is None:
+                raise UserNotFoundError(user_id)
+
+            challenge = await session.scalar(
+                select(EmailChallengeRecord).where(
+                    EmailChallengeRecord.purpose == "change_email",
+                    EmailChallengeRecord.user_id == user_id,
+                    EmailChallengeRecord.expires_at > now,
+                )
+            )
+            if challenge is None:
+                raise InvalidCredentialsError("Код недействителен или истёк — запросите смену почты повторно")
+
+            expected = hash_token(f"change_email:{user_id}:{challenge.email}:{clean_code}")
+            if not secrets.compare_digest(challenge.secret_hash, expected):
+                challenge.attempts += 1
+                exhausted = challenge.attempts >= 5
+                if exhausted:
+                    await session.delete(challenge)
+                await session.commit()
+                if exhausted:
+                    raise InvalidCredentialsError("Превышено число попыток — запросите новый код")
+                raise InvalidCredentialsError("Неверный код подтверждения")
+
+            taken = await session.scalar(select(UserRecord).where(UserRecord.email == challenge.email))
+            if taken is not None and taken.id != user_id:
+                if taken.email_verified_at is None and taken.google_sub is None:
+                    await session.delete(taken)
+                    await session.flush()
+                else:
+                    await session.delete(challenge)
+                    await session.commit()
+                    raise EmailAlreadyExistsError("Эта почта уже занята другим аккаунтом")
+
+            user.email = challenge.email
+            user.email_verified_at = now
+            user.updated_at = now
+            await session.delete(challenge)
             await session.commit()
             return user
 
@@ -746,120 +1077,6 @@ class AuthService:
             await session.commit()
             return user
 
-    async def issue_login_otp(self, email: str, ip_address: str | None = None) -> tuple[str, str]:
-        """Generate a 6-digit one-time login code (10 min TTL) for `email`."""
-        norm_email = normalize_email(email)
-        self.limiter.check(f"otp_send_ip:{ip_address or 'local'}", f"otp_send_email:{norm_email}")
-        now = datetime.now()
-        code = f"{secrets.randbelow(1_000_000):06d}"
-
-        async with self._session() as session:
-            await self._prune_expired_challenges(session, now)
-            user = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
-            if user is not None and not user.is_active:
-                raise AccountDisabledError("Аккаунт заблокирован администратором")
-
-            await self._enforce_cooldown(session, "email_otp", norm_email, now)
-            await session.execute(
-                delete(EmailChallengeRecord).where(
-                    EmailChallengeRecord.purpose == "email_otp",
-                    EmailChallengeRecord.email == norm_email,
-                )
-            )
-            session.add(
-                EmailChallengeRecord(
-                    id=uuid.uuid4().hex[:16],
-                    purpose="email_otp",
-                    email=norm_email,
-                    user_id=user.id if user else None,
-                    secret_hash=hash_token(f"email_otp:{norm_email}:{code}"),
-                    attempts=0,
-                    created_at=now,
-                    expires_at=now + timedelta(minutes=10),
-                )
-            )
-            await session.commit()
-
-        self.limiter.record_failure(f"otp_send_ip:{ip_address or 'local'}")
-        return norm_email, code
-
-    async def verify_login_otp(
-        self,
-        email: str,
-        code: str,
-        ip_address: str | None = None,
-        user_agent: str | None = None,
-    ) -> tuple[UserRecord, SessionRecord, str]:
-        """Verify a 6-digit login code and sign in (or auto-register) the user."""
-        norm_email = normalize_email(email)
-        clean_code = re.sub(r"\s+", "", code.strip())
-        ip_key = f"otp_verify_ip:{ip_address or 'local'}"
-        acct_key = f"otp_verify_email:{norm_email}"
-        self.limiter.check(ip_key, acct_key)
-        now = datetime.now()
-        expected_hash = hash_token(f"email_otp:{norm_email}:{clean_code}")
-
-        async with self._session() as session:
-            challenge = await session.scalar(
-                select(EmailChallengeRecord).where(
-                    EmailChallengeRecord.purpose == "email_otp",
-                    EmailChallengeRecord.email == norm_email,
-                    EmailChallengeRecord.expires_at > now,
-                )
-            )
-            if challenge is None:
-                self.limiter.record_failure(ip_key, acct_key)
-                raise InvalidCredentialsError("Код недействителен или истёк — запросите новый")
-
-            if not secrets.compare_digest(challenge.secret_hash, expected_hash):
-                challenge.attempts += 1
-                exhausted = challenge.attempts >= 5
-                if exhausted:
-                    await session.delete(challenge)
-                await session.commit()
-                self.limiter.record_failure(ip_key, acct_key)
-                if exhausted:
-                    raise InvalidCredentialsError("Превышено число попыток — запросите новый код")
-                raise InvalidCredentialsError("Неверный код из письма")
-
-            await session.delete(challenge)
-            user = await session.scalar(select(UserRecord).where(UserRecord.email == norm_email))
-            if user is None:
-                total_users = await session.scalar(select(func.count()).select_from(UserRecord)) or 0
-                is_first = total_users == 0
-                role = "admin" if (norm_email in self._admin_emails or (is_first and self._first_user_admin)) else "user"
-                user = UserRecord(
-                    id=uuid.uuid4().hex[:16],
-                    email=norm_email,
-                    name=norm_email.split("@", 1)[0][:120],
-                    role=role,
-                    is_active=True,
-                    email_verified_at=now,
-                    created_at=now,
-                    updated_at=now,
-                )
-                session.add(user)
-                await session.flush()
-                if is_first and role == "admin":
-                    await self._claim_unowned_records(session, user.id)
-                logger.info(f"[auth] registered OTP user {user.id} ({user.email}, role={user.role})")
-            else:
-                if not user.is_active:
-                    await session.commit()
-                    raise AccountDisabledError("Аккаунт заблокирован администратором")
-                if user.email_verified_at is None:
-                    user.email_verified_at = now
-                    user.updated_at = now
-                if norm_email in self._admin_emails and user.role != "admin":
-                    user.role = "admin"
-
-            sess, raw_token = self._build_session(user.id, ip_address, user_agent, now)
-            session.add(sess)
-            await session.commit()
-
-        self.limiter.clear(acct_key)
-        return user, sess, raw_token
-
     async def issue_password_reset(self, email: str, ip_address: str | None = None) -> tuple[UserRecord, str] | None:
         """Issue a single-use password reset token (30 min TTL) if an active user exists."""
         norm_email = normalize_email(email)
@@ -915,7 +1132,7 @@ class AuthService:
         ip_address: str | None = None,
         user_agent: str | None = None,
     ) -> tuple[UserRecord, SessionRecord, str]:
-        """Consume a password-reset token, set new Argon2id password, revoke old sessions, and sign in."""
+        """Consume a password-reset token, set new Argon2id password, verify email, revoke old sessions, and sign in."""
         validate_password(new_password)
         cleaned = raw_token.strip()
         if not cleaned or len(cleaned) > 256:
@@ -942,15 +1159,19 @@ class AuthService:
 
             await session.execute(
                 delete(EmailChallengeRecord).where(
-                    EmailChallengeRecord.purpose == "password_reset",
+                    EmailChallengeRecord.purpose.in_(("password_reset", "verify_email")),
                     EmailChallengeRecord.user_id == user.id,
                 )
             )
             await session.execute(delete(SessionRecord).where(SessionRecord.user_id == user.id))
 
+            if user.username is None:
+                user.username = await self._generate_unique_username(session, user.name or user.email.split("@", 1)[0])
+                user.name = user.username
             user.password_hash = _HASHER.hash(new_password)
             if user.email == challenge.email and user.email_verified_at is None:
                 user.email_verified_at = now
+                await self._finalize_verified_role_and_claims(session, user)
             user.updated_at = now
 
             sess, session_token = self._build_session(user.id, ip_address, user_agent, now)
@@ -959,121 +1180,35 @@ class AuthService:
 
         return user, sess, session_token
 
-    async def issue_email_verification(
-        self,
-        user_id: str,
-        ip_address: str | None = None,
-        enforce_cooldown: bool = True,
-    ) -> tuple[UserRecord, str, str]:
-        """Create a 24h email verification challenge with both a URL token and a 6-digit code."""
-        self.limiter.check(f"verify_send_ip:{ip_address or 'local'}")
-        now = datetime.now()
-        raw_token = secrets.token_urlsafe(32)
-        code = f"{secrets.randbelow(1_000_000):06d}"
-
-        async with self._session() as session:
-            await self._prune_expired_challenges(session, now)
-            user = await session.get(UserRecord, user_id)
-            if user is None:
-                raise UserNotFoundError(user_id)
-            if user.email_verified_at is not None:
-                raise AuthError("Почта уже подтверждена")
-
-            if enforce_cooldown:
-                await self._enforce_cooldown(session, "verify_email", user.email, now)
-
-            await session.execute(
-                delete(EmailChallengeRecord).where(
-                    EmailChallengeRecord.purpose == "verify_email",
-                    EmailChallengeRecord.user_id == user.id,
-                )
+    async def _finalize_verified_role_and_claims(self, session: Any, user: UserRecord) -> None:
+        verified_others = (
+            await session.scalar(
+                select(func.count())
+                .select_from(UserRecord)
+                .where(UserRecord.email_verified_at.is_not(None), UserRecord.id != user.id)
             )
-            session.add(
-                EmailChallengeRecord(
-                    id=uuid.uuid4().hex[:16],
-                    purpose="verify_email",
-                    email=user.email,
-                    user_id=user.id,
-                    secret_hash=hash_token(f"verify_email:{user.email}:{code}"),
-                    aux_hash=hash_token(raw_token),
-                    attempts=0,
-                    created_at=now,
-                    expires_at=now + timedelta(hours=24),
-                )
-            )
-            await session.commit()
-            return user, raw_token, code
+            or 0
+        )
+        is_first_verified = verified_others == 0
+        if user.email in self._admin_emails or (is_first_verified and self._first_user_admin):
+            user.role = "admin"
+        if is_first_verified and user.role == "admin":
+            await self._claim_unowned_records(session, user.id)
 
-    async def confirm_email_verification_token(self, raw_token: str) -> UserRecord:
-        """Confirm email ownership via the 1-click URL token."""
-        cleaned = raw_token.strip()
-        if not cleaned or len(cleaned) > 256:
-            raise InvalidCredentialsError("Ссылка подтверждения недействительна или истекла")
-        digest = hash_token(cleaned)
-        now = datetime.now()
+    async def _generate_unique_username(self, session: Any, seed: str) -> str:
+        raw = re.sub(r"[^a-z0-9._-]", "", seed.lower()).strip("._-")
+        raw = re.sub(r"\.{2,}", ".", raw)
+        base = raw[:24] if len(raw) >= 3 else "user"
+        base = base.strip("._-")
+        if len(base) < 3:
+            base = "user"
 
-        async with self._session() as session:
-            challenge = await session.scalar(
-                select(EmailChallengeRecord).where(
-                    EmailChallengeRecord.purpose == "verify_email",
-                    EmailChallengeRecord.aux_hash == digest,
-                    EmailChallengeRecord.expires_at > now,
-                )
-            )
-            if challenge is None or not challenge.user_id:
-                raise InvalidCredentialsError("Ссылка подтверждения недействительна или истекла")
-
-            user = await session.get(UserRecord, challenge.user_id)
-            if user is None or user.email != challenge.email:
-                await session.delete(challenge)
-                await session.commit()
-                raise InvalidCredentialsError("Ссылка устарела — запросите новое письмо в настройках аккаунта")
-
-            user.email_verified_at = now
-            user.updated_at = now
-            await session.delete(challenge)
-            await session.commit()
-            return user
-
-    async def confirm_email_verification_code(self, user_id: str, code: str) -> UserRecord:
-        """Confirm email ownership via the 6-digit code in Account Settings."""
-        clean_code = re.sub(r"\s+", "", code.strip())
-        now = datetime.now()
-
-        async with self._session() as session:
-            user = await session.get(UserRecord, user_id)
-            if user is None:
-                raise UserNotFoundError(user_id)
-            if user.email_verified_at is not None:
-                return user
-
-            challenge = await session.scalar(
-                select(EmailChallengeRecord).where(
-                    EmailChallengeRecord.purpose == "verify_email",
-                    EmailChallengeRecord.user_id == user_id,
-                    EmailChallengeRecord.email == user.email,
-                    EmailChallengeRecord.expires_at > now,
-                )
-            )
-            if challenge is None:
-                raise InvalidCredentialsError("Код недействителен или истёк — отправьте письмо повторно")
-
-            expected = hash_token(f"verify_email:{user.email}:{clean_code}")
-            if not secrets.compare_digest(challenge.secret_hash, expected):
-                challenge.attempts += 1
-                exhausted = challenge.attempts >= 5
-                if exhausted:
-                    await session.delete(challenge)
-                await session.commit()
-                if exhausted:
-                    raise InvalidCredentialsError("Превышено число попыток — запросите новый код")
-                raise InvalidCredentialsError("Неверный код подтверждения")
-
-            user.email_verified_at = now
-            user.updated_at = now
-            await session.delete(challenge)
-            await session.commit()
-            return user
+        for attempt in range(25):
+            candidate = base if attempt == 0 else (f"{base}_{attempt + 1}" if attempt < 15 else f"{base}_{secrets.token_hex(2)}")
+            taken = await session.scalar(select(UserRecord).where(UserRecord.username == candidate))
+            if taken is None:
+                return candidate
+        return f"user_{secrets.token_hex(4)}"
 
     async def _enforce_cooldown(self, session: Any, purpose: str, email: str, now: datetime) -> None:
         if self._email_cooldown.total_seconds() <= 0:
