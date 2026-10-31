@@ -14,6 +14,8 @@ Generation core for Google Flow (Veo video + image models): Dolphin Anty account
 src/
 ├── core/        settings.py, errors.py, logger.py (loguru + flow-stat sink), db.py (Database: one async engine, Base,
 │                additive migration — new model columns are added to existing tables on start)
+├── auth/        service.py (AuthService: Argon2id passwords, Google OAuth 2.0 + PKCE, SHA-256 hashed opaque sessions,
+│                user/admin roles; first user becomes admin and claims legacy unowned records)
 ├── projects/    service.py (ProjectService: projects = «Ролики», title + style line; jobs/prompt runs/infographic runs carry project_id)
 ├── avatars/     service.py (AvatarService: name, appearance text, reference image keys; i2i2v uses the first key)
 ├── accounts/    AccountInfo, ProxyInfo, AccountRepository (accounts/account_N/*.txt)

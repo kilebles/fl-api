@@ -36,6 +36,7 @@ class JobRecord(Base):
     __tablename__ = "jobs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(32), index=True, default=None)
     title: Mapped[str | None] = mapped_column(String(200))
     project_id: Mapped[str | None] = mapped_column(String(32), index=True)
     mode: Mapped[str] = mapped_column(String(16))
@@ -81,9 +82,10 @@ class JobRepository:
     def __init__(self, db: Database) -> None:
         self._session = db.session
 
-    async def create(self, job_id: str, request: JobRequest) -> JobRecord:
+    async def create(self, job_id: str, request: JobRequest, user_id: str | None = None) -> JobRecord:
         record = JobRecord(
             id=job_id,
+            user_id=user_id,
             title=request.title,
             project_id=request.project_id,
             mode=request.mode.value,
@@ -106,8 +108,10 @@ class JobRepository:
         async with self._session() as session:
             return await session.get(JobRecord, job_id)
 
-    async def recent(self, limit: int = 100, project_id: str | None = None) -> list[JobRecord]:
+    async def recent(self, limit: int = 100, project_id: str | None = None, user_id: str | None = None) -> list[JobRecord]:
         query = select(JobRecord).order_by(JobRecord.created_at.desc()).limit(limit)
+        if user_id is not None:
+            query = query.where(JobRecord.user_id == user_id)
         if project_id is not None:
             query = query.where(JobRecord.project_id == project_id)
         async with self._session() as session:

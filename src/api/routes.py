@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
+from src.api.auth import AdminCaller, Caller
 from src.api.schemas import Account, JobDetail, JobFile, ModeInfo, Rows, Upload
 from src.dolphin import cooldowns
 from src.jobs.excel import load_rows
@@ -56,15 +57,27 @@ async def modes() -> list[ModeInfo]:
     ]
 
 
+def check_upload_key_owner(key: str, caller: Caller) -> None:
+    if not key.startswith("inputs/") or ".." in key:
+        raise HTTPException(422, f"uploaded file not found: {key}")
+    parts = key.split("/")
+    if caller.user_id is not None:
+        if len(parts) == 3 and parts[1] != caller.user_id and not caller.is_admin:
+            raise HTTPException(422, f"uploaded file not found: {key}")
+        if len(parts) == 2 and not caller.is_admin:
+            raise HTTPException(422, f"uploaded file not found: {key}")
+
+
 @router.post("/uploads")
-async def upload(request: Request, file: UploadFile) -> Upload:
+async def upload(request: Request, file: UploadFile, caller: Caller) -> Upload:
     """Store an input picture (avatar / static image); pass the returned key in the job."""
     name = file.filename or "image.jpg"
     suffix = PurePosixPath(name).suffix.lower()
     if suffix not in IMAGE_TYPES:
         raise HTTPException(415, f"expected a picture: {', '.join(sorted(IMAGE_TYPES))}")
     data = await _read_limited(file, MAX_UPLOAD_BYTES)
-    key = f"inputs/{uuid.uuid4().hex}{suffix}"
+    prefix = f"inputs/{caller.user_id}" if caller.user_id else "inputs"
+    key = f"{prefix}/{uuid.uuid4().hex}{suffix}"
     await request.app.state.objects.put(data, key, name)
     return Upload(key=key, name=name, size=len(data))
 
@@ -83,25 +96,31 @@ async def rows_from_xlsx(file: UploadFile, mode: Annotated[Mode, Form()]) -> Row
 
 
 @router.get("/jobs")
-async def list_jobs(queue: Queue, limit: int = 100, project_id: str | None = None) -> list[JobStatus]:
-    return await queue.recent(min(max(limit, 1), 500), project_id)
+async def list_jobs(queue: Queue, caller: Caller, limit: int = 100, project_id: str | None = None) -> list[JobStatus]:
+    return await queue.recent(min(max(limit, 1), 500), project_id, user_id=caller.user_id)
 
 
 @router.post("/jobs/sync")
-async def sync_jobs(queue: Queue) -> dict[str, int]:
+async def sync_jobs(queue: Queue, _admin: AdminCaller) -> dict[str, int]:
     restored = await queue.sync()
     return {"restored": restored}
 
 
 @router.post("/jobs", status_code=201)
-async def create_job(body: JobRequest, queue: Queue) -> JobStatus:
-    return await queue.submit(body)
+async def create_job(body: JobRequest, request: Request, queue: Queue, caller: Caller) -> JobStatus:
+    if body.project_id:
+        await request.app.state.projects.get(body.project_id, user_id=caller.user_id)
+    for key in (body.avatar, body.static_image):
+        if key is not None:
+            check_upload_key_owner(key, caller)
+    return await queue.submit(body, user_id=caller.user_id)
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: str, queue: Queue) -> JobDetail:
-    record = await queue.record(job_id)
-    status = await queue.get(job_id)
+async def get_job(job_id: str, queue: Queue, caller: Caller) -> JobDetail:
+    scope = None if caller.is_admin else caller.user_id
+    record = await queue.record(job_id, user_id=scope)
+    status = await queue.get(job_id, user_id=scope)
     return JobDetail(
         **status.model_dump(),
         rows=record.job_rows,
@@ -113,9 +132,10 @@ async def get_job(job_id: str, queue: Queue) -> JobDetail:
 
 
 @router.get("/jobs/{job_id}/files")
-async def job_files(job_id: str, request: Request, queue: Queue) -> list[JobFile]:
+async def job_files(job_id: str, request: Request, queue: Queue, caller: Caller) -> list[JobFile]:
     """Results with presigned links: `url` to show / play, `download_url` to save."""
-    record = await queue.record(job_id)
+    scope = None if caller.is_admin else caller.user_id
+    record = await queue.record(job_id, user_id=scope)
     valid_rows = {r.name for r in record.job_rows}
     objects = request.app.state.objects
     prefix = f"{job_id}_"
@@ -130,7 +150,7 @@ async def job_files(job_id: str, request: Request, queue: Queue) -> list[JobFile
             download_url=objects.url(f.key, download_name=prefix + f.name) if f.key else None,
             created_at=f.created_at,
         )
-        for f in sorted(await queue.files(job_id), key=lambda f: (natural_key(f.row), f.name))
+        for f in sorted(await queue.files(job_id, user_id=scope), key=lambda f: (natural_key(f.row), f.name))
         if f.row in valid_rows
     ]
 
@@ -140,14 +160,16 @@ async def job_zip(
     job_id: str,
     request: Request,
     queue: Queue,
+    caller: Caller,
     kind: Literal["video", "image", "all"] | None = None,
 ) -> StreamingResponse:
     """Stream all done files of a job (or only `video` / `image`) as a ZIP/ZIP64 archive."""
-    record = await queue.record(job_id)
+    scope = None if caller.is_admin else caller.user_id
+    record = await queue.record(job_id, user_id=scope)
     valid_rows = {r.name for r in record.job_rows}
     files = [
         f
-        for f in await queue.files(job_id)
+        for f in await queue.files(job_id, user_id=scope)
         if f.key and f.kind in ("video", "image") and f.row in valid_rows
     ]
     if kind in ("video", "image"):
@@ -162,6 +184,7 @@ async def job_zip(
     items = [
         (f"{'videos' if f.kind == 'video' else 'images'}/{f.name}" if both_kinds else f.name, f.key)
         for f in selected
+        for _ in (0,)
         if f.key
     ]
     base = (record.title or f"job_{job_id}").strip()
@@ -175,30 +198,33 @@ async def job_zip(
 
 
 @router.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str, queue: Queue) -> JobStatus:
-    if not await queue.cancel(job_id):
+async def cancel_job(job_id: str, queue: Queue, caller: Caller) -> JobStatus:
+    scope = None if caller.is_admin else caller.user_id
+    if not await queue.cancel(job_id, user_id=scope):
         raise HTTPException(409, "job has already finished")
-    return await queue.get(job_id)
+    return await queue.get(job_id, user_id=scope)
 
 
 @router.post("/jobs/{job_id}/retry")
-async def retry_job(job_id: str, queue: Queue) -> JobStatus:
-    if not await queue.retry(job_id):
+async def retry_job(job_id: str, queue: Queue, caller: Caller) -> JobStatus:
+    scope = None if caller.is_admin else caller.user_id
+    if not await queue.retry(job_id, user_id=scope):
         raise HTTPException(409, "only stopped, failed or cancelled jobs can be retried")
-    return await queue.get(job_id)
+    return await queue.get(job_id, user_id=scope)
 
 
 @router.delete("/jobs/{job_id}", status_code=204)
-async def delete_job(job_id: str, queue: Queue) -> None:
-    await queue.delete(job_id)
+async def delete_job(job_id: str, queue: Queue, caller: Caller) -> None:
+    scope = None if caller.is_admin else caller.user_id
+    await queue.delete(job_id, user_id=scope)
 
 
 @router.get("/events")
-async def events(request: Request, queue: Queue) -> StreamingResponse:
-    """Server-sent events: a `job` event with the JobStatus on every change of any job."""
+async def events(request: Request, queue: Queue, caller: Caller) -> StreamingResponse:
+    """Server-sent events: a `job` event with the JobStatus on every change of the caller's jobs."""
 
     async def stream() -> AsyncIterator[str]:
-        async with queue.subscribe() as updates:
+        async with queue.subscribe(user_id=caller.user_id) as updates:
             yield "retry: 3000\n\n"
             while not await request.is_disconnected():
                 try:
@@ -216,7 +242,7 @@ async def events(request: Request, queue: Queue) -> StreamingResponse:
 
 
 @router.get("/accounts")
-async def accounts(request: Request) -> list[Account]:
+async def accounts(request: Request, _admin: AdminCaller) -> list[Account]:
     """Accounts with their pauses in seconds (0 = free)."""
     repo = request.app.state.accounts
     result = []

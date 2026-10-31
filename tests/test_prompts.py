@@ -79,6 +79,7 @@ async def test_generate_pairs_applies_suffixes_and_stock_queries():
 def test_prompts_api_flow(tmp_path: Path):
     settings = Settings(
         _env_file=None,
+        auth_required=False,
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}",
         work_dir=tmp_path / "work",
         storage_dir=tmp_path / "storage",

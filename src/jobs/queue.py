@@ -47,7 +47,7 @@ class JobQueue:
         self._worker: asyncio.Task | None = None
         self._running_id: str | None = None
         self._running_task: asyncio.Task | None = None
-        self._subscribers: set[asyncio.Queue[JobStatus]] = set()
+        self._subscribers: set[tuple[str | None, asyncio.Queue[JobStatus]]] = set()
         self._stopping = False
 
     async def start(self) -> None:
@@ -71,28 +71,28 @@ class JobQueue:
             except asyncio.CancelledError:
                 pass
 
-    async def submit(self, request: JobRequest) -> JobStatus:
+    async def submit(self, request: JobRequest, user_id: str | None = None) -> JobStatus:
         for key in (request.avatar, request.static_image):
             if key is not None and not await self._objects.exists(key):
                 raise InputNotFoundError(f"uploaded file not found: {key}")
-        record = await self._repo.create(uuid.uuid4().hex[:12], request)
+        record = await self._repo.create(uuid.uuid4().hex[:12], request, user_id=user_id)
         logger.info(f"[queue] job {record.id} queued: {record.mode}, {record.total} rows")
         status = await self._repo.status(record)
-        await self._publish(status)
+        await self._publish(status, record.user_id)
         self._wake.set()
         return status
 
-    async def get(self, job_id: str) -> JobStatus:
-        return await self._repo.status(await self._record(job_id))
+    async def get(self, job_id: str, user_id: str | None = None) -> JobStatus:
+        return await self._repo.status(await self._record(job_id, user_id=user_id))
 
-    async def recent(self, limit: int = 100, project_id: str | None = None) -> list[JobStatus]:
-        return await self._repo.statuses(await self._repo.recent(limit, project_id))
+    async def recent(self, limit: int = 100, project_id: str | None = None, user_id: str | None = None) -> list[JobStatus]:
+        return await self._repo.statuses(await self._repo.recent(limit, project_id, user_id=user_id))
 
-    async def record(self, job_id: str) -> JobRecord:
-        return await self._record(job_id)
+    async def record(self, job_id: str, user_id: str | None = None) -> JobRecord:
+        return await self._record(job_id, user_id=user_id)
 
-    async def files(self, job_id: str) -> list[JobFileRecord]:
-        await self._record(job_id)
+    async def files(self, job_id: str, user_id: str | None = None) -> list[JobFileRecord]:
+        await self._record(job_id, user_id=user_id)
         return await self._repo.files(job_id)
 
     async def position(self, job_id: str) -> int | None:
@@ -102,9 +102,9 @@ class JobQueue:
         queued = await self._repo.queued_ids()
         return queued.index(job_id) + 1 if job_id in queued else None
 
-    async def cancel(self, job_id: str) -> bool:
+    async def cancel(self, job_id: str, user_id: str | None = None) -> bool:
         """Cancel a queued or running job; False when it has already finished."""
-        record = await self._record(job_id)
+        record = await self._record(job_id, user_id=user_id)
         if JobState(record.state).finished:
             return False
         if job_id == self._running_id and self._running_task is not None:
@@ -113,19 +113,19 @@ class JobQueue:
         await self._set(job_id, JobState.CANCELLED, finished=True)
         return True
 
-    async def retry(self, job_id: str) -> bool:
+    async def retry(self, job_id: str, user_id: str | None = None) -> bool:
         """Queue a stopped / failed / cancelled job again: only its unfinished rows run."""
-        record = await self._record(job_id)
+        record = await self._record(job_id, user_id=user_id)
         if JobState(record.state) not in (JobState.STOPPED, JobState.FAILED, JobState.CANCELLED):
             return False
         await self._repo.update(job_id, state=JobState.QUEUED.value, message=None, finished_at=None)
-        await self._publish(await self.get(job_id))
+        await self._publish(await self.get(job_id), record.user_id)
         self._wake.set()
         return True
 
-    async def delete(self, job_id: str) -> None:
+    async def delete(self, job_id: str, user_id: str | None = None) -> None:
         """Delete a job with its results; a running one is cancelled first."""
-        await self._record(job_id)
+        await self._record(job_id, user_id=user_id)
         if job_id == self._running_id and self._running_task is not None:
             task = self._running_task
             task.cancel()
@@ -136,23 +136,26 @@ class JobQueue:
         logger.info(f"[queue] job {job_id} deleted")
 
     @asynccontextmanager
-    async def subscribe(self) -> AsyncIterator[asyncio.Queue[JobStatus]]:
-        """A queue of status updates of every job, for as long as the context is open."""
+    async def subscribe(self, user_id: str | None = None) -> AsyncIterator[asyncio.Queue[JobStatus]]:
+        """A queue of status updates of jobs visible to `user_id` (`None` = every job)."""
         queue: asyncio.Queue[JobStatus] = asyncio.Queue(maxsize=1000)
-        self._subscribers.add(queue)
+        entry = (user_id, queue)
+        self._subscribers.add(entry)
         try:
             yield queue
         finally:
-            self._subscribers.discard(queue)
+            self._subscribers.discard(entry)
 
-    async def _record(self, job_id: str) -> JobRecord:
+    async def _record(self, job_id: str, user_id: str | None = None) -> JobRecord:
         record = await self._repo.get(job_id)
-        if record is None:
+        if record is None or (user_id is not None and record.user_id != user_id):
             raise JobNotFoundError(job_id)
         return record
 
-    async def _publish(self, status: JobStatus) -> None:
-        for queue in list(self._subscribers):
+    async def _publish(self, status: JobStatus, owner_id: str | None = None) -> None:
+        for sub_user_id, queue in list(self._subscribers):
+            if sub_user_id is not None and sub_user_id != owner_id:
+                continue
             if queue.full():
                 queue.get_nowait()
             queue.put_nowait(status)
@@ -160,7 +163,7 @@ class JobQueue:
     async def _publish_id(self, job_id: str) -> None:
         record = await self._repo.get(job_id)
         if record is not None:
-            await self._publish(await self._repo.status(record))
+            await self._publish(await self._repo.status(record), record.user_id)
 
     async def _set(self, job_id: str, state: JobState, message: str | None = None, finished: bool = False, **fields) -> None:
         fields["state"] = state.value

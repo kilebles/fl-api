@@ -10,6 +10,7 @@ from src.core.settings import Settings
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         _env_file=None,
+        auth_required=False,
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}",
         work_dir=tmp_path / "work",
         storage_dir=tmp_path / "storage",

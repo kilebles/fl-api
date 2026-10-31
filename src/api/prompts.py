@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from src.api.auth import Caller
 from src.prompts.models import GENERATION_MODELS, GeneratedPair, I2VPrompt
 from src.prompts.scenario import document_text, parse_scenario
 from src.prompts.service import PromptRunRecord, PromptService, PromptTemplateRecord
@@ -38,6 +39,7 @@ class TemplateSummary(BaseModel):
     pairs: int
     image_target: str
     video_target: str
+    is_system: bool = False
     created_at: datetime
 
 
@@ -78,6 +80,7 @@ def _template(record: PromptTemplateRecord, detail: bool = False) -> TemplateSum
         "pairs": len(template.pairs),
         "image_target": template.targets.image,
         "video_target": template.targets.video,
+        "is_system": record.user_id is None,
         "created_at": record.created_at,
     }
     return TemplateDetail(**fields, data=template) if detail else TemplateSummary(**fields)
@@ -115,45 +118,62 @@ async def models() -> list[ModelOption]:
 
 
 @router.get("/templates")
-async def list_templates(prompts: Prompts) -> list[TemplateSummary]:
-    return [_template(r) for r in await prompts.templates()]
+async def list_templates(prompts: Prompts, caller: Caller) -> list[TemplateSummary]:
+    return [_template(r) for r in await prompts.templates(user_id=caller.user_id)]
 
 
 @router.post("/templates", status_code=201)
-async def create_template(prompts: Prompts, file: UploadFile, title: Annotated[str | None, Form()] = None) -> TemplateDetail:
+async def create_template(
+    prompts: Prompts,
+    caller: Caller,
+    file: UploadFile,
+    title: Annotated[str | None, Form()] = None,
+) -> TemplateDetail:
     """Extract a template from a brief (.txt / .docx); takes up to a minute."""
     name = file.filename or "brief.txt"
     try:
         brief = document_text(name, await _read(file))
-        record = await prompts.create_template(brief, title or PurePosixPath(name).stem)
+        record = await prompts.create_template(brief, title or PurePosixPath(name).stem, user_id=caller.user_id)
     except (ValueError, UnicodeDecodeError) as e:
         raise HTTPException(422, str(e)) from None
     return _template(record, detail=True)  # type: ignore[return-value]
 
 
 @router.get("/templates/{template_id}")
-async def get_template(template_id: str, prompts: Prompts) -> TemplateDetail:
-    return _template(await prompts.template(template_id), detail=True)  # type: ignore[return-value]
+async def get_template(template_id: str, prompts: Prompts, caller: Caller) -> TemplateDetail:
+    scope = None if caller.is_admin else caller.user_id
+    return _template(await prompts.template(template_id, user_id=scope), detail=True)  # type: ignore[return-value]
 
 
 @router.patch("/templates/{template_id}")
-async def patch_template(template_id: str, body: TemplatePatch, prompts: Prompts) -> TemplateDetail:
-    return _template(await prompts.update_template(template_id, body.title, body.data), detail=True)  # type: ignore[return-value]
+async def patch_template(template_id: str, body: TemplatePatch, prompts: Prompts, caller: Caller) -> TemplateDetail:
+    try:
+        record = await prompts.update_template(
+            template_id, body.title, body.data, user_id=caller.user_id, is_admin=caller.is_admin
+        )
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from None
+    return _template(record, detail=True)  # type: ignore[return-value]
 
 
 @router.delete("/templates/{template_id}", status_code=204)
-async def delete_template(template_id: str, prompts: Prompts) -> None:
-    await prompts.delete_template(template_id)
+async def delete_template(template_id: str, prompts: Prompts, caller: Caller) -> None:
+    try:
+        await prompts.delete_template(template_id, user_id=caller.user_id, is_admin=caller.is_admin)
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from None
 
 
 @router.get("/runs")
-async def list_runs(prompts: Prompts, project_id: str | None = None) -> list[RunSummary]:
-    return [_run(r) for r in await prompts.runs(project_id=project_id)]
+async def list_runs(prompts: Prompts, caller: Caller, project_id: str | None = None) -> list[RunSummary]:
+    return [_run(r) for r in await prompts.runs(project_id=project_id, user_id=caller.user_id)]
 
 
 @router.post("/runs", status_code=201)
 async def create_run(
     prompts: Prompts,
+    request: Request,
+    caller: Caller,
     file: UploadFile,
     template_id: Annotated[str, Form()],
     model: Annotated[str, Form()],
@@ -161,23 +181,35 @@ async def create_run(
     project_id: Annotated[str | None, Form()] = None,
 ) -> RunSummary:
     """Generate prompt pairs for a scenario (.docx / .txt) in the background."""
+    if project_id:
+        await request.app.state.projects.get(project_id, user_id=caller.user_id)
     name = file.filename or "scenario.txt"
     try:
         paragraphs = await asyncio.to_thread(parse_scenario, name, await _read(file))
-        record = await prompts.create_run(template_id, model, pair_count, PurePosixPath(name).stem, paragraphs, project_id or None)
+        record = await prompts.create_run(
+            template_id,
+            model,
+            pair_count,
+            PurePosixPath(name).stem,
+            paragraphs,
+            project_id or None,
+            user_id=caller.user_id,
+        )
     except (ValueError, UnicodeDecodeError) as e:
         raise HTTPException(422, str(e)) from None
     return _run(record)
 
 
 @router.get("/runs/{run_id}")
-async def get_run(run_id: str, prompts: Prompts) -> RunDetail:
-    return _run(await prompts.run(run_id), detail=True)  # type: ignore[return-value]
+async def get_run(run_id: str, prompts: Prompts, caller: Caller) -> RunDetail:
+    scope = None if caller.is_admin else caller.user_id
+    return _run(await prompts.run(run_id, user_id=scope), detail=True)  # type: ignore[return-value]
 
 
 @router.get("/runs/{run_id}/xlsx")
-async def run_xlsx(run_id: str, prompts: Prompts) -> Response:
-    record = await prompts.run(run_id)
+async def run_xlsx(run_id: str, prompts: Prompts, caller: Caller) -> Response:
+    scope = None if caller.is_admin else caller.user_id
+    record = await prompts.run(run_id, user_id=scope)
     if not record.rows:
         raise HTTPException(409, "the run has no prompts yet")
     data = await asyncio.to_thread(build_workbook, record.pairs)
@@ -190,5 +222,6 @@ async def run_xlsx(run_id: str, prompts: Prompts) -> Response:
 
 
 @router.delete("/runs/{run_id}", status_code=204)
-async def delete_run(run_id: str, prompts: Prompts) -> None:
-    await prompts.delete_run(run_id)
+async def delete_run(run_id: str, prompts: Prompts, caller: Caller) -> None:
+    scope = None if caller.is_admin else caller.user_id
+    await prompts.delete_run(run_id, user_id=scope)

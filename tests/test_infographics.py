@@ -41,6 +41,7 @@ def test_infographics_api_flow(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(service_module.InfographicsService, "_stage", fake_stage)
     settings = Settings(
         _env_file=None,
+        auth_required=False,
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}",
         work_dir=tmp_path / "work",
         storage_dir=tmp_path / "storage",

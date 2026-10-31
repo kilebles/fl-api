@@ -54,6 +54,7 @@ class InfographicRunRecord(Base):
     __tablename__ = "infographic_runs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(32), index=True, default=None)
     project_id: Mapped[str | None] = mapped_column(String(32), index=True)
     scenario_name: Mapped[str] = mapped_column(String(300))
     scenario_key: Mapped[str] = mapped_column(String(400))
@@ -129,28 +130,39 @@ class InfographicsService:
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
 
-    async def runs(self, limit: int = 100, project_id: str | None = None) -> list[InfographicRunRecord]:
+    async def runs(
+        self, limit: int = 100, project_id: str | None = None, user_id: str | None = None
+    ) -> list[InfographicRunRecord]:
         query = select(InfographicRunRecord).order_by(InfographicRunRecord.created_at.desc()).limit(limit)
+        if user_id is not None:
+            query = query.where(InfographicRunRecord.user_id == user_id)
         if project_id is not None:
             query = query.where(InfographicRunRecord.project_id == project_id)
         async with self._session() as session:
             return list(await session.scalars(query))
 
-    async def run(self, run_id: str) -> InfographicRunRecord:
+    async def run(self, run_id: str, user_id: str | None = None) -> InfographicRunRecord:
         async with self._session() as session:
             record = await session.get(InfographicRunRecord, run_id)
-        if record is None:
+        if record is None or (user_id is not None and record.user_id != user_id):
             raise NotFoundError(f"infographic run {run_id}")
         return record
 
     async def create(
-        self, scenario_name: str, content: bytes, categories: list[str], one_per_person: bool, project_id: str | None = None
+        self,
+        scenario_name: str,
+        content: bytes,
+        categories: list[str],
+        one_per_person: bool,
+        project_id: str | None = None,
+        user_id: str | None = None,
     ) -> InfographicRunRecord:
         run_id = uuid.uuid4().hex[:12]
         scenario_key = _key(run_id, "scenario.docx")
         await self._objects.put(content, scenario_key, "scenario.docx")
         record = InfographicRunRecord(
             id=run_id,
+            user_id=user_id,
             project_id=project_id,
             scenario_name=scenario_name,
             scenario_key=scenario_key,
@@ -166,16 +178,16 @@ class InfographicsService:
         self._wake.set()
         return record
 
-    async def retry(self, run_id: str) -> bool:
-        record = await self.run(run_id)
+    async def retry(self, run_id: str, user_id: str | None = None) -> bool:
+        record = await self.run(run_id, user_id=user_id)
         if record.state != InfographicState.FAILED.value:
             return False
         await self._set(run_id, state=InfographicState.QUEUED.value, error=None, finished_at=None)
         self._wake.set()
         return True
 
-    async def delete(self, run_id: str) -> None:
-        await self.run(run_id)
+    async def delete(self, run_id: str, user_id: str | None = None) -> None:
+        await self.run(run_id, user_id=user_id)
         if self._current and self._current[0] == run_id:
             task = self._current[1]
             task.cancel()

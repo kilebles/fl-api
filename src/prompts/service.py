@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import JSON, DateTime, Integer, String, Text, delete, func, select, update
+from sqlalchemy import JSON, DateTime, Integer, String, Text, delete, func, or_, select, update
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db import Base, Database
@@ -31,6 +31,7 @@ class PromptTemplateRecord(Base):
     __tablename__ = "prompt_templates"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(32), index=True, default=None)
     title: Mapped[str] = mapped_column(String(300))
     data: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
@@ -44,6 +45,7 @@ class PromptRunRecord(Base):
     __tablename__ = "prompt_runs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(32), index=True, default=None)
     project_id: Mapped[str | None] = mapped_column(String(32), index=True)
     template_id: Mapped[str] = mapped_column(String(32))
     template_title: Mapped[str] = mapped_column(String(300))
@@ -115,29 +117,35 @@ class PromptService:
 
     # Templates
 
-    async def templates(self) -> list[PromptTemplateRecord]:
+    async def templates(self, user_id: str | None = None) -> list[PromptTemplateRecord]:
+        query = select(PromptTemplateRecord).order_by(PromptTemplateRecord.created_at.desc())
+        if user_id is not None:
+            query = query.where(or_(PromptTemplateRecord.user_id == user_id, PromptTemplateRecord.user_id.is_(None)))
         async with self._session() as session:
-            return list(await session.scalars(select(PromptTemplateRecord).order_by(PromptTemplateRecord.created_at.desc())))
+            return list(await session.scalars(query))
 
-    async def template(self, template_id: str) -> PromptTemplateRecord:
+    async def template(self, template_id: str, user_id: str | None = None) -> PromptTemplateRecord:
         async with self._session() as session:
             record = await session.get(PromptTemplateRecord, template_id)
-        if record is None:
+        if record is None or (user_id is not None and record.user_id not in (user_id, None)):
             raise NotFoundError(f"template {template_id}")
         return record
 
-    async def create_template(self, brief: str, title: str) -> PromptTemplateRecord:
+    async def create_template(self, brief: str, title: str, user_id: str | None = None) -> PromptTemplateRecord:
         """Extract a template from a brief with the LLM (takes up to a minute)."""
         if not brief.strip():
             raise ValueError("brief is empty")
         template = await parse_template(self._llm, self._template_model, brief, title)
         if not template.pairs:
             raise ValueError("no shot pairs found in the brief")
-        return await self.save_template(template)
+        return await self.save_template(template, user_id=user_id)
 
-    async def save_template(self, template: I2VPrompt, template_id: str | None = None) -> PromptTemplateRecord:
+    async def save_template(
+        self, template: I2VPrompt, template_id: str | None = None, user_id: str | None = None
+    ) -> PromptTemplateRecord:
         record = PromptTemplateRecord(
             id=template_id or uuid.uuid4().hex,
+            user_id=user_id,
             title=template.title or "Без названия",
             data=template.model_dump(),
             created_at=datetime.now(),
@@ -147,8 +155,17 @@ class PromptService:
             await session.commit()
         return record
 
-    async def update_template(self, template_id: str, title: str | None, data: I2VPrompt | None) -> PromptTemplateRecord:
-        record = await self.template(template_id)
+    async def update_template(
+        self,
+        template_id: str,
+        title: str | None,
+        data: I2VPrompt | None,
+        user_id: str | None = None,
+        is_admin: bool = False,
+    ) -> PromptTemplateRecord:
+        record = await self.template(template_id, user_id=user_id)
+        if user_id is not None and record.user_id != user_id and not (record.user_id is None and is_admin):
+            raise PermissionError("system template can only be modified by an administrator")
         template = data or record.template
         if title is not None:
             template.title = title
@@ -156,43 +173,55 @@ class PromptService:
         async with self._session() as session:
             await session.execute(update(PromptTemplateRecord).where(PromptTemplateRecord.id == template_id).values(**values))
             await session.commit()
-        return await self.template(template_id)
+        return await self.template(template_id, user_id=user_id)
 
-    async def delete_template(self, template_id: str) -> None:
-        await self.template(template_id)
+    async def delete_template(self, template_id: str, user_id: str | None = None, is_admin: bool = False) -> None:
+        record = await self.template(template_id, user_id=user_id)
+        if user_id is not None and record.user_id != user_id and not (record.user_id is None and is_admin):
+            raise PermissionError("system template can only be deleted by an administrator")
         async with self._session() as session:
             await session.execute(delete(PromptTemplateRecord).where(PromptTemplateRecord.id == template_id))
             await session.commit()
 
     # Runs
 
-    async def runs(self, limit: int = 100, project_id: str | None = None) -> list[PromptRunRecord]:
+    async def runs(self, limit: int = 100, project_id: str | None = None, user_id: str | None = None) -> list[PromptRunRecord]:
         query = select(PromptRunRecord).order_by(PromptRunRecord.created_at.desc()).limit(limit)
+        if user_id is not None:
+            query = query.where(PromptRunRecord.user_id == user_id)
         if project_id is not None:
             query = query.where(PromptRunRecord.project_id == project_id)
         async with self._session() as session:
             return list(await session.scalars(query))
 
-    async def run(self, run_id: str) -> PromptRunRecord:
+    async def run(self, run_id: str, user_id: str | None = None) -> PromptRunRecord:
         async with self._session() as session:
             record = await session.get(PromptRunRecord, run_id)
-        if record is None:
+        if record is None or (user_id is not None and record.user_id != user_id):
             raise NotFoundError(f"run {run_id}")
         return record
 
     async def create_run(
-        self, template_id: str, model: str, pair_count: int, scenario_name: str, paragraphs: list[str], project_id: str | None = None
+        self,
+        template_id: str,
+        model: str,
+        pair_count: int,
+        scenario_name: str,
+        paragraphs: list[str],
+        project_id: str | None = None,
+        user_id: str | None = None,
     ) -> PromptRunRecord:
         if model not in {m for m, _ in GENERATION_MODELS}:
             raise ValueError(f"unknown model: {model}")
         if not paragraphs:
             raise ValueError("no paragraphs in the scenario")
-        template = await self.template(template_id)
+        template = await self.template(template_id, user_id=user_id)
         available = len(template.template.pairs)
         if not 1 <= pair_count <= available:
             raise ValueError(f"pair count must be 1..{available}")
         record = PromptRunRecord(
             id=uuid.uuid4().hex[:12],
+            user_id=user_id,
             project_id=project_id,
             template_id=template_id,
             template_title=template.title,
@@ -210,8 +239,8 @@ class PromptService:
         self._launch(record.id)
         return record
 
-    async def delete_run(self, run_id: str) -> None:
-        await self.run(run_id)
+    async def delete_run(self, run_id: str, user_id: str | None = None) -> None:
+        await self.run(run_id, user_id=user_id)
         task = self._tasks.get(run_id)
         if task is not None:
             task.cancel()

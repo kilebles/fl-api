@@ -1,9 +1,10 @@
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -51,9 +52,35 @@ class Settings(BaseSettings):
     renderer_dir: Path = Field(default=Path("renderer"), description="Remotion project that renders infographic cards")
     render_concurrency: int | None = Field(default=None, description="Chrome tabs per render (None = Remotion default; 1 on a small server)")
 
-    # Web API
-    api_token: str = Field(default="", description="Bearer token required by the web API; empty disables the check")
-    cors_origins: list[str] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"], description="Origins of the web frontend")
+    # Web API & Auth
+    api_token: str = Field(default="", description="Bearer token for internal/service API access; empty disables token auth")
+    auth_required: bool = Field(default=True, description="Require user session cookie (or API_TOKEN) on /api/*")
+    auth_secret: str = Field(default="", description="HMAC secret for OAuth state cookies; generated per-process if empty")
+    auth_cookie_name: str = Field(default="fl_session", description="Name of the HttpOnly session cookie")
+    auth_session_days: int = Field(default=30, description="Sliding session lifetime in days")
+    frontend_url: str = Field(default="http://localhost:3000", description="Frontend base URL for OAuth redirects and Origin checks")
+    google_client_id: str = Field(default="", description="Google OAuth 2.0 Client ID")
+    google_client_secret: str = Field(default="", description="Google OAuth 2.0 Client Secret")
+    resend_api_key: str = Field(default="", description="Resend API key (re_...) for auth emails")
+    resend_from: str = Field(default="Motion Pr <noreply@updates.tunnlx.com>", description="Verified sender address for Resend emails")
+    admin_emails: Annotated[list[str], NoDecode] = Field(default=[], description="Emails that are automatically granted the admin role")
+    first_user_admin: bool = Field(default=True, description="Grant admin role to the first registered user and claim legacy unowned rows")
+    cors_origins: Annotated[list[str], NoDecode] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"], description="Origins of the web frontend")
+
+    @field_validator("admin_emails", "cors_origins", mode="before")
+    @classmethod
+    def _parse_str_list(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                parsed = json.loads(raw)
+                return [str(item).strip() for item in parsed if str(item).strip()]
+            return [part.strip() for part in raw.split(",") if part.strip()]
+        return [str(item).strip() for item in value if str(item).strip()]
 
     # Flow API
     api_url: str = Field(

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from src.api.auth import Caller
 from src.infographics.categories import CATEGORIES
 from src.infographics.service import InfographicRunRecord, InfographicsService
 from src.storage.zip_stream import stream_zip, zip_headers
@@ -83,19 +84,23 @@ async def categories() -> list[Category]:
 
 
 @router.get("/runs")
-async def list_runs(service: Service, project_id: str | None = None) -> list[RunSummary]:
-    return [RunSummary(**_summary(r)) for r in await service.runs(project_id=project_id)]
+async def list_runs(service: Service, caller: Caller, project_id: str | None = None) -> list[RunSummary]:
+    return [RunSummary(**_summary(r)) for r in await service.runs(project_id=project_id, user_id=caller.user_id)]
 
 
 @router.post("/runs", status_code=201)
 async def create_run(
     service: Service,
+    request: Request,
+    caller: Caller,
     file: UploadFile,
     categories: Annotated[str, Form()] = "people",
     one_per_person: Annotated[bool, Form()] = False,
     project_id: Annotated[str | None, Form()] = None,
 ) -> RunSummary:
     """Find the subjects of a scenario (.docx) and render a card for each; takes from minutes to hours."""
+    if project_id:
+        await request.app.state.projects.get(project_id, user_id=caller.user_id)
     name = file.filename or "scenario.docx"
     if not name.lower().endswith(".docx"):
         raise HTTPException(422, "scenario must be .docx")
@@ -106,13 +111,16 @@ async def create_run(
     data = await file.read(MAX_DOC_BYTES + 1)
     if len(data) > MAX_DOC_BYTES:
         raise HTTPException(413, "file is larger than 10 MB")
-    record = await service.create(PurePosixPath(name).stem, data, chosen, one_per_person, project_id or None)
+    record = await service.create(
+        PurePosixPath(name).stem, data, chosen, one_per_person, project_id or None, user_id=caller.user_id
+    )
     return RunSummary(**_summary(record))
 
 
 @router.get("/runs/{run_id}")
-async def get_run(run_id: str, service: Service, request: Request) -> RunDetail:
-    record = await service.run(run_id)
+async def get_run(run_id: str, service: Service, request: Request, caller: Caller) -> RunDetail:
+    scope = None if caller.is_admin else caller.user_id
+    record = await service.run(run_id, user_id=scope)
     objects = request.app.state.objects
     cards = [
         Card(
@@ -132,9 +140,10 @@ async def get_run(run_id: str, service: Service, request: Request) -> RunDetail:
 
 
 @router.get("/runs/{run_id}/zip")
-async def run_zip(run_id: str, service: Service, request: Request) -> StreamingResponse:
+async def run_zip(run_id: str, service: Service, request: Request, caller: Caller) -> StreamingResponse:
     """Stream all rendered card videos (or source images) of an infographic run as a ZIP archive."""
-    record = await service.run(run_id)
+    scope = None if caller.is_admin else caller.user_id
+    record = await service.run(run_id, user_id=scope)
     items: list[tuple[str, str]] = []
     for e in record.entries:
         safe_name = str(e.get("name", "")).replace("/", "-").replace("\\", "-").strip()
@@ -153,12 +162,14 @@ async def run_zip(run_id: str, service: Service, request: Request) -> StreamingR
 
 
 @router.post("/runs/{run_id}/retry")
-async def retry_run(run_id: str, service: Service) -> RunSummary:
-    if not await service.retry(run_id):
+async def retry_run(run_id: str, service: Service, caller: Caller) -> RunSummary:
+    scope = None if caller.is_admin else caller.user_id
+    if not await service.retry(run_id, user_id=scope):
         raise HTTPException(409, "only failed runs can be retried")
-    return RunSummary(**_summary(await service.run(run_id)))
+    return RunSummary(**_summary(await service.run(run_id, user_id=scope)))
 
 
 @router.delete("/runs/{run_id}", status_code=204)
-async def delete_run(run_id: str, service: Service) -> None:
-    await service.delete(run_id)
+async def delete_run(run_id: str, service: Service, caller: Caller) -> None:
+    scope = None if caller.is_admin else caller.user_id
+    await service.delete(run_id, user_id=scope)
