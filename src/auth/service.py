@@ -140,7 +140,7 @@ def normalize_username(username: str) -> str:
     """Validate and normalize an account username (`3..32` lowercase `[a-z0-9._-]`)."""
     cleaned = username.strip().lstrip("@").lower()
     if len(cleaned) < 3 or len(cleaned) > 32 or ".." in cleaned or not _USERNAME_RE.match(cleaned):
-        raise AuthError("Username должен содержать от 3 до 32 символов (a-z, 0-9, ., _, -)")
+        raise AuthError("Некорректный логин")
     return cleaned
 
 
@@ -336,7 +336,7 @@ class AuthService:
                     await session.flush()
                 else:
                     self.limiter.record_failure(ip_key)
-                    raise UsernameAlreadyExistsError("Этот username уже занят")
+                    raise UsernameAlreadyExistsError("Этот логин уже занят")
 
             await self._enforce_cooldown(session, "verify_email", norm_email, now)
 
@@ -365,7 +365,7 @@ class AuthService:
                 await session.flush()
             except IntegrityError:
                 await session.rollback()
-                raise UsernameAlreadyExistsError("Этот username или почта уже используются") from None
+                raise UsernameAlreadyExistsError("Этот логин или почта уже используются") from None
 
             await session.execute(
                 delete(EmailChallengeRecord).where(
@@ -842,7 +842,7 @@ class AuthService:
                 if norm_username != user.username:
                     taken = await session.scalar(select(UserRecord).where(UserRecord.username == norm_username))
                     if taken is not None and taken.id != user_id:
-                        raise UsernameAlreadyExistsError("Этот username уже занят")
+                        raise UsernameAlreadyExistsError("Этот логин уже занят")
                     user.username = norm_username
                     user.name = norm_username
 

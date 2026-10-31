@@ -544,7 +544,7 @@ async def login(
     _verify_csrf(request, settings)
     identifier = (body.login or body.email).strip()
     if not identifier:
-        raise HTTPException(422, "Введите username или почту")
+        raise HTTPException(422, "Введите логин или почту")
 
     try:
         user, sess, raw_token = await auth.login(
