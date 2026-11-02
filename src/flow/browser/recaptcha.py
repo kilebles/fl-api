@@ -328,7 +328,10 @@ class RecaptchaTokenProducer:
         page = await self._find_or_create_labs_page(context)
         if "/about" in page.url or "accounts.google.com" in page.url:
             logger.warning(f"Flow landed on {page.url} — attempting automatic Google sign-in recovery")
-            await self._recover_flow_session(page, context)
+            if not await self._recover_flow_session(page, context):
+                raise GoogleNotSignedInError(
+                    f"Google account requires manual sign-in / captcha on Flow (stuck at {page.url})"
+                )
 
         await self._extract_cookies(context)
         self._publish_cookies()
@@ -902,6 +905,8 @@ class RecaptchaTokenProducer:
             if source == "persisted":
                 self._known_project_id = None
                 self._project_id = None
+        if "/about" in page.url or "accounts.google.com" in page.url:
+            raise GoogleNotSignedInError(f"Flow session is signed out (at {page.url}): " + "; ".join(errors))
         raise RuntimeError("Could not obtain a Flow project: " + "; ".join(errors))
 
     async def _known_project(self, page: Page) -> str | None:
