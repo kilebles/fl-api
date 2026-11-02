@@ -21,7 +21,7 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, defer, mapped_column
 
 from src.core.db import Base, Database
 from src.jobs.models import JobProgress, JobRequest, JobRow, JobState, JobStatus
@@ -109,7 +109,7 @@ class JobRepository:
             return await session.get(JobRecord, job_id)
 
     async def recent(self, limit: int = 100, project_id: str | None = None, user_id: str | None = None) -> list[JobRecord]:
-        query = select(JobRecord).order_by(JobRecord.created_at.desc()).limit(limit)
+        query = select(JobRecord).options(defer(JobRecord.rows)).order_by(JobRecord.created_at.desc()).limit(limit)
         if user_id is not None:
             query = query.where(JobRecord.user_id == user_id)
         if project_id is not None:
