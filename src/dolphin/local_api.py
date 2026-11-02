@@ -47,14 +47,7 @@ class DolphinLocalApi:
             except Exception as e:
                 logger.warning(f"Could not stop profile {profile_id}: {e}")
 
-    def _recover_dolphin(self) -> bool:
-        """Attempt to clean orphaned browser processes and relaunch Dolphin Anty on Windows."""
-        logger.warning("Dolphin Anty Local API is unreachable; attempting automatic recovery...")
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "anty.exe"], capture_output=True, timeout=15, check=False)
-        except Exception as e:
-            logger.warning(f"Could not run taskkill on anty.exe: {e}")
-
+    def _launch_dolphin_app(self) -> None:
         launched = False
         try:
             res = subprocess.run(
@@ -77,11 +70,11 @@ class DolphinLocalApi:
                     cwd=str(_DOLPHIN_EXE.parent),
                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0x00000008),
                 )
-                launched = True
             except Exception as e:
                 logger.warning(f"Direct launch of {_DOLPHIN_EXE} failed: {e}")
 
-        deadline = time.monotonic() + self._recover_timeout
+    def _wait_local_api(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             time.sleep(2.0)
             try:
@@ -95,6 +88,24 @@ class DolphinLocalApi:
                 time.sleep(3.0)
                 logger.info("Dolphin Anty Local API recovered and is listening")
                 return True
+        return False
+
+    def _recover_dolphin(self) -> bool:
+        """Attempt to relaunch Dolphin Anty without killing live browsers unless required."""
+        logger.warning("Dolphin Anty Local API is unreachable; attempting soft recovery...")
+        self._launch_dolphin_app()
+        soft_wait = min(15.0, self._recover_timeout)
+        if self._wait_local_api(soft_wait):
+            return True
+
+        logger.warning("Soft recovery did not restore Local API; killing orphaned anty.exe and retrying...")
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "anty.exe"], capture_output=True, timeout=15, check=False)
+        except Exception as e:
+            logger.warning(f"Could not run taskkill on anty.exe: {e}")
+        self._launch_dolphin_app()
+        if self._wait_local_api(max(5.0, self._recover_timeout - soft_wait)):
+            return True
 
         logger.error(f"Dolphin Anty Local API did not recover within {self._recover_timeout:.0f}s")
         return False
@@ -106,15 +117,19 @@ class DolphinLocalApi:
         with _LOCAL_LOCK:
             try:
                 resp = httpx.post(url, json={"automation": True}, timeout=60.0)
-            except httpx.ConnectError as e:
-                if not self._auto_recover or not self._recover_dolphin():
-                    raise DolphinNotRunningError("Dolphin Anty is not running — start the app and retry") from e
+            except httpx.ConnectError:
+                time.sleep(3.0)
                 try:
                     resp = httpx.post(url, json={"automation": True}, timeout=60.0)
-                except httpx.ConnectError as retry_err:
-                    raise DolphinNotRunningError(
-                        "Dolphin Anty is not running — auto-recovery could not reach Local API"
-                    ) from retry_err
+                except httpx.ConnectError as e:
+                    if not self._auto_recover or not self._recover_dolphin():
+                        raise DolphinNotRunningError("Dolphin Anty is not running — start the app and retry") from e
+                    try:
+                        resp = httpx.post(url, json={"automation": True}, timeout=60.0)
+                    except httpx.ConnectError as retry_err:
+                        raise DolphinNotRunningError(
+                            "Dolphin Anty is not running — auto-recovery could not reach Local API"
+                        ) from retry_err
             if resp.status_code == 409:
                 logger.warning(f"Profile {profile_id} already running (409 Conflict) — stopping and restarting")
                 try:

@@ -383,7 +383,7 @@ def test_dolphin_local_api_auto_recovers_on_connect_error(monkeypatch):
     def fake_post(url, **kwargs):
         nonlocal post_calls
         post_calls += 1
-        if post_calls == 1:
+        if post_calls <= 2:
             raise httpx.ConnectError("refused")
         return httpx.Response(
             200,
@@ -401,9 +401,9 @@ def test_dolphin_local_api_auto_recovers_on_connect_error(monkeypatch):
     api = la.DolphinLocalApi("http://localhost:3001", auto_recover=True, recover_timeout=5.0)
     ws = api.start("782331246")
     assert ws == "ws://127.0.0.1:9222/devtools/browser/abc"
-    assert post_calls == 2
-    assert ["taskkill", "/F", "/IM", "anty.exe"] in commands
+    assert post_calls == 3
     assert ["schtasks", "/Run", "/TN", "start-dolphin-anty"] in commands
+    assert ["taskkill", "/F", "/IM", "anty.exe"] not in commands
 
 
 def test_dolphin_local_api_restarts_on_409_conflict(monkeypatch):
