@@ -404,3 +404,36 @@ def test_dolphin_local_api_auto_recovers_on_connect_error(monkeypatch):
     assert post_calls == 2
     assert ["taskkill", "/F", "/IM", "anty.exe"] in commands
     assert ["schtasks", "/Run", "/TN", "start-dolphin-anty"] in commands
+
+
+def test_dolphin_local_api_restarts_on_409_conflict(monkeypatch):
+    import httpx
+    from src.dolphin import local_api as la
+
+    monkeypatch.setattr(la.time, "sleep", lambda _: None)
+    post_calls = 0
+    stopped: list[str] = []
+
+    def fake_post(url, **kwargs):
+        nonlocal post_calls
+        post_calls += 1
+        if post_calls == 1:
+            return httpx.Response(409, json={"error": "Conflict"}, request=httpx.Request("POST", url))
+        return httpx.Response(
+            200,
+            json={"automation": {"port": 9333, "wsEndpoint": "/devtools/browser/xyz"}},
+            request=httpx.Request("POST", url),
+        )
+
+    def fake_get(url, **kwargs):
+        stopped.append(url)
+        return httpx.Response(200, json={"success": True}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(la.httpx, "post", fake_post)
+    monkeypatch.setattr(la.httpx, "get", fake_get)
+
+    api = la.DolphinLocalApi("http://localhost:3001", auto_recover=False)
+    ws = api.start("782332520")
+    assert ws == "ws://127.0.0.1:9333/devtools/browser/xyz"
+    assert post_calls == 2
+    assert stopped == ["http://localhost:3001/v1.0/browser_profiles/782332520/stop"]

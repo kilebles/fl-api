@@ -186,9 +186,11 @@ class AccountSession:
                     await self._rotate_account()
                     return
                 logger.error(f"[{self.name}] Google account not signed in ({e}) — skipping account")
+                await self._stop_browser_quietly()
                 raise
             except Exception as e:
                 if attempt == attempts:
+                    await self._stop_browser_quietly()
                     raise
                 delay = START_RETRY_DELAYS[min(attempt, len(START_RETRY_DELAYS)) - 1]
                 logger.warning(
@@ -197,6 +199,16 @@ class AccountSession:
                 )
                 await asyncio.sleep(delay)
                 self._manager.forget_browser()
+
+    async def _stop_browser_quietly(self) -> None:
+        stop_fn = getattr(self._manager, "stop_current", None)
+        if stop_fn is not None:
+            try:
+                await asyncio.to_thread(stop_fn)
+            except Exception as e:
+                logger.debug(f"[{self.name}] Could not stop failed browser profile: {e}")
+        else:
+            self._manager.forget_browser()
 
     async def close(self) -> None:
         """Stop the producer; the browser keeps running so the next job can reuse it."""
@@ -697,6 +709,9 @@ class AccountSession:
             proxy_url=self._manager.current_proxy_url,
             project_id=self._credentials.known_project_id,
         )
+        creds_loader = getattr(self._manager, "current_google_credentials", None)
+        if creds_loader is not None:
+            producer.google_credentials_loader = creds_loader
         task = asyncio.create_task(producer.run(), name=f"producer_{self.name}")
         self._producer, self._producer_task = producer, task
         self._producer_gen += 1

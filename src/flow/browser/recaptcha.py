@@ -146,6 +146,7 @@ class RecaptchaTokenProducer:
         self._authorization: str | None = None
         self.on_authorization: Callable[[str], None] | None = None
         self.on_cookies: Callable[[dict[str, str]], None] | None = None
+        self.google_credentials_loader: Callable[[], tuple[str | None, str | None]] | None = None
         self._last_session_refresh: float = 0.0
         self._seen_api_paths: set[str] = set()
         self._seen_rpc_ids: set[str] = set()
@@ -325,6 +326,9 @@ class RecaptchaTokenProducer:
         await context.add_init_script(_GRECAPTCHA_INIT_SCRIPT)
 
         page = await self._find_or_create_labs_page(context)
+        if "/about" in page.url or "accounts.google.com" in page.url:
+            logger.warning(f"Flow landed on {page.url} — attempting automatic Google sign-in recovery")
+            await self._recover_flow_session(page, context)
 
         await self._extract_cookies(context)
         self._publish_cookies()
@@ -625,6 +629,103 @@ class RecaptchaTokenProducer:
                 except Exception:
                     continue
 
+    async def _recover_flow_session(self, page: Page, context) -> bool:
+        """Sign back into Google / Flow when redirected to /about or accounts.google.com."""
+        email, password = (None, None)
+        if self.google_credentials_loader is not None:
+            try:
+                email, password = await asyncio.to_thread(self.google_credentials_loader)
+            except Exception as e:
+                logger.debug(f"Could not load Google credentials for auto-login: {e}")
+
+        signin_url = (
+            "https://accounts.google.com/ServiceLogin?passive=1209600&osid=1"
+            f"&continue={self._settings.flow_base_url}/&followup={self._settings.flow_base_url}/"
+        )
+        timeout_ms = self._settings.reload_timeout * 1000
+        try:
+            await page.goto(signin_url, timeout=timeout_ms)
+            await asyncio.sleep(3.0)
+            for _ in range(6):
+                cur = page.url
+                if cur.startswith(self._settings.flow_base_url) and "/about" not in cur:
+                    break
+
+                chooser_selectors = (
+                    (f'div[data-identifier="{email}"]', 'div[data-identifier]', 'div[data-email]')
+                    if email
+                    else ('div[data-identifier]', 'div[data-email]')
+                )
+                clicked = False
+                for sel in chooser_selectors:
+                    loc = page.locator(sel).first
+                    if await loc.count() and await loc.is_visible():
+                        await loc.click(timeout=5_000)
+                        logger.info(f"Auto-login: clicked chooser {sel}")
+                        await asyncio.sleep(3.5)
+                        clicked = True
+                        break
+                if clicked:
+                    continue
+
+                email_inp = page.locator('input[type="email"]').first
+                if email and await email_inp.count() and await email_inp.is_visible():
+                    await email_inp.fill(email)
+                    await asyncio.sleep(0.5)
+                    await page.locator('#identifierNext button, button:has-text("Next"), button:has-text("Далее")').first.click(timeout=5_000)
+                    logger.info("Auto-login: submitted Google email")
+                    await asyncio.sleep(4.0)
+                    continue
+
+                if "confirmidentifier" in page.url:
+                    nxt = page.locator('#identifierNext button, button:has-text("Next"), button:has-text("Далее")').first
+                    if await nxt.count() and await nxt.is_visible():
+                        await nxt.click(timeout=5_000)
+                        logger.info("Auto-login: confirmed Google identifier")
+                        await asyncio.sleep(4.0)
+                        continue
+
+                pw_inp = page.locator('input[type="password"]').first
+                if password and await pw_inp.count() and await pw_inp.is_visible():
+                    await pw_inp.fill(password)
+                    await asyncio.sleep(0.5)
+                    await page.locator('#passwordNext button, button:has-text("Next"), button:has-text("Далее")').first.click(timeout=5_000)
+                    logger.info("Auto-login: submitted Google password")
+                    await asyncio.sleep(6.0)
+                    continue
+
+                if any(h in page.url for h in ("gds.google.com", "myaccount.google.com", "accounts.google.com")):
+                    interstitial = False
+                    for txt in ("Cancel", "Отмена", "Not now", "Не сейчас", "Skip", "Пропустить", "Continue", "Продолжить", "I understand", "Понятно", "Confirm", "Подтвердить"):
+                        btn = page.locator(f'button:has-text("{txt}"), div[role="button"]:has-text("{txt}"), a:has-text("{txt}")').first
+                        if await btn.count() and await btn.is_visible():
+                            await btn.click(timeout=5_000)
+                            logger.info(f"Auto-login: dismissed interstitial '{txt}'")
+                            await asyncio.sleep(4.0)
+                            interstitial = True
+                            break
+                    if interstitial:
+                        continue
+                break
+
+            if not page.url.startswith(self._settings.flow_base_url) or "/about" in page.url:
+                await page.goto(self._settings.labs_url, timeout=timeout_ms)
+                await asyncio.sleep(4.0)
+
+            await self._extract_cookies(context)
+            self._publish_cookies()
+            ok = page.url.startswith(self._settings.flow_base_url) and "/about" not in page.url
+            if ok:
+                logger.success(f"Recovered Flow session via Google sign-in ({page.url})")
+            else:
+                logger.warning(f"Google sign-in recovery ended at {page.url}")
+            return ok
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Automatic Google sign-in recovery failed: {type(e).__name__}: {e}")
+            return False
+
     async def _ensure_labs_session(self, context, force: bool = False) -> None:
         """Build and publish the Authorization header from the browser's Google cookies (SAPISIDHASH).
 
@@ -658,6 +759,15 @@ class RecaptchaTokenProducer:
                         self._last_session_refresh = asyncio.get_event_loop().time()
                         self._publish_authorization(sapisid_auth, source="Google cookies (SAPISIDHASH)")
                         return
+
+            target_page = next((pg for pg in context.pages if not pg.is_closed()), None)
+            if target_page is not None:
+                await self._recover_flow_session(target_page, context)
+                sapisid_auth = sapisidhash_header(self._cookies, self._settings.flow_base_url)
+                if sapisid_auth:
+                    self._last_session_refresh = asyncio.get_event_loop().time()
+                    self._publish_authorization(sapisid_auth, source="Google cookies (SAPISIDHASH)")
+                    return
 
             raise GoogleNotSignedInError(
                 "Google account is not signed in on flow.google.com "
@@ -792,14 +902,24 @@ class RecaptchaTokenProducer:
         """Navigate to the project page and wait for reCAPTCHA; False if Flow bounced us elsewhere."""
         timeout_ms = self._settings.reload_timeout * 1000
         url = self._project_url(project_id)
-        try:
-            await page.goto(url, timeout=timeout_ms)
-            await self._wait_for_recaptcha(page, timeout_ms)
-        except (asyncio.CancelledError, RecaptchaInterfaceError):
-            raise
-        except Exception as e:
-            logger.warning(f"Project page {url} not ready: {type(e).__name__}: {e} (now at {page.url})")
-            return False
+        for attempt in range(2):
+            try:
+                await page.goto(url, timeout=timeout_ms)
+                if "/about" in page.url and attempt == 0 and self._context is not None:
+                    logger.warning(f"Project {project_id} bounced to {page.url} — attempting Google sign-in recovery")
+                    if await self._recover_flow_session(page, self._context):
+                        continue
+                await self._wait_for_recaptcha(page, timeout_ms)
+            except (asyncio.CancelledError, RecaptchaInterfaceError):
+                raise
+            except Exception as e:
+                if "/about" in page.url and attempt == 0 and self._context is not None:
+                    logger.warning(f"Project {project_id} bounced to {page.url} — attempting Google sign-in recovery")
+                    if await self._recover_flow_session(page, self._context):
+                        continue
+                logger.warning(f"Project page {url} not ready: {type(e).__name__}: {e} (now at {page.url})")
+                return False
+            break
         if project_id not in page.url:
             logger.warning(f"Flow redirected away from project {project_id} to {page.url}")
             return False

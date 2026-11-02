@@ -42,6 +42,7 @@ class DolphinAntyManager:
         self._accounts_rotated: int = 0
         self._was_reset: bool = False
         self._dead_proxies: dict[str, set[str]] = {acc.name: self._load_dead_proxies(acc.directory) for acc in accounts}
+        self._google_creds_cache: dict[str, tuple[str | None, str | None]] = {}
         logger.info(
             f"DolphinAntyManager ready: {len(self._accounts)} profiles, "
             f"active: {self._current.name} (dolphin_id={self._current.dolphin_id})"
@@ -83,6 +84,21 @@ class DolphinAntyManager:
     def forget_browser(self) -> None:
         """Drop the cached endpoint so the next start_current() really restarts the profile."""
         self._current_ws = None
+
+    def stop_current(self) -> None:
+        """Stop the currently selected Dolphin browser profile and clear its cached CDP endpoint."""
+        self._current_ws = None
+        if self._current.dolphin_id:
+            self._local_api.stop(self._current.dolphin_id)
+
+    def current_google_credentials(self) -> tuple[str | None, str | None]:
+        """Return cached (login, password) for the current Dolphin profile from Dolphin Cloud."""
+        did = self._current.dolphin_id
+        if not did:
+            return None, None
+        if did not in self._google_creds_cache:
+            self._google_creds_cache[did] = self._public_api.get_profile_credentials(did)
+        return self._google_creds_cache[did]
 
     @property
     def current_proxy(self) -> ProxyInfo | None:
@@ -136,11 +152,14 @@ class DolphinAntyManager:
 
     @staticmethod
     def _is_proxy_alive(proxy: ProxyInfo) -> bool:
-        try:
-            resp = httpx.get("http://api.ipify.org", proxy=proxy.url, timeout=6.0)
-            return resp.status_code == 200
-        except Exception:
-            return False
+        for url in ("https://api.ipify.org", "https://flow.google.com/about"):
+            try:
+                resp = httpx.get(url, proxy=proxy.url, timeout=7.0)
+                if resp.status_code == 200:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _resolve_working_proxy(self, acc: AccountInfo, proxy: ProxyInfo) -> ProxyInfo:
         """Return `proxy` if alive, else fall back to another entry in proxies.txt or Dolphin Cloud."""

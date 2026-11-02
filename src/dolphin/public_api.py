@@ -76,3 +76,20 @@ class DolphinPublicApi:
         )
         resp.raise_for_status()
         logger.debug(f"Proxy updated on profile {profile_id}: {proxy.host}:{proxy.port}")
+
+    def get_profile_credentials(self, profile_id: str) -> tuple[str | None, str | None]:
+        """Fetch stored Google (login, password) from a Dolphin Anty browser profile, if any."""
+        try:
+            resp = httpx.get(
+                f"{DOLPHIN_PUBLIC_API_BASE}/browser_profiles/{profile_id}",
+                headers=self._headers,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            login = (data.get("login") or "").strip() or None
+            password = (data.get("password") or "").strip() or None
+            return login, password
+        except Exception as e:
+            logger.debug(f"Could not fetch profile credentials for {profile_id}: {e}")
+            return None, None

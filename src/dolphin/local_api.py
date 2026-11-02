@@ -102,6 +102,7 @@ class DolphinLocalApi:
     def start(self, profile_id: str) -> str:
         """Start a profile with automation enabled and return its CDP WebSocket endpoint."""
         url = f"{self._base_url}/v1.0/browser_profiles/{profile_id}/start"
+        stop_url = f"{self._base_url}/v1.0/browser_profiles/{profile_id}/stop"
         with _LOCAL_LOCK:
             try:
                 resp = httpx.post(url, json={"automation": True}, timeout=60.0)
@@ -114,6 +115,14 @@ class DolphinLocalApi:
                     raise DolphinNotRunningError(
                         "Dolphin Anty is not running — auto-recovery could not reach Local API"
                     ) from retry_err
+            if resp.status_code == 409:
+                logger.warning(f"Profile {profile_id} already running (409 Conflict) — stopping and restarting")
+                try:
+                    httpx.get(stop_url, timeout=15.0)
+                    time.sleep(6.0)
+                except Exception as stop_err:
+                    logger.warning(f"Could not stop conflicting profile {profile_id}: {stop_err}")
+                resp = httpx.post(url, json={"automation": True}, timeout=60.0)
             resp.raise_for_status()
             data = resp.json()
             port: int = data["automation"]["port"]
