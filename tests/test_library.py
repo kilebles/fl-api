@@ -51,3 +51,34 @@ def test_projects_and_avatars(tmp_path: Path):
         assert client.delete(f"/api/avatars/{avatar['id']}").status_code == 204
         assert client.delete(f"/api/projects/{project['id']}").status_code == 204
         assert client.get("/api/avatars").json() == []
+
+
+def test_projects_sync_across_databases_via_object_store(tmp_path: Path):
+    shared_storage = tmp_path / "shared_bucket"
+    linux_settings = Settings(
+        _env_file=None,
+        auth_required=False,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'linux.sqlite'}",
+        work_dir=tmp_path / "work_linux",
+        storage_dir=shared_storage,
+        accounts_dir=tmp_path / "accounts_linux",
+    )
+    windows_settings = Settings(
+        _env_file=None,
+        auth_required=False,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'windows.sqlite'}",
+        work_dir=tmp_path / "work_win",
+        storage_dir=shared_storage,
+        accounts_dir=tmp_path / "accounts_win",
+    )
+
+    with TestClient(create_app(linux_settings)) as linux_client:
+        project = linux_client.post("/api/projects", json={"title": "Римская республика", "style": "35mm"}).json()
+
+    with TestClient(create_app(windows_settings)) as win_client:
+        resp = win_client.post(
+            "/api/jobs",
+            json={"mode": "t2v", "project_id": project["id"], "rows": [{"name": "1", "prompt": "p"}]},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["project_id"] == project["id"]

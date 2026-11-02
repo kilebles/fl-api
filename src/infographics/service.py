@@ -25,10 +25,11 @@ from sqlalchemy import (
     String,
     Text,
     delete,
+    or_,
     select,
     update,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, defer, mapped_column
 
 from src.core.db import Base, Database
 from src.core.settings import Settings
@@ -114,26 +115,46 @@ class InfographicsService:
         self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
         self._current: tuple[str, asyncio.Task] | None = None
+        self._stopping = False
 
     async def start(self) -> None:
+        self._stopping = False
         async with self._session() as session:
             await session.execute(
                 update(InfographicRunRecord)
-                .where(InfographicRunRecord.state.in_(ACTIVE_STATES[1:]))
-                .values(state=InfographicState.QUEUED.value)
+                .where(
+                    or_(
+                        InfographicRunRecord.state.in_(ACTIVE_STATES[1:]),
+                        (InfographicRunRecord.state == InfographicState.FAILED.value)
+                        & (InfographicRunRecord.error.like("%exited with code -15%")),
+                    )
+                )
+                .values(state=InfographicState.QUEUED.value, error=None, finished_at=None)
             )
             await session.commit()
         self._worker = asyncio.create_task(self._run_forever(), name="infographics")
 
     async def stop(self) -> None:
+        self._stopping = True
+        tasks: list[asyncio.Task] = []
+        if self._current is not None:
+            self._current[1].cancel()
+            tasks.append(self._current[1])
         if self._worker is not None:
             self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
+            tasks.append(self._worker)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def runs(
         self, limit: int = 100, project_id: str | None = None, user_id: str | None = None
     ) -> list[InfographicRunRecord]:
-        query = select(InfographicRunRecord).order_by(InfographicRunRecord.created_at.desc()).limit(limit)
+        query = (
+            select(InfographicRunRecord)
+            .options(defer(InfographicRunRecord.entries))
+            .order_by(InfographicRunRecord.created_at.desc())
+            .limit(limit)
+        )
         if user_id is not None:
             query = query.where(InfographicRunRecord.user_id == user_id)
         if project_id is not None:
@@ -287,8 +308,13 @@ class InfographicsService:
             shutil.rmtree(work, ignore_errors=True)
             logger.success(f"[infographics] run {run_id}: {len(entries)} cards")
         except asyncio.CancelledError:
+            if self._stopping:
+                await self._set(run_id, state=InfographicState.QUEUED.value, error=None, finished_at=None)
             raise
         except Exception as e:
+            if self._stopping:
+                await self._set(run_id, state=InfographicState.QUEUED.value, error=None, finished_at=None)
+                return
             logger.error(f"[infographics] run {run_id} failed: {type(e).__name__}: {e}")
             await self._set(run_id, state=InfographicState.FAILED.value, error=f"{e}", finished_at=datetime.now())
 
@@ -306,7 +332,13 @@ class InfographicsService:
         with log_path.open("ab") as log:
             log.write(f"=== {stage}: {' '.join(args)}\n".encode())
             log.flush()
-            process = await asyncio.create_subprocess_exec(*args, cwd=cwd, stdout=log, stderr=asyncio.subprocess.STDOUT)
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=cwd,
+                stdout=log,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=(sys.platform != "win32"),
+            )
             try:
                 while True:
                     try:
@@ -317,10 +349,16 @@ class InfographicsService:
                         if entries is not None and videos_dir is not None:
                             await self._upload_videos(run_id, entries, videos_dir)
             except asyncio.CancelledError:
-                process.terminate()
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
                 await process.wait()
                 raise
         await self._progress(run_id, log_path)
+        if self._stopping or code in (-15, -2):
+            logger.info(f"[infographics] run {run_id} {stage} stage interrupted by signal ({code}), will resume on restart")
+            raise asyncio.CancelledError
         if code != 0:
             raise StageError(f"{stage} stage exited with code {code} — see {log_path}")
 

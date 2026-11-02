@@ -169,7 +169,12 @@ async def test_queue_runs_stores_results_and_cancels(tmp_path: Path, monkeypatch
 
     assert status.state is JobState.DONE and status.progress.images_done == 1 and status.progress.videos_done == 1
     assert (await queue.get(second.id)).state is JobState.CANCELLED
-    assert _keys(store) == {f"jobs/{first.id}/1.jpg", f"jobs/{first.id}/1.mp4"}
+    assert _keys(store) == {
+        f"jobs/{first.id}/1.jpg",
+        f"jobs/{first.id}/1.mp4",
+        f"jobs/{first.id}/meta.json",
+        f"jobs/{second.id}/meta.json",
+    }
     assert not (tmp_path / "work" / first.id).exists()
     await repo.close()
 
@@ -330,3 +335,72 @@ async def test_result_sync_uploads_a_regenerated_image_again(tmp_path: Path):
     assert (store.root / "jobs/job1/1.jpg").read_text() == "second"
     assert [f.name for f in await repo.files("job1")] == ["1.jpg"]
     await db.close()
+
+
+async def test_sync_from_store_restores_meta_and_user_id(tmp_path: Path, monkeypatch):
+    from src.core.db import Database
+    from src.jobs.repository import JobRepository
+
+    session = FakeSession("a", tmp_path / "tmp")
+    queue, repo, store = await _queue(tmp_path, _runner_with(tmp_path, monkeypatch, [session]))
+    await queue.start()
+    rows = [JobRow(name="1", prompt="p1", image_prompt="i1")]
+    submitted = await queue.submit(JobRequest(mode=Mode.I2V, title="My Batch", rows=rows), user_id="user_abc")
+    await _until_finished(queue, submitted.id)
+    await queue.stop()
+    await repo.close()
+
+    fresh_db = Database(f"sqlite+aiosqlite:///{tmp_path / 'db2' / 'jobs.db'}")
+    await fresh_db.init()
+    fresh_repo = JobRepository(fresh_db)
+    restored = await fresh_repo.sync_from_store(store)
+    assert restored == 1
+    rec = await fresh_repo.get(submitted.id)
+    assert rec is not None
+    assert rec.user_id == "user_abc"
+    assert rec.title == "My Batch"
+    assert len(await fresh_repo.recent(user_id="user_abc")) == 1
+    assert len(await fresh_repo.recent(user_id="other_user")) == 0
+    await fresh_db.close()
+
+
+def test_dolphin_local_api_auto_recovers_on_connect_error(monkeypatch):
+    import subprocess
+    import httpx
+    from src.dolphin import local_api as la
+
+    monkeypatch.setattr(la.time, "sleep", lambda _: None)
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(la.subprocess, "run", fake_run)
+
+    post_calls = 0
+
+    def fake_post(url, **kwargs):
+        nonlocal post_calls
+        post_calls += 1
+        if post_calls == 1:
+            raise httpx.ConnectError("refused")
+        return httpx.Response(
+            200,
+            json={"automation": {"port": 9222, "wsEndpoint": "/devtools/browser/abc"}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(la.httpx, "post", fake_post)
+    monkeypatch.setattr(
+        la.httpx,
+        "get",
+        lambda url, **kwargs: httpx.Response(200, json=[], request=httpx.Request("GET", url)),
+    )
+
+    api = la.DolphinLocalApi("http://localhost:3001", auto_recover=True, recover_timeout=5.0)
+    ws = api.start("782331246")
+    assert ws == "ws://127.0.0.1:9222/devtools/browser/abc"
+    assert post_calls == 2
+    assert ["taskkill", "/F", "/IM", "anty.exe"] in commands
+    assert ["schtasks", "/Run", "/TN", "start-dolphin-anty"] in commands

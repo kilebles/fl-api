@@ -67,3 +67,56 @@ def test_infographics_api_flow(tmp_path: Path, monkeypatch):
 
         assert client.delete(f"/api/infographics/runs/{run['id']}").status_code == 204
         assert not (tmp_path / "storage" / "infographics" / run["id"]).exists()
+
+
+async def test_infographics_sigterm_is_requeued_not_failed(tmp_path: Path, monkeypatch):
+    import sys
+    from src.core.db import Database
+    from src.storage.objects import LocalObjectStore
+
+    settings = Settings(
+        _env_file=None,
+        auth_required=False,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}",
+        work_dir=tmp_path / "work",
+        storage_dir=tmp_path / "storage",
+        accounts_dir=tmp_path / "accounts",
+    )
+    db = Database(settings.database_url)
+    await db.init()
+    store = LocalObjectStore(settings)
+    await store.ensure_bucket()
+    svc = service_module.InfographicsService(db, store, settings)
+
+    # Simulate a subprocess killed by SIGTERM (exit code -15 on POSIX)
+    if sys.platform != "win32":
+        import asyncio
+        import signal
+
+        log_path = tmp_path / "stage.log"
+        raised_cancelled = False
+        try:
+            await svc._stage(
+                "dummy",
+                "search",
+                [sys.executable, "-c", f"import os, signal; os.kill(os.getpid(), {int(signal.SIGTERM)})"],
+                tmp_path,
+                log_path,
+            )
+        except asyncio.CancelledError:
+            raised_cancelled = True
+        assert raised_cancelled
+
+    # Also verify start() requeues any run previously marked failed with code -15
+    rec = await svc.create("presidents.docx", _docx(), ["people"], False)
+    await svc._set(rec.id, state="failed", error="search stage exited with code -15 — see log.txt")
+    monkeypatch.setattr(service_module.InfographicsService, "_stage", fake_stage)
+    await svc.start()
+    for _ in range(100):
+        cur = await svc.run(rec.id)
+        if cur.state == "done":
+            break
+        await asyncio.sleep(0.02)
+    await svc.stop()
+    assert (await svc.run(rec.id)).state == "done"
+    await db.close()

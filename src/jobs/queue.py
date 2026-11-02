@@ -76,6 +76,27 @@ class JobQueue:
             if key is not None and not await self._objects.exists(key):
                 raise InputNotFoundError(f"uploaded file not found: {key}")
         record = await self._repo.create(uuid.uuid4().hex[:12], request, user_id=user_id)
+        meta = {
+            "id": record.id,
+            "user_id": record.user_id,
+            "title": record.title,
+            "project_id": record.project_id,
+            "mode": record.mode,
+            "strategy": record.strategy,
+            "rows": record.rows,
+            "video_model_key": record.video_model_key,
+            "avatar_key": record.avatar_key,
+            "static_image_key": record.static_image_key,
+            "created_at": record.created_at.isoformat(),
+        }
+        try:
+            await self._objects.put(
+                json.dumps(meta, ensure_ascii=False).encode("utf-8"),
+                f"jobs/{record.id}/meta.json",
+                "meta.json",
+            )
+        except Exception as e:
+            logger.warning(f"[queue] could not store meta.json for job {record.id}: {e}")
         logger.info(f"[queue] job {record.id} queued: {record.mode}, {record.total} rows")
         status = await self._repo.status(record)
         await self._publish(status, record.user_id)

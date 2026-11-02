@@ -90,7 +90,7 @@ def create_app(
         app.state.queue = queue
         app.state.prompts = prompts
         app.state.infographics = infographics = InfographicsService(db, store, settings)
-        app.state.projects = ProjectService(db)
+        app.state.projects = ProjectService(db, store)
         app.state.avatars = AvatarService(db)
         await queue.start()
         await prompts.start()

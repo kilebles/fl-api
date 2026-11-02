@@ -10,7 +10,7 @@ from typing import Any
 
 from loguru import logger
 from sqlalchemy import JSON, DateTime, Integer, String, Text, delete, func, or_, select, update
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, defer, mapped_column
 
 from src.core.db import Base, Database
 from src.prompts.generation import generate_pairs, parse_template
@@ -186,7 +186,12 @@ class PromptService:
     # Runs
 
     async def runs(self, limit: int = 100, project_id: str | None = None, user_id: str | None = None) -> list[PromptRunRecord]:
-        query = select(PromptRunRecord).order_by(PromptRunRecord.created_at.desc()).limit(limit)
+        query = (
+            select(PromptRunRecord)
+            .options(defer(PromptRunRecord.rows))
+            .order_by(PromptRunRecord.created_at.desc())
+            .limit(limit)
+        )
         if user_id is not None:
             query = query.where(PromptRunRecord.user_id == user_id)
         if project_id is not None:

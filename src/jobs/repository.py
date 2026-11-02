@@ -254,6 +254,7 @@ class JobRepository:
                     if meta:
                         mode = Mode(meta.get("mode", Mode.I2V.value))
                         rows = meta.get("rows") or [{"name": r, "prompt": f"Сцена {r}", "image_prompt": f"Кадр {r}"} for r in row_names]
+                        user_id = meta.get("user_id")
                         title = meta.get("title")
                         project_id = meta.get("project_id")
                         strategy = meta.get("strategy", Strategy.PARALLEL.value)
@@ -265,6 +266,7 @@ class JobRepository:
                     else:
                         if not jfiles:
                             continue
+                        user_id = None
                         if "image" in kinds and "video" in kinds:
                             mode = Mode.I2V
                             rows = [{"name": r, "prompt": f"Сцена {r}", "image_prompt": f"Кадр {r}"} for r in row_names]
@@ -297,6 +299,7 @@ class JobRepository:
 
                     record = JobRecord(
                         id=job_id,
+                        user_id=user_id,
                         title=title,
                         project_id=project_id,
                         mode=mode.value,
