@@ -668,13 +668,14 @@ class RecaptchaTokenProducer:
                 if clicked:
                     continue
 
-                email_inp = page.locator('input[type="email"]').first
-                if email and await email_inp.count() and await email_inp.is_visible():
+                email_inp = page.locator('#identifierId, input[name="identifier"], input[type="email"]').first
+                if email and ("signin/identifier" in page.url or (await email_inp.count() and await email_inp.is_visible())):
+                    await email_inp.wait_for(state="visible", timeout=8_000)
                     await email_inp.fill(email)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.6)
                     await page.locator('#identifierNext button, button:has-text("Next"), button:has-text("Далее")').first.click(timeout=5_000)
                     logger.info("Auto-login: submitted Google email")
-                    await asyncio.sleep(4.0)
+                    await asyncio.sleep(4.5)
                     continue
 
                 if "confirmidentifier" in page.url:
@@ -682,22 +683,34 @@ class RecaptchaTokenProducer:
                     if await nxt.count() and await nxt.is_visible():
                         await nxt.click(timeout=5_000)
                         logger.info("Auto-login: confirmed Google identifier")
-                        await asyncio.sleep(4.0)
+                        await asyncio.sleep(4.5)
                         continue
 
-                pw_inp = page.locator('input[type="password"]').first
+                if "challenge/selection" in page.url and password:
+                    pwd_opt = page.locator('div[role="link"]:has-text("Enter your password"), li:has-text("Enter your password")').first
+                    if await pwd_opt.count() and await pwd_opt.is_visible():
+                        await pwd_opt.click(timeout=5_000)
+                        logger.info("Auto-login: selected password challenge")
+                        await asyncio.sleep(4.5)
+                        continue
+
+                pw_inp = page.locator('input[type="password"], input[name="Passwd"]').first
                 if password and await pw_inp.count() and await pw_inp.is_visible():
                     await pw_inp.fill(password)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.6)
                     await page.locator('#passwordNext button, button:has-text("Next"), button:has-text("Далее")').first.click(timeout=5_000)
                     logger.info("Auto-login: submitted Google password")
                     await asyncio.sleep(6.0)
                     continue
 
                 if any(h in page.url for h in ("gds.google.com", "myaccount.google.com", "accounts.google.com")):
+                    if any(ch in page.url for ch in ("challenge/", "speedbump/idvreenable", "disabled")):
+                        break
                     interstitial = False
-                    for txt in ("Cancel", "Отмена", "Not now", "Не сейчас", "Skip", "Пропустить", "Continue", "Продолжить", "I understand", "Понятно", "Confirm", "Подтвердить"):
-                        btn = page.locator(f'button:has-text("{txt}"), div[role="button"]:has-text("{txt}"), a:has-text("{txt}")').first
+                    for txt in ("Cancel", "Отмена", "Not now", "Не сейчас", "Skip", "Пропустить", "Continue", "Продолжить", "I understand", "Понятно", "Remind me later", "Done"):
+                        btn = page.get_by_role("button", name=txt).first
+                        if not await btn.count():
+                            btn = page.get_by_role("link", name=txt).first
                         if await btn.count() and await btn.is_visible():
                             await btn.click(timeout=5_000)
                             logger.info(f"Auto-login: dismissed interstitial '{txt}'")
