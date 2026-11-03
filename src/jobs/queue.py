@@ -50,13 +50,14 @@ class JobQueue:
         self._subscribers: set[tuple[str | None, asyncio.Queue[JobStatus]]] = set()
         self._stopping = False
 
-    async def start(self) -> None:
-        await self._repo.sync_from_store(self._objects)
+    async def start(self, background_sync: bool = False) -> None:
+        if not background_sync:
+            await self._repo.sync_from_store(self._objects)
         requeued = await self._repo.requeue_interrupted()
         if requeued:
             logger.info(f"[queue] {requeued} interrupted job(s) queued again")
         if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._run_forever(), name="job_queue")
+            self._worker = asyncio.create_task(self._run_forever(sync_first=background_sync), name="job_queue")
 
     async def sync(self) -> int:
         return await self._repo.sync_from_store(self._objects)
@@ -195,7 +196,17 @@ class JobQueue:
         await self._repo.update(job_id, **fields)
         await self._publish_id(job_id)
 
-    async def _run_forever(self) -> None:
+    async def _run_forever(self, sync_first: bool = False) -> None:
+        if sync_first:
+            try:
+                await self._repo.sync_from_store(self._objects)
+                requeued = await self._repo.requeue_interrupted()
+                if requeued:
+                    logger.info(f"[queue] {requeued} synced interrupted job(s) queued again")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[queue] startup store sync failed: {e}")
         while True:
             record = await self._repo.next_queued()
             if record is None:

@@ -92,7 +92,7 @@ def create_app(
         app.state.infographics = infographics = InfographicsService(db, store, settings)
         app.state.projects = ProjectService(db, store)
         app.state.avatars = AvatarService(db)
-        await queue.start()
+        await queue.start(background_sync=True)
         await prompts.start()
         await infographics.start()
         try:
