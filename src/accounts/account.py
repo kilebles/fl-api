@@ -7,10 +7,11 @@ from src.accounts.proxy import ProxyInfo
 
 
 class AccountInfo(BaseModel):
-    """One Google account: its Dolphin Anty profile, proxies and persisted Flow project."""
+    """One Google account: its browser profile ID/UUID, proxies and persisted Flow project."""
 
     directory: Path
     dolphin_id: str | None = None
+    octo_uuid: str | None = None
     proxies: list[ProxyInfo] = []
     project_id: str | None = None
 
@@ -41,11 +42,40 @@ class AccountInfo(BaseModel):
         except OSError as e:
             logger.warning(f"Could not remove project_id for {self.directory.name}: {e}")
 
+    def local_credentials(self) -> tuple[str | None, str | None]:
+        """Read optional `credentials.txt` (`login:password` or two lines) for auto-relogin."""
+        creds_path = self.directory / "credentials.txt"
+        if not creds_path.exists():
+            return None, None
+        lines = [ln.strip() for ln in creds_path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+        if not lines:
+            return None, None
+        if len(lines) >= 2 and ":" not in lines[0]:
+            return lines[0], lines[1]
+        if ":" in lines[0]:
+            login, password = lines[0].split(":", 1)
+            return login.strip() or None, password.strip() or None
+        return None, None
+
+    def for_provider(self, provider: str = "dolphin") -> "AccountInfo | None":
+        """Resolve the active profile identifier for `dolphin` or `octo`."""
+        if provider == "octo":
+            pid = self.octo_uuid or (self.dolphin_id if self.dolphin_id and not self.dolphin_id.isdigit() else None)
+            if not pid:
+                return None
+            return self.model_copy(update={"dolphin_id": pid})
+        if not self.dolphin_id:
+            return None
+        return self
+
     @classmethod
     def load(cls, directory: Path) -> "AccountInfo":
         """Load account credentials and proxy list from directory."""
         dolphin_id_path = directory / "dolphin_id.txt"
-        dolphin_id = dolphin_id_path.read_text().strip() if dolphin_id_path.exists() else None
+        dolphin_id = dolphin_id_path.read_text().strip() or None if dolphin_id_path.exists() else None
+
+        octo_uuid_path = directory / "octo_uuid.txt"
+        octo_uuid = octo_uuid_path.read_text().strip() or None if octo_uuid_path.exists() else None
 
         project_id_path = directory / "project_id.txt"
         project_id = project_id_path.read_text().strip() or None if project_id_path.exists() else None
@@ -65,6 +95,7 @@ class AccountInfo(BaseModel):
         return cls(
             directory=directory,
             dolphin_id=dolphin_id,
+            octo_uuid=octo_uuid,
             proxies=proxies,
             project_id=project_id,
         )

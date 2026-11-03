@@ -11,6 +11,7 @@ from src.core.settings import Settings
 from src.dolphin import cooldowns
 from src.dolphin.local_api import DolphinLocalApi
 from src.dolphin.manager import DolphinAntyManager
+from src.dolphin.octo_api import OctoLocalApi, OctoPublicApi
 from src.dolphin.public_api import DolphinPublicApi
 from src.engine.chain import run_chain
 from src.engine.scheduler import BatchOptions, BatchScheduler, scaled_poll_pause
@@ -45,8 +46,12 @@ class JobRunner:
     def __init__(self, settings: Settings, accounts: AccountRepository) -> None:
         self._settings = settings
         self._accounts = accounts
-        self._public_api = DolphinPublicApi(settings.anty_token)
-        self._local_api = DolphinLocalApi(settings.anty_local_api)
+        if settings.browser_provider == "octo":
+            self._public_api = OctoPublicApi(settings.octo_api_token)
+            self._local_api = OctoLocalApi(settings.octo_local_api)
+        else:
+            self._public_api = DolphinPublicApi(settings.anty_token)
+            self._local_api = DolphinLocalApi(settings.anty_local_api, anty_token=settings.anty_token)
 
     async def run(
         self,
@@ -59,9 +64,14 @@ class JobRunner:
         `output` lets the caller share the result state (e.g. with files already moved to
         the object store); by default it is read from `spec.output_dir`.
         """
-        accounts = [a for a in self._accounts.active() if not self._settings.accounts_enabled or a.name in self._settings.accounts_enabled]
+        provider = self._settings.browser_provider
+        accounts = [
+            a
+            for a in self._accounts.active(provider=provider)
+            if not self._settings.accounts_enabled or a.name in self._settings.accounts_enabled
+        ]
         if not accounts:
-            raise NoAccountsError(f"No accounts with dolphin_id in {self._accounts.root}")
+            raise NoAccountsError(f"No accounts configured for provider={provider} in {self._accounts.root}")
 
         output = output or JobOutput(spec)
         output.directory.mkdir(parents=True, exist_ok=True)

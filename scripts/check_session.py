@@ -28,6 +28,7 @@ from src.accounts.repository import AccountRepository
 from src.flow.credentials import CredentialsService
 from src.dolphin.local_api import DolphinLocalApi
 from src.dolphin.manager import DolphinAntyManager
+from src.dolphin.octo_api import OctoLocalApi, OctoPublicApi
 from src.dolphin.public_api import DolphinPublicApi
 from src.flow.downloader import VideoDownloaderService
 from src.flow.google_auth import auth_scheme
@@ -38,8 +39,9 @@ from src.flow.video import VideoGenerationService
 
 
 def _load_account(name: str | None) -> AccountInfo:
-    repo = AccountRepository(get_settings().accounts_dir)
-    accounts = repo.active()
+    settings = get_settings()
+    repo = AccountRepository(settings.accounts_dir)
+    accounts = repo.active(provider=settings.browser_provider)
     if name:
         matches = [a for a in accounts if a.name == name]
         if not matches:
@@ -47,7 +49,7 @@ def _load_account(name: str | None) -> AccountInfo:
             sys.exit(1)
         return matches[0]
     if not accounts:
-        logger.error(f"No accounts with dolphin_id found in {repo.root}")
+        logger.error(f"No accounts configured for {settings.browser_provider} in {repo.root}")
         sys.exit(1)
     return accounts[0]
 
@@ -64,7 +66,13 @@ async def main() -> None:
     account = _load_account(args.account)
     logger.info(f"Using {account.name} (dolphin_id={account.dolphin_id}, persisted project={account.project_id})")
 
-    dolphin_manager = DolphinAntyManager([account], DolphinPublicApi(settings.anty_token), DolphinLocalApi(settings.anty_local_api))
+    if settings.browser_provider == "octo":
+        pub_api = OctoPublicApi(settings.octo_api_token)
+        loc_api = OctoLocalApi(settings.octo_local_api)
+    else:
+        pub_api = DolphinPublicApi(settings.anty_token)
+        loc_api = DolphinLocalApi(settings.anty_local_api, anty_token=settings.anty_token)
+    dolphin_manager = DolphinAntyManager([account], pub_api, loc_api)
     ws_url = await asyncio.to_thread(dolphin_manager.start_current)
     logger.info(f"Dolphin profile started @ {ws_url}")
 

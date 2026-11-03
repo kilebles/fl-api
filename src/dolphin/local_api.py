@@ -27,12 +27,41 @@ class DolphinLocalApi:
         self,
         base_url: str = "http://localhost:3001",
         *,
+        anty_token: str = "",
         auto_recover: bool | None = None,
         recover_timeout: float = 35.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._anty_token = anty_token.strip()
         self._auto_recover = (sys.platform == "win32") if auto_recover is None else auto_recover
         self._recover_timeout = recover_timeout
+
+    def _login_with_token(self) -> bool:
+        """Authenticate the Dolphin Anty desktop app using ANTY_TOKEN when its session expires."""
+        if not self._anty_token:
+            return False
+        try:
+            resp = httpx.post(
+                f"{self._base_url}/v1.0/auth/login-with-token",
+                json={"token": self._anty_token},
+                timeout=20.0,
+            )
+            if resp.status_code == 200:
+                logger.info("Authenticated Dolphin Anty Local API via ANTY_TOKEN")
+                return True
+            logger.warning(f"Dolphin login-with-token returned {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Dolphin login-with-token failed: {e}")
+        return False
+
+    @staticmethod
+    def _is_token_error(resp: httpx.Response) -> bool:
+        if resp.status_code == 401:
+            return True
+        if resp.status_code >= 500:
+            body = resp.text.lower()
+            return any(k in body for k in ("token", "unauthorized", "invalid session", "jwt", "auth"))
+        return False
 
     def stop(self, profile_id: str) -> None:
         """Stop a profile; failures are logged, never raised (the profile may not be running)."""
@@ -96,6 +125,7 @@ class DolphinLocalApi:
         self._launch_dolphin_app()
         soft_wait = min(15.0, self._recover_timeout)
         if self._wait_local_api(soft_wait):
+            self._login_with_token()
             return True
 
         logger.warning("Soft recovery did not restore Local API; killing orphaned anty.exe and retrying...")
@@ -105,6 +135,7 @@ class DolphinLocalApi:
             logger.warning(f"Could not run taskkill on anty.exe: {e}")
         self._launch_dolphin_app()
         if self._wait_local_api(max(5.0, self._recover_timeout - soft_wait)):
+            self._login_with_token()
             return True
 
         logger.error(f"Dolphin Anty Local API did not recover within {self._recover_timeout:.0f}s")
@@ -138,6 +169,20 @@ class DolphinLocalApi:
                 except Exception as stop_err:
                     logger.warning(f"Could not stop conflicting profile {profile_id}: {stop_err}")
                 resp = httpx.post(url, json={"automation": True}, timeout=60.0)
+            if self._anty_token and self._is_token_error(resp):
+                logger.warning(
+                    f"Dolphin returned {resp.status_code} ({resp.text[:160]}) starting profile {profile_id} "
+                    f"— re-authenticating Local API with ANTY_TOKEN"
+                )
+                if self._login_with_token():
+                    resp = httpx.post(url, json={"automation": True}, timeout=60.0)
+                    if resp.status_code == 409:
+                        try:
+                            httpx.get(stop_url, timeout=15.0)
+                            time.sleep(6.0)
+                        except Exception:
+                            pass
+                        resp = httpx.post(url, json={"automation": True}, timeout=60.0)
             resp.raise_for_status()
             data = resp.json()
             port: int = data["automation"]["port"]

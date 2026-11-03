@@ -18,13 +18,22 @@ class Settings(BaseSettings):
     log_level: str = Field(default="SUCCESS", description="Minimum log level (DEBUG, INFO, SUCCESS, WARNING, ERROR, CRITICAL)")
     monitor_url: str | None = Field(default=None, description="flow-stat base URL, e.g. http://192.168.1.100:8080")
 
-    # Dolphin Anty
+    # Antidetect browser backend ("dolphin" or "octo")
+    browser_provider: Literal["dolphin", "octo"] = Field(
+        default="dolphin",
+        description="Browser automation provider: 'dolphin' (Dolphin Anty) or 'octo' (Octo Browser)",
+    )
     anty_token: str = Field(default="", description="Dolphin Anty JWT token")
     anty_local_api: str = Field(default="http://localhost:3001", description="Dolphin Anty Local API base URL")
+    octo_api_token: str = Field(default="", description="Octo Browser Cloud API token (X-Octo-Api-Token)")
+    octo_local_api: str = Field(default="http://localhost:58888", description="Octo Browser Local API base URL")
 
     # Storage
     accounts_dir: Path = Field(default=Path("accounts"), description="Directory with account_N/ folders")
-    accounts_enabled: list[str] = Field(default=[], description='Accounts jobs may use, e.g. ["account_1","account_2"]; empty = every account with a dolphin_id')
+    accounts_enabled: Annotated[list[str], NoDecode] = Field(
+        default=[],
+        description='Accounts jobs may use, e.g. "account_1,account_2" or ["account_1","account_2"]; empty = every configured account',
+    )
     output_dir: Path = Field(default=Path("output"), description="Root directory for job results")
     download_dir: Path = Field(default=Path("work/_tmp"), description="Scratch directory for downloads before they are renamed into a job folder")
     work_dir: Path = Field(default=Path("work"), description="API jobs: local work folders, removed once results are in the object store")
@@ -67,7 +76,7 @@ class Settings(BaseSettings):
     first_user_admin: bool = Field(default=True, description="Grant admin role to the first registered user and claim legacy unowned rows")
     cors_origins: Annotated[list[str], NoDecode] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"], description="Origins of the web frontend")
 
-    @field_validator("admin_emails", "cors_origins", mode="before")
+    @field_validator("accounts_enabled", "admin_emails", "cors_origins", mode="before")
     @classmethod
     def _parse_str_list(cls, value: Any) -> list[str]:
         if value is None:

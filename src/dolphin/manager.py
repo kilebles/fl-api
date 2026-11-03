@@ -92,7 +92,10 @@ class DolphinAntyManager:
             self._local_api.stop(self._current.dolphin_id)
 
     def current_google_credentials(self) -> tuple[str | None, str | None]:
-        """Return cached (login, password) for the current Dolphin profile from Dolphin Cloud."""
+        """Return cached (login, password) from local `credentials.txt` or browser cloud API."""
+        local_login, local_pw = self._current.local_credentials()
+        if local_login and local_pw:
+            return local_login, local_pw
         did = self._current.dolphin_id
         if not did:
             return None, None

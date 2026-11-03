@@ -437,3 +437,89 @@ def test_dolphin_local_api_restarts_on_409_conflict(monkeypatch):
     assert ws == "ws://127.0.0.1:9333/devtools/browser/xyz"
     assert post_calls == 2
     assert stopped == ["http://localhost:3001/v1.0/browser_profiles/782332520/stop"]
+
+
+def test_dolphin_local_api_relogins_on_token_refresh_500(monkeypatch):
+    import httpx
+    from src.dolphin import local_api as la
+
+    monkeypatch.setattr(la.time, "sleep", lambda _: None)
+    calls: list[tuple[str, dict | None]] = []
+    logged_in = False
+
+    def fake_post(url, **kwargs):
+        nonlocal logged_in
+        calls.append((url, kwargs.get("json")))
+        if url.endswith("/v1.0/auth/login-with-token"):
+            logged_in = True
+            return httpx.Response(200, json={"success": True}, request=httpx.Request("POST", url))
+        if not logged_in:
+            return httpx.Response(
+                500,
+                json={"success": False, "error": "Token refresh timeout after 30 seconds"},
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={"automation": {"port": 9444, "wsEndpoint": "/devtools/browser/reauthed"}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(la.httpx, "post", fake_post)
+
+    api = la.DolphinLocalApi("http://localhost:3001", anty_token="jwt-secret", auto_recover=False)
+    ws = api.start("782331246")
+    assert ws == "ws://127.0.0.1:9444/devtools/browser/reauthed"
+    assert [u for u, _ in calls] == [
+        "http://localhost:3001/v1.0/browser_profiles/782331246/start",
+        "http://localhost:3001/v1.0/auth/login-with-token",
+        "http://localhost:3001/v1.0/browser_profiles/782331246/start",
+    ]
+
+
+def test_octo_browser_adapter_and_account_selection(tmp_path: Path, monkeypatch):
+    import httpx
+    from src.dolphin import octo_api as oa
+
+    monkeypatch.setattr(oa.time, "sleep", lambda _: None)
+    acc1 = tmp_path / "accounts" / "account_1"
+    acc2 = tmp_path / "accounts" / "account_2"
+    acc1.mkdir(parents=True)
+    acc2.mkdir(parents=True)
+    (acc1 / "dolphin_id.txt").write_text("782331246\n")
+    (acc1 / "octo_uuid.txt").write_text("2bbfd1dbaf3349cf979787f15a9e413d\n")
+    (acc2 / "dolphin_id.txt").write_text("782332520\n")
+
+    repo = AccountRepository(tmp_path / "accounts")
+    dolphin_active = repo.active(provider="dolphin")
+    octo_active = repo.active(provider="octo")
+    assert [a.dolphin_id for a in dolphin_active] == ["782331246", "782332520"]
+    assert [(a.name, a.dolphin_id) for a in octo_active] == [("account_1", "2bbfd1dbaf3349cf979787f15a9e413d")]
+
+    posts: list[tuple[str, dict | None]] = []
+
+    def fake_post(url, **kwargs):
+        posts.append((url, kwargs.get("json")))
+        if len(posts) == 1:
+            return httpx.Response(400, json={"error": "Profile already started"}, request=httpx.Request("POST", url))
+        if url.endswith("/api/profiles/force_stop"):
+            return httpx.Response(200, json={"msg": "ok"}, request=httpx.Request("POST", url))
+        return httpx.Response(
+            200,
+            json={"ws_endpoint": "ws://127.0.0.1:55834/devtools/browser/octo-1"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(oa.httpx, "post", fake_post)
+    local = oa.OctoLocalApi("http://localhost:58888", auto_recover=False)
+    ws = local.start("2bbfd1dbaf3349cf979787f15a9e413d")
+    assert ws == "ws://127.0.0.1:55834/devtools/browser/octo-1"
+    assert [u for u, _ in posts] == [
+        "http://localhost:58888/api/profiles/start",
+        "http://localhost:58888/api/profiles/force_stop",
+        "http://localhost:58888/api/profiles/start",
+    ]
+
+    s = Settings(_env_file=None, accounts_enabled="account_1, account_2", browser_provider="octo")
+    assert s.accounts_enabled == ["account_1", "account_2"]
+    assert s.browser_provider == "octo"

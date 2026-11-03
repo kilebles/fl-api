@@ -37,9 +37,14 @@ class AccountRepository:
         """All accounts, including ones without a dolphin_id yet."""
         return [AccountInfo.load(self._root / name) for name in self.names()]
 
-    def active(self) -> list[AccountInfo]:
-        """Accounts that can run: those with a dolphin_id."""
-        return [a for a in self.all() if a.dolphin_id]
+    def active(self, provider: str = "dolphin") -> list[AccountInfo]:
+        """Accounts that can run for the selected browser provider (`dolphin` or `octo`)."""
+        result: list[AccountInfo] = []
+        for acc in self.all():
+            resolved = acc.for_provider(provider)
+            if resolved is not None:
+                result.append(resolved)
+        return result
 
     def create(self, dolphin_id: str) -> AccountInfo:
         """Create the next `account_N` directory for a Dolphin profile."""
