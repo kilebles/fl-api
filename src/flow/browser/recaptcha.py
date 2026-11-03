@@ -666,38 +666,83 @@ class RecaptchaTokenProducer:
             except Exception as e:
                 logger.debug(f"Could not load Google TOTP secret for auto-login: {e}")
 
-        signin_url = (
-            "https://accounts.google.com/ServiceLogin?passive=1209600&osid=1"
-            f"&continue={self._settings.flow_base_url}/&followup={self._settings.flow_base_url}/"
-        )
         timeout_ms = self._settings.reload_timeout * 1000
         try:
-            await page.goto(signin_url, timeout=timeout_ms)
-            await asyncio.sleep(3.0)
-            for _ in range(10):
+            if "/about" in page.url and page.url.startswith(self._settings.flow_base_url):
+                create_btn = page.locator(
+                    'button:has-text("Create with Google Flow"), button:has-text("Create with Flow"), '
+                    'a:has-text("Create with Google Flow")'
+                ).first
+                if await create_btn.count() and await create_btn.is_visible():
+                    await create_btn.click(timeout=8_000)
+                    logger.info("Auto-login: clicked 'Create with Google Flow'")
+                    await asyncio.sleep(4.0)
+            if "accounts.google.com" not in page.url and (
+                not page.url.startswith(self._settings.flow_base_url) or "/about" in page.url
+            ):
+                signin_url = (
+                    "https://accounts.google.com/v3/signin/accountchooser"
+                    f"?continue={self._settings.flow_base_url}/&flowName=GlifWebSignIn&flowEntry=ServiceLogin"
+                )
+                await page.goto(signin_url, timeout=timeout_ms)
+                await asyncio.sleep(3.0)
+
+            chooser_clicked = False
+            for _ in range(12):
                 cur = page.url
                 if cur.startswith(self._settings.flow_base_url) and "/about" not in cur:
                     break
 
-                chooser_selectors = (
-                    (f'div[data-identifier="{email}"]', 'div[data-identifier]', 'div[data-email]')
-                    if email
-                    else ('div[data-identifier]', 'div[data-email]')
-                )
-                clicked = False
-                for sel in chooser_selectors:
-                    loc = page.locator(sel).first
-                    if await loc.count() and await loc.is_visible():
-                        await loc.click(timeout=5_000)
-                        logger.info(f"Auto-login: clicked chooser {sel}")
-                        await asyncio.sleep(3.5)
-                        clicked = True
-                        break
-                if clicked:
-                    continue
+                if "/about" in cur and cur.startswith(self._settings.flow_base_url):
+                    create_btn = page.locator(
+                        'button:has-text("Create with Google Flow"), button:has-text("Create with Flow"), '
+                        'a:has-text("Create with Google Flow")'
+                    ).first
+                    if await create_btn.count() and await create_btn.is_visible():
+                        await create_btn.click(timeout=8_000)
+                        logger.info("Auto-login: clicked 'Create with Google Flow' after auth")
+                        await asyncio.sleep(4.5)
+                        continue
 
-                email_inp = page.locator('#identifierId, input[name="identifier"], input[type="email"]').first
-                if email and ("signin/identifier" in page.url or (await email_inp.count() and await email_inp.is_visible())):
+                # Dismiss post-login interstitials (e.g. gds.google.com/web/recoveryoptions) BEFORE matching input[type="email"]
+                if any(h in cur for h in ("gds.google.com", "myaccount.google.com")):
+                    interstitial = False
+                    for txt in ("Cancel", "Отмена", "Not now", "Не сейчас", "Skip", "Пропустить", "Continue", "Продолжить", "I understand", "Понятно", "Remind me later", "Done"):
+                        btn = page.get_by_role("button", name=txt).first
+                        if not await btn.count():
+                            btn = page.get_by_role("link", name=txt).first
+                        if await btn.count() and await btn.is_visible():
+                            await btn.click(timeout=5_000)
+                            logger.info(f"Auto-login: dismissed interstitial '{txt}' on {cur.split('?')[0]}")
+                            await asyncio.sleep(4.0)
+                            interstitial = True
+                            break
+                    if interstitial:
+                        continue
+
+                if not chooser_clicked and "accountchooser" in cur:
+                    chooser_selectors = (
+                        (f'[data-identifier="{email}"]', '[data-identifier]', 'li div[role="link"]')
+                        if email
+                        else ('[data-identifier]', 'li div[role="link"]')
+                    )
+                    clicked = False
+                    for sel in chooser_selectors:
+                        loc = page.locator(sel).first
+                        if await loc.count() and await loc.is_visible():
+                            await loc.click(timeout=5_000)
+                            chooser_clicked = True
+                            logger.info(f"Auto-login: clicked chooser {sel}")
+                            await asyncio.sleep(4.0)
+                            clicked = True
+                            break
+                    if clicked:
+                        continue
+
+                email_inp = page.locator('#identifierId, input[name="identifier"]').first
+                if email and "gds.google.com" not in cur and (
+                    "signin/identifier" in cur or (await email_inp.count() and await email_inp.is_visible())
+                ):
                     await email_inp.wait_for(state="visible", timeout=8_000)
                     await email_inp.fill(email)
                     await asyncio.sleep(0.6)
@@ -787,6 +832,17 @@ class RecaptchaTokenProducer:
             if not page.url.startswith(self._settings.flow_base_url) or "/about" in page.url:
                 await page.goto(self._settings.labs_url, timeout=timeout_ms)
                 await asyncio.sleep(4.0)
+                if "/about" in page.url:
+                    create_btn = page.locator(
+                        'button:has-text("Create with Google Flow"), button:has-text("Create with Flow"), '
+                        'a:has-text("Create with Google Flow")'
+                    ).first
+                    if await create_btn.count() and await create_btn.is_visible():
+                        await create_btn.click(timeout=8_000)
+                        await asyncio.sleep(4.0)
+                        if "accounts.google.com" in page.url:
+                            await self._click_through_google_prompt(page)
+                            await asyncio.sleep(4.0)
 
             await self._extract_cookies(context)
             self._publish_cookies()
