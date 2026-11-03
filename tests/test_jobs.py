@@ -689,3 +689,50 @@ async def test_runner_waits_and_recovers_on_octo_not_running(tmp_path: Path, mon
     final_state, progress, _ = await runner.run(spec, on_progress=on_progress)
     assert final_state is JobState.DONE and progress.videos_done == 1
     assert JobState.WAITING in states
+    assert session.started is False
+
+
+async def test_max_active_browsers_caps_concurrency_and_rotates_standby(tmp_path: Path):
+    import asyncio
+    from src.core.errors import RateLimitError
+    from src.engine.scheduler import BatchOptions, BatchScheduler, WorkItem
+
+    sessions = [FakeSession(f"acc_{i}", tmp_path / "tmp") for i in range(5)]
+    peak_open = 0
+
+    for s in sessions:
+        orig_start = s.ensure_started
+
+        async def tracked_start(sess=s, orig=orig_start):
+            nonlocal peak_open
+            await orig()
+            now_open = sum(1 for x in sessions if x.started)
+            peak_open = max(peak_open, now_open)
+
+        s.ensure_started = tracked_start
+
+    # Make the first two accounts hit long cooldown after 1 video so standby accounts take over their slots
+    for s in sessions[:2]:
+        orig_sub = s.submit_video
+        count = {"n": 0}
+
+        async def limited_submit(index, prompt, image=None, frame=None, model_key=None, sess=s, orig=orig_sub, c=count):
+            if c["n"] >= 1:
+                sess.on_cooldown = True
+                sess.cooldown_remaining = 7200.0
+                raise RateLimitError("daily quota")
+            c["n"] += 1
+            await asyncio.sleep(0.02)
+            return await orig(index, prompt, image=image, frame=frame, model_key=model_key)
+
+        s.submit_video = limited_submit
+
+    items = [WorkItem(index=i, name=str(i), video_prompt=f"p{i}") for i in range(6)]
+    stats = await BatchScheduler(
+        sessions,
+        BatchOptions(output_dir=tmp_path / "out", max_active_browsers=2),
+    ).run(items)
+
+    assert stats.done == 6
+    assert peak_open <= 2
+    assert sum(1 for x in sessions if x.started) == 0

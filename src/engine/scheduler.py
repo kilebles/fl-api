@@ -6,7 +6,8 @@ import math
 import random
 import shutil
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -86,6 +87,7 @@ class BatchOptions:
     video_model_key: str | None = None
     reference_image: Path | None = None
     max_retries: int = 5
+    max_active_browsers: int = 0
 
 
 @dataclass
@@ -211,8 +213,13 @@ class BatchScheduler:
             else:
                 state.pending.discard(item.index)
 
+        slot_sem = (
+            asyncio.Semaphore(self._options.max_active_browsers)
+            if self._options.max_active_browsers > 0
+            else None
+        )
         workers = [
-            asyncio.create_task(self._worker(_Worker(session), state), name=f"worker_{session.name}")
+            asyncio.create_task(self._worker(_Worker(session), state, slot_sem), name=f"worker_{session.name}")
             for session in self._sessions
         ]
         watchdog = asyncio.create_task(self._watchdog(workers, state))
@@ -242,56 +249,104 @@ class BatchScheduler:
 
     # ── worker ────────────────────────────────────────────────────────────
 
-    async def _worker(self, w: _Worker, state: _BatchState) -> None:
+    @staticmethod
+    @asynccontextmanager
+    async def _slot(slot_sem: asyncio.Semaphore | None) -> AsyncIterator[None]:
+        if slot_sem is None:
+            yield
+            return
+        async with slot_sem:
+            yield
+
+    async def _worker(
+        self,
+        w: _Worker,
+        state: _BatchState,
+        slot_sem: asyncio.Semaphore | None = None,
+    ) -> None:
         session = w.session
-        if not session.can_rotate and not self._has_work_for(session, state):
+        pooled = slot_sem is not None and len(self._sessions) > self._options.max_active_browsers
+
+        while state.fatal is None and state.pending:
+            if not session.can_rotate and not self._has_work_for(session, state):
+                rem = getattr(session, "cooldown_remaining", 0.0)
+                if 0 < rem <= MAX_WORKER_COOLDOWN_SLEEP:
+                    logger.info(f"[{w.name}] waiting {rem / 60:.1f}m for temporary cooldown before acquiring browser")
+                    await self._sleep_until_ready_or_done(session, state, rem + 2.0)
+                elif pooled and (session.can_make_videos() or session.can_make_images()):
+                    # Account can work one queue (e.g. videos), wait until items arrive in it without holding a browser slot
+                    await asyncio.sleep(PICK_POLL_INTERVAL)
+                    continue
+                if not state.pending or state.fatal is not None:
+                    return
+                if not self._has_work_for(session, state):
+                    if pooled and (session.can_make_videos() or session.can_make_images()):
+                        continue
+                    logger.warning(f"[{w.name}] skipped — the account cannot do any of the queued work (cooldown or no model access)")
+                    return
+
+            async with self._slot(slot_sem):
+                if state.fatal is not None or not state.pending:
+                    return
+                if not session.can_rotate and not self._has_work_for(session, state):
+                    continue
+                try:
+                    await session.ensure_started()
+                except FATAL_ERRORS as e:
+                    state.fatal = e
+                    return
+                except Exception as e:
+                    logger.error(f"[{w.name}] could not start: {type(e).__name__}: {e} — worker exits")
+                    await session.close(stop_browser=True)
+                    return
+
+                try:
+                    idle_rotations = 0
+                    while state.fatal is None:
+                        await self._wait_global_cooldown(w.name)
+                        picked = await self._pick(session, state, pooled=pooled)
+                        if picked is None:
+                            if session.can_rotate and self._stuck(session, state) and idle_rotations < session.account_count:
+                                idle_rotations += 1
+                                logger.warning(f"[{w.name}] cannot do any queued work — rotating")
+                                try:
+                                    await session.rotate()
+                                except FATAL_ERRORS as e:
+                                    state.fatal = e
+                                except Exception as e:
+                                    logger.error(f"[{w.name}] rotation failed: {type(e).__name__}: {e}")
+                                    break
+                                continue
+                            break
+                        idle_rotations = 0
+                        kind, item = picked
+
+                        if item.retries > self._options.max_retries:
+                            logger.warning(f"[{w.name}] {item.name} exceeded max retries ({self._options.max_retries}), skipping")
+                            await self._settle(state, item, "failed", skip_reason=f"Max retries exceeded ({self._options.max_retries})")
+                            continue
+
+                        if not getattr(session, "is_running", True):
+                            await session.ensure_started()
+
+                        if kind == "image":
+                            stop = await self._run_image(w, state, item)
+                        else:
+                            stop = await self._run_video(w, state, item)
+                        if stop:
+                            break
+                finally:
+                    if pooled or session.on_cooldown or not (session.can_make_videos() or session.can_make_images()):
+                        await session.close(stop_browser=True)
+
+            if session.can_rotate or state.fatal is not None or not state.pending:
+                return
             rem = getattr(session, "cooldown_remaining", 0.0)
             if 0 < rem <= MAX_WORKER_COOLDOWN_SLEEP:
-                logger.info(f"[{w.name}] waiting {rem / 60:.1f}m for temporary cooldown before joining pass")
-                await self._sleep_until_ready_or_done(session, state, rem + 2.0)
-            if not self._has_work_for(session, state):
-                logger.warning(f"[{w.name}] skipped — the account cannot do any of the queued work (cooldown or no model access)")
-                return
-        try:
-            await session.ensure_started()
-        except FATAL_ERRORS as e:
-            state.fatal = e
-            return
-        except Exception as e:
-            logger.error(f"[{w.name}] could not start: {type(e).__name__}: {e} — worker exits")
-            return
-
-        idle_rotations = 0
-        while state.fatal is None:
-            await self._wait_global_cooldown(w.name)
-            picked = await self._pick(session, state)
-            if picked is None:
-                if session.can_rotate and self._stuck(session, state) and idle_rotations < session.account_count:
-                    idle_rotations += 1
-                    logger.warning(f"[{w.name}] cannot do any queued work — rotating")
-                    try:
-                        await session.rotate()
-                    except FATAL_ERRORS as e:
-                        state.fatal = e
-                    except Exception as e:
-                        logger.error(f"[{w.name}] rotation failed: {type(e).__name__}: {e}")
-                        break
-                    continue
-                break
-            idle_rotations = 0
-            kind, item = picked
-
-            if item.retries > self._options.max_retries:
-                logger.warning(f"[{w.name}] {item.name} exceeded max retries ({self._options.max_retries}), skipping")
-                await self._settle(state, item, "failed", skip_reason=f"Max retries exceeded ({self._options.max_retries})")
                 continue
-
-            if kind == "image":
-                stop = await self._run_image(w, state, item)
-            else:
-                stop = await self._run_video(w, state, item)
-            if stop:
-                break
+            if pooled and (session.can_make_videos() or session.can_make_images()):
+                continue
+            return
 
     def _has_work_for(self, session: AccountSession, state: _BatchState) -> bool:
         return (session.can_make_videos() and not state.video_queue.empty()) or (
@@ -303,11 +358,11 @@ class BatchScheduler:
         queued = not state.video_queue.empty() or not state.image_queue.empty()
         return bool(state.pending) and queued and not self._has_work_for(session, state)
 
-    async def _pick(self, session: AccountSession, state: _BatchState) -> tuple[str, WorkItem] | None:
+    async def _pick(self, session: AccountSession, state: _BatchState, pooled: bool = False) -> tuple[str, WorkItem] | None:
         """Next job for the session: a ready video first, otherwise an image.
 
         Returns None when the batch is settled, the drain timeout passed, or the account
-        can do neither kind of job.
+        can do neither kind of job (or yields its pooled browser slot to another account).
         """
         while True:
             videos_ok = session.can_make_videos()
@@ -325,15 +380,16 @@ class BatchScheduler:
             if not state.pending or asyncio.get_running_loop().time() > state.deadline:
                 return None
             if not videos_ok and not images_ok:
-                rem = getattr(session, "cooldown_remaining", 0.0)
-                if not session.can_rotate and 0 < rem <= MAX_WORKER_COOLDOWN_SLEEP and state.fatal is None:
-                    await asyncio.sleep(min(rem + 1.0, PICK_POLL_INTERVAL))
-                    continue
+                return None
+            if pooled and self._stuck(session, state):
+                # Yield browser slot so a standby account that CAN work the non-empty queue takes over
                 return None
             queue, kind = (state.video_queue, "video") if videos_ok else (state.image_queue, "image")
             try:
                 return kind, await asyncio.wait_for(queue.get(), timeout=PICK_POLL_INTERVAL)
             except asyncio.TimeoutError:
+                if pooled and not state.pending:
+                    return None
                 continue
 
     async def _run_image(self, w: _Worker, state: _BatchState, item: WorkItem) -> bool:
@@ -457,11 +513,10 @@ class BatchScheduler:
             if 0 < rem <= MAX_WORKER_COOLDOWN_SLEEP:
                 logger.warning(
                     f"[{w.name}] account on temporary cooldown ({rem / 60:.1f}m) — "
-                    f"{item.name} re-queued, worker sleeping until cooldown expires"
+                    f"{item.name} re-queued, closing browser until cooldown expires"
                 )
-                await self._sleep_until_ready_or_done(w.session, state, rem + 2.0)
-                return False
-            logger.warning(f"[{w.name}] account on cooldown — {item.name} re-queued, worker exits")
+            else:
+                logger.warning(f"[{w.name}] account on cooldown — {item.name} re-queued, worker exits")
             return True
         delay = _ip_backoff(item.retries) if isinstance(e, IpProhibitedError) else _backoff(w.fails)
         logger.warning(f"[{w.name}] {type(e).__name__} on {item.name} (attempt {item.retries}/{self._options.max_retries}), re-queued, backing off {delay:.0f}s")

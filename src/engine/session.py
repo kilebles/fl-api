@@ -218,10 +218,12 @@ class AccountSession:
         else:
             self._manager.forget_browser()
 
-    async def close(self) -> None:
-        """Stop the producer; the browser keeps running so the next job can reuse it."""
+    async def close(self, stop_browser: bool = False) -> None:
+        """Stop the producer; optionally stop the browser profile to free RAM and sync cloud cookies."""
         await self._stop_producer()
         self._stop_generations = False
+        if stop_browser:
+            await self._stop_browser_quietly()
 
     async def rotate(self) -> None:
         """Rotate now (e.g. the current account cannot do any of the queued work)."""
@@ -653,7 +655,9 @@ class AccountSession:
             if not self._stop_generations:
                 return
             if not self.can_rotate and self.on_cooldown:
-                logger.warning(f"[{self.name}] on cooldown — not restarting, the session stays paused")
+                logger.warning(f"[{self.name}] on cooldown — stopping browser to free RAM while session stays paused")
+                await self._stop_producer()
+                await self._stop_browser_quietly()
                 return
 
             while True:

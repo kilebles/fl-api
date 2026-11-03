@@ -40,16 +40,21 @@ class FakeSession:
         self.sources: list[Path | None] = []
 
     def can_make_images(self) -> bool:
-        return self._images
+        return not self.on_cooldown and self._images
 
     def can_make_videos(self) -> bool:
-        return self._videos
+        return not self.on_cooldown and self._videos
+
+    @property
+    def is_running(self) -> bool:
+        return self.started
 
     async def ensure_started(self) -> None:
         self.started = True
 
-    async def close(self) -> None:
-        pass
+    async def close(self, stop_browser: bool = False) -> None:
+        if stop_browser:
+            self.started = False
 
     async def rotate(self) -> None:
         pass

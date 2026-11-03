@@ -127,7 +127,7 @@ class JobRunner:
                     logger.warning(f"[job] {message}")
                     await report(JobState.WAITING, message)
                     for session in sessions:
-                        await session.close()
+                        await session.close(stop_browser=True)
                     await asyncio.sleep(wait)
                     prev_progress = None
                     continue
@@ -144,7 +144,12 @@ class JobRunner:
                         clips = [(row.name, row.prompt) for row in spec.rows]
                         await run_chain(sessions[0], clips, output.directory, first_model_key=model_key, on_change=on_change)
                     else:
-                        options = BatchOptions(output_dir=output.directory, video_model_key=model_key, reference_image=spec.avatar)
+                        options = BatchOptions(
+                            output_dir=output.directory,
+                            video_model_key=model_key,
+                            reference_image=spec.avatar,
+                            max_active_browsers=self._settings.max_active_browsers,
+                        )
                         await BatchScheduler(sessions, options, on_change=on_change).run(output.work_items(missing))
                 except DolphinNotRunningError as e:
                     if infra_retries >= INFRA_MAX_RETRIES:
@@ -157,7 +162,7 @@ class JobRunner:
                     logger.warning(f"[job] {message}")
                     await report(JobState.WAITING, message)
                     for session in sessions:
-                        await session.close()
+                        await session.close(stop_browser=True)
                     await asyncio.sleep(INFRA_RETRY_WAIT)
                     prev_progress = None
                     continue
@@ -167,7 +172,7 @@ class JobRunner:
             return await self._finish(JobState.FAILED, output, pass_num, message, report)
         finally:
             for session in sessions:
-                await session.close()
+                await session.close(stop_browser=True)
 
     def _make_sessions(self, accounts: list[AccountInfo], strategy: Strategy) -> list[AccountSession]:
         if strategy is Strategy.SEQUENTIAL:

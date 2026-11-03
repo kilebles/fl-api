@@ -141,8 +141,13 @@ class Settings(BaseSettings):
         description="Image model for flowMedia:batchGenerateImages; BELUGA = Nano Banana 2.1 in the Flow UI (GEM_PIX_2, HARBOR_SEAL also accepted; NARWHAL retired 2026-10-05)",
     )
 
-    # Rotation
+    # Rotation & Concurrency
     rotate_every_generations: int = Field(default=300, description="Rotate account after this many successful generations")
+    max_active_browsers: int = Field(
+        default=4,
+        ge=0,
+        description="Max browser profiles open simultaneously in parallel mode (0 = unlimited)",
+    )
 
 
 @lru_cache
