@@ -59,6 +59,7 @@ class ImageGenerationService:
         browser_headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         reference_media_ids: list[str] | None = None,
+        model_name: str | None = None,
     ) -> list[str]:
         """
         Submit a text-to-image generation request to Flow API.
@@ -70,6 +71,7 @@ class ImageGenerationService:
             recaptcha_token: Valid reCAPTCHA Enterprise token.
             reference_media_ids: Media ids of uploaded pictures the model must keep
                 (image-to-image, e.g. an avatar). Uses the request's `imageInputs`.
+            model_name: Explicit Flow image model enum (defaults to settings.image_model_name).
 
         Returns:
             List of media IDs for the generated images.
@@ -77,8 +79,9 @@ class ImageGenerationService:
         Raises:
             httpx.HTTPStatusError: If API returns non-200 response.
         """
+        effective_model = model_name or self._settings.image_model_name
         logger.info(
-            f"Sending image generation request ({self._settings.image_model_name}): {prompt}"
+            f"Sending image generation request ({effective_model}): {prompt}"
             + (f" (reference media: {reference_media_ids})" if reference_media_ids else "")
         )
 
@@ -100,7 +103,7 @@ class ImageGenerationService:
                     clientContext=client_context,
                     seed=seed,
                     imageInputs=[ImageInput(name=m) for m in reference_media_ids or []],
-                    imageModelName=self._settings.image_model_name,
+                    imageModelName=effective_model,
                     structuredPrompt=StructuredPrompt(parts=[TextPart(text=prompt)]),
                 )
             ],

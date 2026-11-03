@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     first_user_admin: bool = Field(default=True, description="Grant admin role to the first registered user and claim legacy unowned rows")
     cors_origins: Annotated[list[str], NoDecode] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"], description="Origins of the web frontend")
 
-    @field_validator("accounts_enabled", "admin_emails", "cors_origins", mode="before")
+    @field_validator("accounts_enabled", "admin_emails", "cors_origins", "image_model_names", mode="before")
     @classmethod
     def _parse_str_list(cls, value: Any) -> list[str]:
         if value is None:
@@ -138,8 +138,24 @@ class Settings(BaseSettings):
     f2v_model_key: str = Field(default="abra_t2v_10s", description="Frame-to-video model for f2v clips after the first one")
     image_model_name: str = Field(
         default="BELUGA",
-        description="Image model for flowMedia:batchGenerateImages; BELUGA = Nano Banana 2.1 in the Flow UI (GEM_PIX_2, HARBOR_SEAL also accepted; NARWHAL retired 2026-10-05)",
+        description="Primary image model for flowMedia:batchGenerateImages; BELUGA = Nano Banana 2.1, GEM_PIX_2 = Nano Banana Pro",
     )
+    image_model_names: Annotated[list[str], NoDecode] = Field(
+        default=["BELUGA", "GEM_PIX_2"],
+        description="Ordered image models tried per account (BELUGA = Nano Banana 2.1, GEM_PIX_2 = Nano Banana Pro); switches on per-model quota/404",
+    )
+
+    @property
+    def image_models(self) -> list[str]:
+        """Ordered deduplicated list of image models to use."""
+        raw = list(self.image_model_names)
+        if "image_model_name" in self.model_fields_set and "image_model_names" not in self.model_fields_set:
+            raw = [self.image_model_name, *raw]
+        seen: list[str] = []
+        for model in raw:
+            if model and model not in seen:
+                seen.append(model)
+        return seen or [self.image_model_name]
 
     # Rotation & Concurrency
     rotate_every_generations: int = Field(default=300, description="Rotate account after this many successful generations")

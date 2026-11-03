@@ -31,7 +31,7 @@ from src.dolphin.manager import DolphinAntyManager
 from src.flow.browser.recaptcha import RecaptchaTokenProducer
 from src.flow.credentials import CredentialsService
 from src.flow.downloader import VideoDownloaderService
-from src.flow.http import MODEL_ACCESS_DENIED, QUOTA_REACHED, TOO_MUCH_TRAFFIC, error_reason
+from src.flow.http import MODEL_ACCESS_DENIED, QUOTA_REACHED, TOO_MUCH_TRAFFIC, USER_QUOTA_REACHED, error_reason
 from src.flow.image import ImageGenerationService
 from src.flow.polling import PollingService
 from src.flow.video import VideoGenerationService
@@ -48,6 +48,8 @@ DELAY_403 = (7.0, 14.0)
 DELAY_403_REPEAT = (30.0, 60.0)
 DELAY_PROXY_ERROR = (4.0, 9.0)
 DELAY_429_STEPS = (7.0, 30.0, 90.0)  # pause for all requests of the session after the 1st, 2nd, 3rd consecutive 429
+DELAY_USER_QUOTA_STEPS = (15.0, 30.0, 60.0)  # pause when concurrent in-flight video slots per user are full
+USER_QUOTA_REQUEUE_LIMIT = 5
 DELAY_TRAFFIC_STEPS = (120.0, 300.0, 600.0)  # pause on 429 TOO_MUCH_TRAFFIC (no rotation)
 TRAFFIC_QUIET_RESET = 900.0
 TOKEN_TIMEOUT = 120.0
@@ -121,6 +123,7 @@ class AccountSession:
         self._successful_generations = 0
         self._consecutive_403s = 0
         self._consecutive_429s = 0
+        self._consecutive_user_quota_429s = 0
         self._consecutive_proxy_errors = 0
         self._auth_failures = 0
         self._proxy_failures: dict[str, int] = {}
@@ -156,7 +159,10 @@ class AccountSession:
 
     def can_make_images(self) -> bool:
         did = self._manager.current.dolphin_id
-        return cooldowns.cooldown_remaining(did) <= 0 and cooldowns.image_cooldown_remaining(did) <= 0
+        return (
+            cooldowns.cooldown_remaining(did) <= 0
+            and cooldowns.pick_image_model(did, self._settings.image_models) is not None
+        )
 
     def can_make_videos(self) -> bool:
         did = self._manager.current.dolphin_id
@@ -348,14 +354,22 @@ class AccountSession:
     async def make_image(self, index: int, prompt: str, dest: Path, reference: Path | None = None) -> Path:
         """Generate one image and save it as `dest`.
 
+        Tries configured image models in order (BELUGA = Nano Banana 2.1 -> GEM_PIX_2 = Nano Banana Pro):
+        when one model hits its per-model daily quota, the session immediately switches to the next.
         With `reference` the picture is uploaded to the project once and passed as an
         image input, so the generated image keeps its subject (avatar mode).
         """
         logger.info(f"[{index}] image: {prompt[:50]}..." + (f" (reference {reference.name})" if reference else ""))
         used_proxy: list[str | None] = [None]
+        used_model: list[str | None] = [None]
 
         async def call(token: str, proxy_url: str | None) -> list[str]:
             async with self._generate_lock:
+                did = self._manager.current.dolphin_id
+                model_name = cooldowns.pick_image_model(did, self._settings.image_models)
+                if model_name is None:
+                    raise ImageQuotaError(f"[{index}] all image models on cooldown on {self.name}")
+                used_model[0] = model_name
                 used_proxy[0] = proxy_url
                 reference_ids = [await self._reference_media_id(reference, proxy_url)] if reference else None
                 return await self._image.generate(
@@ -367,9 +381,12 @@ class AccountSession:
                     browser_headers=self._credentials.browser_headers or None,
                     cookies=dict(self._downloader.cookies) or None,
                     reference_media_ids=reference_ids,
+                    model_name=model_name,
                 )
 
-        media_ids = await self._request(index, "image", call, kind="image", action="IMAGE_GENERATION")
+        media_ids = await self._request(
+            index, "image", call, kind="image", action="IMAGE_GENERATION", image_model_ref=used_model
+        )
         if not media_ids:
             raise RuntimeError(f"[{index}] No media returned from image generation")
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -388,6 +405,7 @@ class AccountSession:
         call: Callable[[str, str | None], Awaitable[T]],
         kind: str = "video",
         action: str | None = None,
+        image_model_ref: list[str | None] | None = None,
     ) -> T:
         """Run `call(token, proxy_url)` until it succeeds, applying the session's recovery policy."""
         delay = 0.0
@@ -415,7 +433,8 @@ class AccountSession:
             try:
                 result = await call(token, self._manager.current_proxy_url)
             except httpx.HTTPStatusError as e:
-                delay = await self._handle_http_error(index, label, kind, e)
+                failed_model = image_model_ref[0] if image_model_ref else None
+                delay = await self._handle_http_error(index, label, kind, e, image_model=failed_model)
                 continue
             except (httpx.ProxyError, httpx.TransportError) as e:
                 self._consecutive_proxy_errors += 1
@@ -441,10 +460,17 @@ class AccountSession:
                 raise
 
             self._producer.report_success()
-            self._on_accepted(kind)
+            self._on_accepted(kind, image_model=image_model_ref[0] if image_model_ref else None)
             return result
 
-    async def _handle_http_error(self, index: int, label: str, kind: str, e: httpx.HTTPStatusError) -> float:
+    async def _handle_http_error(
+        self,
+        index: int,
+        label: str,
+        kind: str,
+        e: httpx.HTTPStatusError,
+        image_model: str | None = None,
+    ) -> float:
         """React to an API error; returns the pause before the retry or raises to give the item up."""
         status = e.response.status_code
         reason = error_reason(e.response)
@@ -467,14 +493,25 @@ class AccountSession:
 
         if status == 429:
             if reason == QUOTA_REACHED and kind == "image":
-                cooldowns.mark_image_cooldown(account.dolphin_id, account.name)
-                raise ImageQuotaError(f"[{index}] image quota reached on {account.name}") from e
+                return self._switch_or_raise_image_quota(index, account, image_model, e, "quota reached")
             if reason == QUOTA_REACHED:
                 secs = self._manager.mark_current_on_cooldown(max_seconds=DAILY_QUOTA_COOLDOWN_MAX)
                 logger.bind(event_type="quota", account=account.name).warning(f"[{index}] Daily quota exhausted — {account.name} on cooldown {secs / 60:.0f}m")
                 self._stop_generations = True
                 await self._rotate_account()
                 raise RateLimitError("Daily quota exhausted") from e
+            if reason == USER_QUOTA_REACHED and kind == "video":
+                self._consecutive_user_quota_429s += 1
+                if self._consecutive_user_quota_429s >= USER_QUOTA_REQUEUE_LIMIT:
+                    self._consecutive_user_quota_429s = 0
+                    raise RateLimitError("Concurrent user video slots full") from e
+                pause = DELAY_USER_QUOTA_STEPS[min(self._consecutive_user_quota_429s, len(DELAY_USER_QUOTA_STEPS)) - 1]
+                self._resume_at = max(self._resume_at, asyncio.get_running_loop().time() + pause)
+                logger.bind(event_type="429", account=account.name).info(
+                    f"[{index}] Concurrent video slots full on {account.name} "
+                    f"({self._consecutive_user_quota_429s}/{USER_QUOTA_REQUEUE_LIMIT}) — waiting {pause:.0f}s for an in-flight render"
+                )
+                return 0.0
             if reason == TOO_MUCH_TRAFFIC:
                 self._pause_for_traffic(index)
                 if self._traffic_429s >= 3:
@@ -508,11 +545,13 @@ class AccountSession:
             logger.bind(event_type="filtered", account=account.name).warning(f"[{index}] HTTP 400 ({reason}) — skipping {label}")
             raise GenerationFilteredError(f"400 {reason}") from e
 
+        if status == 404 and kind == "image":
+            return self._switch_or_raise_image_quota(index, account, image_model, e, "model 404 / retired")
+
         if status == 403:
             if reason == MODEL_ACCESS_DENIED:
                 if kind == "image":
-                    cooldowns.mark_image_cooldown(account.dolphin_id, account.name)
-                    raise ImageQuotaError(f"[{index}] image model access denied on {account.name}") from e
+                    return self._switch_or_raise_image_quota(index, account, image_model, e, "model access denied")
                 cooldowns.mark_video_denied(account.dolphin_id, account.name)
                 raise VideoAccessDeniedError(f"[{index}] no access to the video model on {account.name}") from e
             self._consecutive_429s = 0
@@ -533,6 +572,21 @@ class AccountSession:
             raise ConsecutiveFailuresError("403 limit reached") from e
 
         raise e
+
+    def _switch_or_raise_image_quota(
+        self,
+        index: int,
+        account,
+        image_model: str | None,
+        err: httpx.HTTPStatusError,
+        cause: str,
+    ) -> float:
+        """Mark `image_model` unavailable on `account`; retry immediately if a fallback model is free."""
+        models = self._settings.image_models
+        cooldowns.mark_image_cooldown(account.dolphin_id, account.name, model=image_model, models=models)
+        if cooldowns.pick_image_model(account.dolphin_id, models) is not None:
+            return 0.0
+        raise ImageQuotaError(f"[{index}] image {cause} across all models ({models}) on {account.name}") from err
 
     def _count_403(self, index: int) -> _Count403:
         if self._stop_generations:
@@ -574,16 +628,17 @@ class AccountSession:
             f"[{index}] HTTP 429 TOO_MUCH_TRAFFIC #{self._traffic_429s} — pausing {self.name} for {pause / 60:.0f}m, no rotation"
         )
 
-    def _on_accepted(self, kind: str) -> None:
+    def _on_accepted(self, kind: str, image_model: str | None = None) -> None:
         account = self._manager.current
         self._consecutive_403s = 0
         self._consecutive_429s = 0
+        self._consecutive_user_quota_429s = 0
         self._consecutive_proxy_errors = 0
         self._auth_failures = 0
         self._proxy_failures.pop(self._manager.current_proxy_key, None)
         self._manager.reset_cooldown(account)
         if kind == "image":
-            cooldowns.reset_image_cooldown(account.dolphin_id)
+            cooldowns.reset_image_cooldown(account.dolphin_id, model=image_model)
         else:
             cooldowns.reset_video_denied(account.dolphin_id)
 

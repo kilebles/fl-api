@@ -184,18 +184,22 @@ class JobRunner:
             for account in accounts
         ]
 
-    @staticmethod
-    def _cooldown_wait(accounts: list[AccountInfo], images_needed: bool) -> float:
+    def _cooldown_wait(self, accounts: list[AccountInfo], images_needed: bool) -> float:
         """Seconds until at least one account can work again; 0 when any account is free now.
 
-        With `images_needed` an account also counts as busy while its image quota lasts,
-        otherwise while its videos are paused (no access to the video model).
+        With `images_needed` an account also counts as busy while all its image models are on
+        cooldown, otherwise while its videos are paused (no access to the video model).
         """
         waits = []
+        image_models = self._settings.image_models
         for account in accounts:
             wait = cooldowns.cooldown_remaining(account.dolphin_id)
-            extra = cooldowns.image_cooldown_remaining if images_needed else cooldowns.video_denied_remaining
-            waits.append(max(wait, extra(account.dolphin_id)))
+            extra = (
+                cooldowns.image_cooldown_remaining(account.dolphin_id, image_models)
+                if images_needed
+                else cooldowns.video_denied_remaining(account.dolphin_id)
+            )
+            waits.append(max(wait, extra))
         return min(waits) if waits and min(waits) > 0 else 0.0
 
     @staticmethod

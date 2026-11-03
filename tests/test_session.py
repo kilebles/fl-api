@@ -119,7 +119,15 @@ def no_waits(monkeypatch):
     monkeypatch.setattr(session_module, "DELAY_403", (0.0, 0.0))
     monkeypatch.setattr(session_module, "DELAY_403_REPEAT", (0.0, 0.0))
     monkeypatch.setattr(session_module, "DELAY_429_STEPS", (0.0, 0.0, 0.0))
-    for registry in (cooldowns._COOLDOWNS, cooldowns._COOLDOWN_HITS, cooldowns._IMAGE_COOLDOWNS, cooldowns._IMAGE_COOLDOWN_HITS):
+    monkeypatch.setattr(session_module, "DELAY_USER_QUOTA_STEPS", (0.0, 0.0, 0.0))
+    for registry in (
+        cooldowns._COOLDOWNS,
+        cooldowns._COOLDOWN_HITS,
+        cooldowns._IMAGE_COOLDOWNS,
+        cooldowns._IMAGE_COOLDOWN_HITS,
+        cooldowns._MODEL_IMAGE_COOLDOWNS,
+        cooldowns._MODEL_IMAGE_COOLDOWN_HITS,
+    ):
         registry.clear()
 
 
@@ -184,16 +192,60 @@ async def test_400_is_a_permanent_skip(tmp_path: Path):
 
 async def test_image_quota_pauses_only_images(tmp_path: Path):
     session, manager, _ = await _session(tmp_path, 1, [])
+    models_tried: list[str | None] = []
 
     class QuotaImage:
         async def generate(self, **kwargs):
+            models_tried.append(kwargs.get("model_name"))
             raise _error(429, "PUBLIC_ERROR_PER_MODEL_DAILY_QUOTA_REACHED")
 
     session._image = QuotaImage()
     with pytest.raises(ImageQuotaError):
         await session.make_image(0, "p", tmp_path / "x.jpg")
 
+    assert models_tried == ["BELUGA", "GEM_PIX_2"]
     assert not session.can_make_images() and session.can_make_videos() and manager.rotations == 0
+    await session.close()
+
+
+async def test_image_quota_falls_back_from_beluga_to_nano_banana_pro(tmp_path: Path):
+    session, manager, _ = await _session(tmp_path, 1, [])
+    models_tried: list[str | None] = []
+
+    class BelugaExhaustedImage:
+        async def generate(self, **kwargs):
+            model = kwargs.get("model_name")
+            models_tried.append(model)
+            if model == "BELUGA":
+                raise _error(429, "PUBLIC_ERROR_PER_MODEL_DAILY_QUOTA_REACHED")
+            return ["img-1"]
+
+        async def download(self, media_id: str, cookies: dict, proxy_url=None) -> Path:
+            p = tmp_path / f"{media_id}.jpg"
+            p.write_bytes(b"jpg")
+            return p
+
+    session._image = BelugaExhaustedImage()
+    out1 = await session.make_image(0, "p1", tmp_path / "1.jpg")
+    out2 = await session.make_image(1, "p2", tmp_path / "2.jpg")
+
+    assert out1.exists() and out2.exists()
+    # First call hits BELUGA quota and switches to GEM_PIX_2; second call goes straight to GEM_PIX_2!
+    assert models_tried == ["BELUGA", "GEM_PIX_2", "GEM_PIX_2"]
+    assert session.can_make_images() and manager.rotations == 0
+    await session.close()
+
+
+async def test_video_user_quota_waits_without_proxy_penalty(tmp_path: Path):
+    session, manager, video = await _session(
+        tmp_path, 2, [_error(429, "PUBLIC_ERROR_USER_QUOTA_REACHED")] * 3
+    )
+
+    submitted = await session.submit_video(0, "p")
+
+    assert submitted.media_id == "m"
+    assert video.calls == 4 and manager.rotations == 0
+    assert not session._proxy_failures
     await session.close()
 
 

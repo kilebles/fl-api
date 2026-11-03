@@ -42,6 +42,7 @@ from src.flow.models import (
 from src.flow.credentials import CredentialsService
 from src.dolphin.local_api import DolphinLocalApi
 from src.dolphin.manager import DolphinAntyManager
+from src.dolphin.octo_api import OctoLocalApi, OctoPublicApi
 from src.dolphin.public_api import DolphinPublicApi
 from src.flow.http import api_headers
 from src.flow.image import ImageGenerationService
@@ -74,17 +75,17 @@ DEFAULT_CANDIDATES = [
 PROMPT = "a red apple on a wooden table, studio light"
 
 
-def _load_account(name: str | None) -> AccountInfo:
+def _load_account(name: str | None, provider: str = "dolphin") -> AccountInfo:
     repo = AccountRepository(get_settings().accounts_dir)
-    accounts = repo.active()
+    accounts = repo.active(provider=provider)
     if name:
         matches = [a for a in accounts if a.name == name]
         if not matches:
-            logger.error(f"Account {name} not found in {repo.root}")
+            logger.error(f"Account {name} not found for provider={provider} in {repo.root}")
             sys.exit(1)
         return matches[0]
     if not accounts:
-        logger.error(f"No accounts with dolphin_id found in {repo.root}")
+        logger.error(f"No accounts configured for provider={provider} in {repo.root}")
         sys.exit(1)
     return accounts[0]
 
@@ -166,10 +167,19 @@ async def main() -> None:
 
     setup_logger("INFO")
     settings = get_settings()
-    account = _load_account(args.account)
-    logger.info(f"Using {account.name} (dolphin_id={account.dolphin_id}); current IMAGE_MODEL_NAME={settings.image_model_name}")
+    account = _load_account(args.account, provider=settings.browser_provider)
+    logger.info(
+        f"Using {account.name} (id={account.dolphin_id}, provider={settings.browser_provider}); "
+        f"current IMAGE_MODELS={settings.image_models}"
+    )
 
-    dolphin_manager = DolphinAntyManager([account], DolphinPublicApi(settings.anty_token), DolphinLocalApi(settings.anty_local_api))
+    if settings.browser_provider == "octo":
+        public_api = OctoPublicApi(settings.octo_api_token)
+        local_api = OctoLocalApi(settings.octo_local_api, octo_api_token=settings.octo_api_token, public_api=public_api)
+    else:
+        public_api = DolphinPublicApi(settings.anty_token)
+        local_api = DolphinLocalApi(settings.anty_local_api, anty_token=settings.anty_token)
+    dolphin_manager = DolphinAntyManager([account], public_api, local_api)
     ws_url = await asyncio.to_thread(dolphin_manager.start_current)
     credentials = CredentialsService(origin=settings.flow_base_url)
     credentials.reload(account)
