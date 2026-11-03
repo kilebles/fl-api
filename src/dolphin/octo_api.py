@@ -16,6 +16,14 @@ from src.dolphin.local_api import DolphinNotRunningError
 OCTO_PUBLIC_API_BASE = "https://app.octobrowser.net/api/v2/automation"
 _OCTO_LOCAL_LOCK = threading.Lock()
 _OCTO_TASK = "start-octo-browser"
+_OCTO_CHROME_FLAGS = [
+    "--disable-backgrounding-occluded-windows",
+    "--noerrdialogs",
+    "--hide-crash-restore-bubble",
+    "--disable-session-crashed-bubble",
+    "--window-size=1280,800",
+    "--window-position=60,40",
+]
 
 
 class OctoNotRunningError(DolphinNotRunningError):
@@ -281,7 +289,7 @@ class OctoLocalApi:
             "headless": False,
             "debug_port": True,
             "timeout": 120,
-            "flags": ["--disable-backgrounding-occluded-windows"],
+            "flags": list(_OCTO_CHROME_FLAGS),
         }
         with _OCTO_LOCAL_LOCK:
             try:

@@ -159,10 +159,10 @@ class DolphinAntyManager:
 
     @staticmethod
     def _is_proxy_alive(proxy: ProxyInfo) -> bool:
-        for url in ("https://api.ipify.org", "https://flow.google.com/about"):
+        for url in ("https://labs.google/fx/tools/flow", "https://api.ipify.org"):
             try:
                 resp = httpx.get(url, proxy=proxy.url, timeout=7.0)
-                if resp.status_code == 200:
+                if 200 <= resp.status_code < 400:
                     return True
             except Exception:
                 continue
