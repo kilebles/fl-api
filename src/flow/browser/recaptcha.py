@@ -1,6 +1,11 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import random
 import re
+import struct
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -110,6 +115,19 @@ def _is_recaptcha_not_ready(exc: BaseException) -> bool:
     return any(marker in text for marker in _RECAPTCHA_NOT_READY_MARKERS)
 
 
+def generate_totp(secret: str, timestamp: float | None = None) -> str:
+    """Compute a 6-digit RFC 6238 TOTP code from a Base32 secret."""
+    normalized = "".join(ch for ch in secret.strip().upper() if ch.isalnum())
+    pad = (-len(normalized)) % 8
+    key = base64.b32decode(normalized + ("=" * pad), casefold=True)
+    ts = int(time.time() if timestamp is None else timestamp)
+    counter = struct.pack(">Q", ts // 30)
+    digest = hmac.new(key, counter, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = (struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF) % 1_000_000
+    return f"{code:06d}"
+
+
 class RecaptchaTokenProducer:
     """
     Connects to an existing Chrome instance via CDP and generates reCAPTCHA tokens on demand.
@@ -147,6 +165,7 @@ class RecaptchaTokenProducer:
         self.on_authorization: Callable[[str], None] | None = None
         self.on_cookies: Callable[[dict[str, str]], None] | None = None
         self.google_credentials_loader: Callable[[], tuple[str | None, str | None]] | None = None
+        self.google_totp_loader: Callable[[], str | None] | None = None
         self._last_session_refresh: float = 0.0
         self._seen_api_paths: set[str] = set()
         self._seen_rpc_ids: set[str] = set()
@@ -635,11 +654,17 @@ class RecaptchaTokenProducer:
     async def _recover_flow_session(self, page: Page, context) -> bool:
         """Sign back into Google / Flow when redirected to /about or accounts.google.com."""
         email, password = (None, None)
+        totp_secret: str | None = None
         if self.google_credentials_loader is not None:
             try:
                 email, password = await asyncio.to_thread(self.google_credentials_loader)
             except Exception as e:
                 logger.debug(f"Could not load Google credentials for auto-login: {e}")
+        if self.google_totp_loader is not None:
+            try:
+                totp_secret = await asyncio.to_thread(self.google_totp_loader)
+            except Exception as e:
+                logger.debug(f"Could not load Google TOTP secret for auto-login: {e}")
 
         signin_url = (
             "https://accounts.google.com/ServiceLogin?passive=1209600&osid=1"
@@ -649,7 +674,7 @@ class RecaptchaTokenProducer:
         try:
             await page.goto(signin_url, timeout=timeout_ms)
             await asyncio.sleep(3.0)
-            for _ in range(6):
+            for _ in range(10):
                 cur = page.url
                 if cur.startswith(self._settings.flow_base_url) and "/about" not in cur:
                     break
@@ -689,13 +714,24 @@ class RecaptchaTokenProducer:
                         await asyncio.sleep(4.5)
                         continue
 
-                if "challenge/selection" in page.url and password:
-                    pwd_opt = page.locator('div[role="link"]:has-text("Enter your password"), li:has-text("Enter your password")').first
-                    if await pwd_opt.count() and await pwd_opt.is_visible():
-                        await pwd_opt.click(timeout=5_000)
-                        logger.info("Auto-login: selected password challenge")
-                        await asyncio.sleep(4.5)
-                        continue
+                if "challenge/selection" in page.url:
+                    if totp_secret:
+                        totp_opt = page.locator(
+                            'div[data-challengetype="6"], div[role="link"]:has-text("Authenticator"), '
+                            'li:has-text("Authenticator"), div[role="link"]:has-text("аутентификатор")'
+                        ).first
+                        if await totp_opt.count() and await totp_opt.is_visible():
+                            await totp_opt.click(timeout=5_000)
+                            logger.info("Auto-login: selected Authenticator TOTP challenge")
+                            await asyncio.sleep(4.0)
+                            continue
+                    if password:
+                        pwd_opt = page.locator('div[role="link"]:has-text("Enter your password"), li:has-text("Enter your password")').first
+                        if await pwd_opt.count() and await pwd_opt.is_visible():
+                            await pwd_opt.click(timeout=5_000)
+                            logger.info("Auto-login: selected password challenge")
+                            await asyncio.sleep(4.5)
+                            continue
 
                 pw_inp = page.locator('input[type="password"], input[name="Passwd"]').first
                 if password and await pw_inp.count() and await pw_inp.is_visible():
@@ -706,8 +742,32 @@ class RecaptchaTokenProducer:
                     await asyncio.sleep(6.0)
                     continue
 
+                totp_inp = page.locator('#totpPin, input[name="totpPin"], input[type="tel"][autocomplete="one-time-code"]').first
+                if totp_secret and ("challenge/totp" in page.url or (await totp_inp.count() and await totp_inp.is_visible())):
+                    rem = 30 - (int(time.time()) % 30)
+                    if rem < 4:
+                        await asyncio.sleep(rem + 1.0)
+                    code = generate_totp(totp_secret)
+                    await totp_inp.wait_for(state="visible", timeout=8_000)
+                    await totp_inp.fill(code)
+                    await asyncio.sleep(0.6)
+                    await page.locator('#totpNext button, button:has-text("Next"), button:has-text("Далее")').first.click(timeout=5_000)
+                    logger.info("Auto-login: submitted Google 2FA TOTP code")
+                    await asyncio.sleep(5.5)
+                    continue
+
                 if any(h in page.url for h in ("gds.google.com", "myaccount.google.com", "accounts.google.com")):
-                    if any(ch in page.url for ch in ("challenge/", "speedbump/idvreenable", "disabled")):
+                    if any(ch in page.url for ch in ("speedbump/idvreenable", "disabled")):
+                        break
+                    if "challenge/" in page.url and not any(
+                        ok_ch in page.url for ok_ch in ("challenge/pwd", "challenge/selection", "challenge/totp")
+                    ):
+                        try_another = page.locator('button:has-text("Try another way"), button:has-text("Другой способ")').first
+                        if totp_secret and await try_another.count() and await try_another.is_visible():
+                            await try_another.click(timeout=5_000)
+                            logger.info("Auto-login: clicked 'Try another way' to reach TOTP challenge")
+                            await asyncio.sleep(3.5)
+                            continue
                         break
                     interstitial = False
                     for txt in ("Cancel", "Отмена", "Not now", "Не сейчас", "Skip", "Пропустить", "Continue", "Продолжить", "I understand", "Понятно", "Remind me later", "Done"):

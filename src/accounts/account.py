@@ -57,6 +57,33 @@ class AccountInfo(BaseModel):
             return login.strip() or None, password.strip() or None
         return None, None
 
+    @staticmethod
+    def _clean_totp_secret(raw: str) -> str | None:
+        val = raw.strip()
+        if not val:
+            return None
+        if "/" in val:
+            val = val.rstrip("/").rsplit("/", 1)[-1]
+        cleaned = "".join(ch for ch in val.upper() if ch.isalnum())
+        return cleaned or None
+
+    def local_totp_secret(self) -> str | None:
+        """Read optional Base32 2FA TOTP secret from `totp.txt` or line 3 of `credentials.txt`."""
+        totp_path = self.directory / "totp.txt"
+        if totp_path.exists():
+            secret = self._clean_totp_secret(totp_path.read_text(encoding="utf-8", errors="ignore"))
+            if secret:
+                return secret
+        creds_path = self.directory / "credentials.txt"
+        if not creds_path.exists():
+            return None
+        lines = [ln.strip() for ln in creds_path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+        if len(lines) >= 3 and ":" not in lines[0]:
+            return self._clean_totp_secret(lines[2])
+        if len(lines) >= 2 and ":" in lines[0]:
+            return self._clean_totp_secret(lines[1])
+        return None
+
     def for_provider(self, provider: str = "dolphin") -> "AccountInfo | None":
         """Resolve the active profile identifier for `dolphin` or `octo`."""
         if provider == "octo":

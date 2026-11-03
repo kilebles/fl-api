@@ -42,8 +42,11 @@ ACCOUNT_ROTATION_403_LIMIT = 3
 ACCOUNT_ROTATION_429_LIMIT = 4
 ACCOUNT_ROTATION_TIMEOUT_LIMIT = 2  # consecutive server-side TIMED_OUT results before rotating
 PROXY_COOLDOWN_AFTER_ROTATIONS = 2  # 403-limit rotations on the same proxy before the account cools down
+PROXY_ERROR_ROTATION_LIMIT = 3      # consecutive proxy/transport errors before rotating without reloading Flow
+MAX_POLL_PROXY_ERRORS = 6           # cap polling proxy/network retries so a dead proxy never hangs inflight forever
 DELAY_403 = (7.0, 14.0)
 DELAY_403_REPEAT = (30.0, 60.0)
+DELAY_PROXY_ERROR = (4.0, 9.0)
 DELAY_429_STEPS = (7.0, 30.0, 90.0)  # pause for all requests of the session after the 1st, 2nd, 3rd consecutive 429
 DELAY_TRAFFIC_STEPS = (120.0, 300.0, 600.0)  # pause on 429 TOO_MUCH_TRAFFIC (no rotation)
 TRAFFIC_QUIET_RESET = 900.0
@@ -118,6 +121,7 @@ class AccountSession:
         self._successful_generations = 0
         self._consecutive_403s = 0
         self._consecutive_429s = 0
+        self._consecutive_proxy_errors = 0
         self._auth_failures = 0
         self._proxy_failures: dict[str, int] = {}
         self._resume_at = 0.0
@@ -145,6 +149,10 @@ class AccountSession:
     @property
     def on_cooldown(self) -> bool:
         return cooldowns.cooldown_remaining(self._manager.current.dolphin_id) > 0
+
+    @property
+    def cooldown_remaining(self) -> float:
+        return cooldowns.cooldown_remaining(self._manager.current.dolphin_id)
 
     def can_make_images(self) -> bool:
         did = self._manager.current.dolphin_id
@@ -294,10 +302,17 @@ class AccountSession:
                     cookies=dict(self._downloader.cookies) or submitted.cookies,
                 )
                 break
-            except httpx.ProxyError as exc:
+            except (httpx.ProxyError, httpx.TransportError) as exc:
                 proxy_errors += 1
-                pause = random.uniform(*DELAY_403)
-                logger.warning(f"[{index}] ProxyError during polling (attempt {proxy_errors}): {exc}, retrying in {pause:.0f}s")
+                if proxy_errors > MAX_POLL_PROXY_ERRORS:
+                    raise ConsecutiveFailuresError(
+                        f"[{index}] Polling aborted after {MAX_POLL_PROXY_ERRORS} proxy/network errors: {exc}"
+                    ) from exc
+                pause = random.uniform(*DELAY_PROXY_ERROR)
+                logger.warning(
+                    f"[{index}] Proxy/network error during polling "
+                    f"(attempt {proxy_errors}/{MAX_POLL_PROXY_ERRORS}): {exc}, retrying in {pause:.0f}s"
+                )
                 await asyncio.sleep(pause)
             except GenerationFilteredError:
                 logger.warning(f"[{index}] Content filtered — will be skipped")
@@ -400,13 +415,25 @@ class AccountSession:
             except httpx.HTTPStatusError as e:
                 delay = await self._handle_http_error(index, label, kind, e)
                 continue
-            except httpx.ProxyError as e:
-                self._consecutive_429s = 0
-                logger.warning(f"[{index}] ProxyError (treated as 403): {e}")
-                if self._count_403(index) is not _Count403.WAIT:
-                    await self._rotate_account()
-                delay = self._delay_after_403()
-                continue
+            except (httpx.ProxyError, httpx.TransportError) as e:
+                self._consecutive_proxy_errors += 1
+                proxy_key = self._manager.current_proxy_key
+                logger.warning(
+                    f"[{index}] Proxy/transport error on {self.name} / {proxy_key} "
+                    f"({self._consecutive_proxy_errors}/{PROXY_ERROR_ROTATION_LIMIT}): {type(e).__name__}: {e}"
+                )
+                if self._consecutive_proxy_errors < PROXY_ERROR_ROTATION_LIMIT:
+                    delay = random.uniform(*DELAY_PROXY_ERROR)
+                    continue
+                self._consecutive_proxy_errors = 0
+                failures = self._proxy_failures.get(proxy_key, 0) + 1
+                self._proxy_failures[proxy_key] = failures
+                if failures >= PROXY_COOLDOWN_AFTER_ROTATIONS:
+                    self._proxy_failures.pop(proxy_key, None)
+                    self._manager.mark_current_on_cooldown()
+                self._stop_generations = True
+                await self._rotate_account()
+                raise ConsecutiveFailuresError(f"Proxy/transport error limit reached on {proxy_key}") from e
             except Exception as e:
                 logger.error(f"[{index}] {label} exception: {type(e).__name__}: {e}")
                 raise
@@ -549,6 +576,7 @@ class AccountSession:
         account = self._manager.current
         self._consecutive_403s = 0
         self._consecutive_429s = 0
+        self._consecutive_proxy_errors = 0
         self._auth_failures = 0
         self._proxy_failures.pop(self._manager.current_proxy_key, None)
         self._manager.reset_cooldown(account)
@@ -657,6 +685,7 @@ class AccountSession:
             self._successful_generations = 0
             self._consecutive_403s = 0
             self._consecutive_429s = 0
+            self._consecutive_proxy_errors = 0
             self._resume_at = 0.0
             self._stop_generations = False
 
@@ -712,6 +741,9 @@ class AccountSession:
         creds_loader = getattr(self._manager, "current_google_credentials", None)
         if creds_loader is not None:
             producer.google_credentials_loader = creds_loader
+        totp_loader = getattr(self._manager, "current_totp_secret", None)
+        if totp_loader is not None:
+            producer.google_totp_loader = totp_loader
         task = asyncio.create_task(producer.run(), name=f"producer_{self.name}")
         self._producer, self._producer_task = producer, task
         self._producer_gen += 1

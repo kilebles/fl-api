@@ -1,3 +1,4 @@
+import asyncio
 import errno
 from pathlib import Path
 
@@ -9,6 +10,9 @@ from src.core.settings import Settings
 from src.flow.google_auth import sapisidhash_header
 from src.flow.http import API_BASE, api_headers
 from src.flow.polling import _find_direct_url
+
+_STREAM_TIMEOUT = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0)
+_DOWNLOAD_ATTEMPTS = 3
 
 
 class VideoDownloaderService:
@@ -102,34 +106,53 @@ class VideoDownloaderService:
             )
 
     async def _download_video(self, media_id: str, video_url: str, proxy_url: str | None = None) -> Path:
-        """Download video from URL with progress logging."""
+        """Download video from URL with bounded read timeouts and proxy fallback retries."""
         self._settings.download_dir.mkdir(parents=True, exist_ok=True)
         output_path = self._settings.download_dir / f"{media_id}.mp4"
+        is_signed_storage = "storage.googleapis.com" in video_url
 
-        async with httpx.AsyncClient(timeout=None, proxy=proxy_url) as client:
-            async with client.stream("GET", video_url) as response:
-                response.raise_for_status()
+        last_exc: Exception | None = None
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            active_proxy = None if (attempt == _DOWNLOAD_ATTEMPTS and proxy_url and is_signed_storage) else proxy_url
+            try:
+                async with httpx.AsyncClient(timeout=_STREAM_TIMEOUT, proxy=active_proxy) as client:
+                    async with client.stream("GET", video_url) as response:
+                        response.raise_for_status()
 
-                total_size = int(response.headers.get("Content-Length", 0))
-                downloaded = 0
-                last_logged_percent = -1
+                        total_size = int(response.headers.get("Content-Length", 0))
+                        downloaded = 0
+                        last_logged_percent = -1
 
-                try:
-                    with open(output_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            f.write(chunk)
-                            downloaded += len(chunk)
+                        try:
+                            with open(output_path, "wb") as f:
+                                async for chunk in response.aiter_bytes(chunk_size=8192):
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
 
-                            if total_size > 0:
-                                percent = int((downloaded / total_size) * 100)
-                                if percent >= last_logged_percent + 10:
-                                    logger.info(f"Downloading: {percent}%")
-                                    last_logged_percent = percent
-                except OSError as e:
-                    output_path.unlink(missing_ok=True)
-                    if e.errno == errno.ENOSPC:
-                        raise DiskFullError(f"No space left on device while saving {output_path}") from e
+                                    if total_size > 0:
+                                        percent = int((downloaded / total_size) * 100)
+                                        if percent >= last_logged_percent + 10:
+                                            logger.info(f"Downloading: {percent}%")
+                                            last_logged_percent = percent
+                        except OSError as e:
+                            output_path.unlink(missing_ok=True)
+                            if e.errno == errno.ENOSPC:
+                                raise DiskFullError(f"No space left on device while saving {output_path}") from e
+                            raise
+
+                logger.info(f"Download complete: {output_path}")
+                return output_path
+            except (httpx.ProxyError, httpx.TransportError) as e:
+                output_path.unlink(missing_ok=True)
+                last_exc = e
+                if attempt == _DOWNLOAD_ATTEMPTS:
                     raise
+                delay = 2.5 * attempt
+                logger.warning(
+                    f"Video stream error for {media_id} (attempt {attempt}/{_DOWNLOAD_ATTEMPTS}): {e} — retrying in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
 
-        logger.info(f"Download complete: {output_path}")
-        return output_path
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Video download exhausted retries for {media_id}")

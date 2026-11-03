@@ -103,6 +103,10 @@ class DolphinAntyManager:
             self._google_creds_cache[did] = self._public_api.get_profile_credentials(did)
         return self._google_creds_cache[did]
 
+    def current_totp_secret(self) -> str | None:
+        """Return optional Base32 TOTP secret for the current Google account."""
+        return self._current.local_totp_secret()
+
     @property
     def current_proxy(self) -> ProxyInfo | None:
         acc = self._current

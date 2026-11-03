@@ -39,6 +39,10 @@ IP_BACKOFF_MAX = 14400.0
 
 # An idle worker re-checks the queues and its account's pauses this often.
 PICK_POLL_INTERVAL = 5.0
+# Single-account workers sleep through temporary cooldowns up to this long instead of dying for the rest of the pass.
+MAX_WORKER_COOLDOWN_SLEEP = 1800.0
+# Maximum time to drain leftover inflight video polls after all workers exit.
+INFLIGHT_DRAIN_TIMEOUT = 420.0
 # How long an idle worker keeps waiting for re-queued work before it gives up.
 QUEUE_DRAIN_TIMEOUT = IP_BACKOFF_MAX + 60.0
 # No item settled and no image made for this long → cancel the workers (the runner starts a new pass).
@@ -107,6 +111,7 @@ class _BatchState:
     image_regenerations: dict[int, int] = field(default_factory=dict)
     inflight: set[asyncio.Task] = field(default_factory=set)
     deadline: float = 0.0
+    watchdog_fired: bool = False
 
 
 @dataclass
@@ -213,8 +218,17 @@ class BatchScheduler:
         watchdog = asyncio.create_task(self._watchdog(workers, state))
         try:
             await asyncio.gather(*workers, return_exceptions=True)
-            while state.inflight:
-                await asyncio.gather(*list(state.inflight), return_exceptions=True)
+            if state.inflight and not state.watchdog_fired:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*list(state.inflight), return_exceptions=True),
+                        timeout=INFLIGHT_DRAIN_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Watchdog/drain: {len(state.inflight)} inflight video poll(s) stuck for "
+                        f"{INFLIGHT_DRAIN_TIMEOUT:.0f}s — cancelling"
+                    )
         finally:
             watchdog.cancel()
             for task in [*workers, *state.inflight]:
@@ -231,8 +245,13 @@ class BatchScheduler:
     async def _worker(self, w: _Worker, state: _BatchState) -> None:
         session = w.session
         if not session.can_rotate and not self._has_work_for(session, state):
-            logger.warning(f"[{w.name}] skipped — the account cannot do any of the queued work (cooldown or no model access)")
-            return
+            rem = getattr(session, "cooldown_remaining", 0.0)
+            if 0 < rem <= MAX_WORKER_COOLDOWN_SLEEP:
+                logger.info(f"[{w.name}] waiting {rem / 60:.1f}m for temporary cooldown before joining pass")
+                await self._sleep_until_ready_or_done(session, state, rem + 2.0)
+            if not self._has_work_for(session, state):
+                logger.warning(f"[{w.name}] skipped — the account cannot do any of the queued work (cooldown or no model access)")
+                return
         try:
             await session.ensure_started()
         except FATAL_ERRORS as e:
@@ -306,6 +325,10 @@ class BatchScheduler:
             if not state.pending or asyncio.get_running_loop().time() > state.deadline:
                 return None
             if not videos_ok and not images_ok:
+                rem = getattr(session, "cooldown_remaining", 0.0)
+                if not session.can_rotate and 0 < rem <= MAX_WORKER_COOLDOWN_SLEEP and state.fatal is None:
+                    await asyncio.sleep(min(rem + 1.0, PICK_POLL_INTERVAL))
+                    continue
                 return None
             queue, kind = (state.video_queue, "video") if videos_ok else (state.image_queue, "image")
             try:
@@ -430,6 +453,14 @@ class BatchScheduler:
         item.retries += 1
         queue.put_nowait(item)
         if w.session.on_cooldown and not w.session.can_rotate:
+            rem = getattr(w.session, "cooldown_remaining", 0.0)
+            if 0 < rem <= MAX_WORKER_COOLDOWN_SLEEP:
+                logger.warning(
+                    f"[{w.name}] account on temporary cooldown ({rem / 60:.1f}m) — "
+                    f"{item.name} re-queued, worker sleeping until cooldown expires"
+                )
+                await self._sleep_until_ready_or_done(w.session, state, rem + 2.0)
+                return False
             logger.warning(f"[{w.name}] account on cooldown — {item.name} re-queued, worker exits")
             return True
         delay = _ip_backoff(item.retries) if isinstance(e, IpProhibitedError) else _backoff(w.fails)
@@ -494,13 +525,25 @@ class BatchScheduler:
             logger.warning(f"[{worker_name}] Global cooldown active — waiting {wait:.0f}s")
             await asyncio.sleep(wait)
 
+    async def _sleep_until_ready_or_done(self, session: AccountSession, state: _BatchState, duration: float) -> None:
+        end = asyncio.get_running_loop().time() + duration
+        while state.pending and state.fatal is None:
+            left = end - asyncio.get_running_loop().time()
+            if left <= 0 or not session.on_cooldown:
+                return
+            await asyncio.sleep(min(PICK_POLL_INTERVAL, left))
+
     async def _watchdog(self, workers: list[asyncio.Task], state: _BatchState) -> None:
         last = -1
         while True:
             await asyncio.sleep(WATCHDOG_STALL_TIMEOUT)
             if state.stats.progress == last:
-                logger.error(f"Watchdog: no progress for {WATCHDOG_STALL_TIMEOUT:.0f}s ({state.stats}) — cancelling workers")
-                for task in workers:
+                state.watchdog_fired = True
+                logger.error(
+                    f"Watchdog: no progress for {WATCHDOG_STALL_TIMEOUT:.0f}s ({state.stats}) — "
+                    f"cancelling {len(workers)} workers and {len(state.inflight)} inflight polls"
+                )
+                for task in [*workers, *state.inflight]:
                     task.cancel()
                 return
             last = state.stats.progress

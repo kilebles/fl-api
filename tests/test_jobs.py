@@ -523,3 +523,169 @@ def test_octo_browser_adapter_and_account_selection(tmp_path: Path, monkeypatch)
     s = Settings(_env_file=None, accounts_enabled="account_1, account_2", browser_provider="octo")
     assert s.accounts_enabled == ["account_1", "account_2"]
     assert s.browser_provider == "octo"
+
+
+def test_octo_proxy_cache_free_stop_and_cloud_unlock(monkeypatch):
+    import httpx
+    from src.accounts.proxy import ProxyInfo
+    from src.dolphin import octo_api as oa
+
+    monkeypatch.setattr(oa.time, "sleep", lambda _: None)
+    cloud_calls: list[tuple[str, str]] = []
+
+    def fake_request(method, url, **kwargs):
+        cloud_calls.append((method, url))
+        if method == "GET":
+            return httpx.Response(
+                200,
+                json={"data": {"proxy": {"type": "http", "host": "1.2.3.4", "port": 12323, "login": "u", "password": "p"}}},
+                request=httpx.Request(method, url),
+            )
+        return httpx.Response(200, json={"success": True}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(oa.httpx, "request", fake_request)
+    pub = oa.OctoPublicApi("octo-token")
+    same_proxy = ProxyInfo(host="1.2.3.4", port=12323, user="u", password="p", type="http")
+    new_proxy = ProxyInfo(host="5.6.7.8", port=12323, user="u", password="p", type="http")
+
+    # Already matches cloud -> 1 GET, 0 PATCH
+    pub.set_profile_proxy("uuid-1", same_proxy)
+    pub.set_profile_proxy("uuid-1", same_proxy)
+    assert cloud_calls == [("GET", f"{oa.OCTO_PUBLIC_API_BASE}/profiles/uuid-1")]
+
+    # Changed -> 1 PATCH, then cached -> 0 extra calls
+    pub.set_profile_proxy("uuid-1", new_proxy)
+    pub.set_profile_proxy("uuid-1", new_proxy)
+    assert len(cloud_calls) == 2 and cloud_calls[1][0] == "PATCH"
+
+    # stop() skips POST when /api/profiles/active reports profile is not running
+    local_posts: list[str] = []
+    monkeypatch.setattr(
+        oa.httpx,
+        "get",
+        lambda url, **kwargs: httpx.Response(200, json=[], request=httpx.Request("GET", url)),
+    )
+    monkeypatch.setattr(
+        oa.httpx,
+        "post",
+        lambda url, **kwargs: (
+            local_posts.append(url)
+            or httpx.Response(200, json={"ws_endpoint": "ws://127.0.0.1:9999/devtools/browser/1"}, request=httpx.Request("POST", url))
+        ),
+    )
+    local = oa.OctoLocalApi("http://localhost:58888", octo_api_token="octo-token", public_api=pub, auto_recover=False)
+    local.stop("uuid-1")
+    assert local_posts == []
+
+    # Cloud force-stop fallback when local force_stop still returns already started
+    attempt = 0
+
+    def locked_post(url, **kwargs):
+        nonlocal attempt
+        local_posts.append(url)
+        if url.endswith("/api/profiles/start"):
+            attempt += 1
+            if attempt <= 2:
+                return httpx.Response(400, json={"error": "Profile already started"}, request=httpx.Request("POST", url))
+            return httpx.Response(200, json={"ws_endpoint": "ws://127.0.0.1:9999/devtools/browser/unlocked"}, request=httpx.Request("POST", url))
+        return httpx.Response(200, json={"msg": "ok"}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(oa.httpx, "post", locked_post)
+    assert local.start("uuid-1") == "ws://127.0.0.1:9999/devtools/browser/unlocked"
+    assert ("POST", f"{oa.OCTO_PUBLIC_API_BASE}/profiles/uuid-1/force_stop") in cloud_calls
+
+
+def test_totp_generation_and_account_secret_parsing(tmp_path: Path):
+    from src.accounts.account import AccountInfo
+    from src.flow.browser.recaptcha import generate_totp
+
+    acc_dir = tmp_path / "account_6"
+    acc_dir.mkdir()
+    (acc_dir / "credentials.txt").write_text(
+        "bon0650567736@gmail.com\nEvuilk%8989\nhttps://2fa.fb.tools/7PHNUT335HOLZDQ2AUR4PP2NOOPZ2RIM\n"
+    )
+    acc = AccountInfo.load(acc_dir)
+    assert acc.local_credentials() == ("bon0650567736@gmail.com", "Evuilk%8989")
+    assert acc.local_totp_secret() == "7PHNUT335HOLZDQ2AUR4PP2NOOPZ2RIM"
+
+    code = generate_totp("fj4o yn6w w5qj luaf 44i4 oycc og6e ml5m", timestamp=1_700_000_000)
+    assert len(code) == 6 and code.isdigit()
+    assert code == generate_totp("FJ4OYN6WW5QJLUAf44I4OYCCOG6EML5M", timestamp=1_700_000_005)
+
+
+async def test_worker_sleeps_through_temporary_cooldown_and_watchdog_cancels_inflight(tmp_path: Path, monkeypatch):
+    import asyncio
+    from src.core.errors import RateLimitError
+    from src.engine.scheduler import BatchOptions, BatchScheduler, WorkItem
+
+    session = FakeSession("a", tmp_path / "tmp")
+    hit_once = False
+
+    orig_submit = session.submit_video
+
+    async def flaky_submit(index, prompt, image=None, frame=None, model_key=None):
+        nonlocal hit_once
+        if not hit_once:
+            hit_once = True
+            session.on_cooldown = True
+            session.cooldown_remaining = 0.08
+
+            async def expire():
+                await asyncio.sleep(0.06)
+                session.on_cooldown = False
+                session.cooldown_remaining = 0.0
+
+            asyncio.create_task(expire())
+            raise RateLimitError("temporary 5m cooldown")
+        return await orig_submit(index, prompt, image=image, frame=frame, model_key=model_key)
+
+    session.submit_video = flaky_submit
+    stats = await BatchScheduler([session], BatchOptions(output_dir=tmp_path / "out")).run(
+        [WorkItem(index=0, name="1", video_prompt="p1"), WorkItem(index=1, name="2", video_prompt="p2")]
+    )
+    assert stats.done == 2
+
+    # Watchdog cancels stuck inflight poll instead of deadlocking
+    monkeypatch.setattr(scheduler, "WATCHDOG_STALL_TIMEOUT", 0.05)
+    hung_session = FakeSession("hung", tmp_path / "tmp2")
+
+    async def hang_forever(index, submitted):
+        await asyncio.sleep(3600)
+
+    hung_session.finish_video = hang_forever
+    stalled_stats = await asyncio.wait_for(
+        BatchScheduler([hung_session], BatchOptions(output_dir=tmp_path / "out2")).run(
+            [WorkItem(index=0, name="1", video_prompt="p1")]
+        ),
+        timeout=1.0,
+    )
+    assert stalled_stats.done == 0
+
+
+async def test_runner_waits_and_recovers_on_octo_not_running(tmp_path: Path, monkeypatch):
+    from src.dolphin.octo_api import OctoNotRunningError
+    from src.jobs import runner as runner_module
+
+    monkeypatch.setattr(runner_module, "INFRA_RETRY_WAIT", 0.01)
+    session = FakeSession("a", tmp_path / "tmp")
+    attempts = 0
+    orig_ensure = session.ensure_started
+
+    async def flaky_ensure():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OctoNotRunningError("Octo restarting")
+        await orig_ensure()
+
+    session.ensure_started = flaky_ensure
+    runner = _runner_with(tmp_path, monkeypatch, [session])
+    states: list[JobState] = []
+
+    async def on_progress(state, progress, message):
+        states.append(state)
+
+    spec = JobSpec(mode=Mode.T2V, rows=[JobRow(name="1", prompt="p1")], output_dir=tmp_path / "out")
+    final_state, progress, _ = await runner.run(spec, on_progress=on_progress)
+    assert final_state is JobState.DONE and progress.videos_done == 1
+    assert JobState.WAITING in states

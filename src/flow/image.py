@@ -217,21 +217,35 @@ class ImageGenerationService:
         raise RuntimeError(f"Expected redirect, got {response.status_code}")
 
     async def _download_image(self, media_id: str, image_url: str, save_dir: Path) -> Path:
-        """Stream-download image from signed URL."""
+        """Stream-download image from signed URL with bounded read timeouts and retries."""
+        import asyncio
+
         output_path = save_dir / f"{media_id}.jpg"
+        stream_timeout = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0)
 
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", image_url) as response:
-                response.raise_for_status()
-                try:
-                    with open(output_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            f.write(chunk)
-                except OSError as e:
-                    output_path.unlink(missing_ok=True)
-                    if e.errno == errno.ENOSPC:
-                        raise DiskFullError(f"No space left on device while saving {output_path}") from e
+        for attempt in range(1, 4):
+            try:
+                async with httpx.AsyncClient(timeout=stream_timeout) as client:
+                    async with client.stream("GET", image_url) as response:
+                        response.raise_for_status()
+                        try:
+                            with open(output_path, "wb") as f:
+                                async for chunk in response.aiter_bytes(chunk_size=8192):
+                                    f.write(chunk)
+                        except OSError as e:
+                            output_path.unlink(missing_ok=True)
+                            if e.errno == errno.ENOSPC:
+                                raise DiskFullError(f"No space left on device while saving {output_path}") from e
+                            raise
+
+                logger.success(f"Image downloaded: {output_path}")
+                return output_path
+            except (httpx.ProxyError, httpx.TransportError) as e:
+                output_path.unlink(missing_ok=True)
+                if attempt == 3:
                     raise
+                delay = 2.0 * attempt
+                logger.warning(f"Image download transient error for {media_id} (attempt {attempt}/3): {e} — retrying in {delay:.1f}s")
+                await asyncio.sleep(delay)
 
-        logger.success(f"Image downloaded: {output_path}")
-        return output_path
+        raise RuntimeError(f"Image download exhausted retries for {media_id}")

@@ -9,7 +9,7 @@ from src.accounts.account import AccountInfo
 from src.accounts.repository import AccountRepository
 from src.core.settings import Settings
 from src.dolphin import cooldowns
-from src.dolphin.local_api import DolphinLocalApi
+from src.dolphin.local_api import DolphinLocalApi, DolphinNotRunningError
 from src.dolphin.manager import DolphinAntyManager
 from src.dolphin.octo_api import OctoLocalApi, OctoPublicApi
 from src.dolphin.public_api import DolphinPublicApi
@@ -25,6 +25,9 @@ MAX_COOLDOWN_WAIT = 3600.0
 # wait this long and try again, up to IMAGE_QUOTA_MAX_WAITS times in a row (~26h).
 IMAGE_QUOTA_WAIT = 900.0
 IMAGE_QUOTA_MAX_WAITS = 104
+# Transient desktop browser app outage (Octo/Dolphin restarting): wait in WAITING state instead of cascade-failing queued jobs.
+INFRA_RETRY_WAIT = 60.0
+INFRA_MAX_RETRIES = 20
 
 ProgressCallback = Callable[[JobState, JobProgress, str | None], Awaitable[None]]
 
@@ -48,7 +51,11 @@ class JobRunner:
         self._accounts = accounts
         if settings.browser_provider == "octo":
             self._public_api = OctoPublicApi(settings.octo_api_token)
-            self._local_api = OctoLocalApi(settings.octo_local_api)
+            self._local_api = OctoLocalApi(
+                settings.octo_local_api,
+                octo_api_token=settings.octo_api_token,
+                public_api=self._public_api,
+            )
         else:
             self._public_api = DolphinPublicApi(settings.anty_token)
             self._local_api = DolphinLocalApi(settings.anty_local_api, anty_token=settings.anty_token)
@@ -93,6 +100,7 @@ class JobRunner:
         try:
             prev_progress: int | None = None
             quota_waits = 0
+            infra_retries = 0
             while True:
                 missing = output.missing()
                 if not missing:
@@ -125,17 +133,34 @@ class JobRunner:
                     continue
                 if prev_progress is not None and current > prev_progress:
                     quota_waits = 0
+                    infra_retries = 0
                 prev_progress = current
 
                 pass_num += 1
                 logger.info(f"[job] {spec.mode} pass {pass_num}: {len(missing)} of {len(spec.rows)} rows left")
                 await report(JobState.RUNNING)
-                if mode.chain:
-                    clips = [(row.name, row.prompt) for row in spec.rows]
-                    await run_chain(sessions[0], clips, output.directory, first_model_key=model_key, on_change=on_change)
-                else:
-                    options = BatchOptions(output_dir=output.directory, video_model_key=model_key, reference_image=spec.avatar)
-                    await BatchScheduler(sessions, options, on_change=on_change).run(output.work_items(missing))
+                try:
+                    if mode.chain:
+                        clips = [(row.name, row.prompt) for row in spec.rows]
+                        await run_chain(sessions[0], clips, output.directory, first_model_key=model_key, on_change=on_change)
+                    else:
+                        options = BatchOptions(output_dir=output.directory, video_model_key=model_key, reference_image=spec.avatar)
+                        await BatchScheduler(sessions, options, on_change=on_change).run(output.work_items(missing))
+                except DolphinNotRunningError as e:
+                    if infra_retries >= INFRA_MAX_RETRIES:
+                        raise
+                    infra_retries += 1
+                    message = (
+                        f"browser app unreachable ({e}) — waiting {INFRA_RETRY_WAIT:.0f}s "
+                        f"before retry ({infra_retries}/{INFRA_MAX_RETRIES})"
+                    )
+                    logger.warning(f"[job] {message}")
+                    await report(JobState.WAITING, message)
+                    for session in sessions:
+                        await session.close()
+                    await asyncio.sleep(INFRA_RETRY_WAIT)
+                    prev_progress = None
+                    continue
         except FATAL_ERRORS as e:
             message = f"{type(e).__name__}: {e}"
             logger.error(f"[job] stopped: {message}")
