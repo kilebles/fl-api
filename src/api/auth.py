@@ -794,10 +794,23 @@ async def google_start(
     intent: Literal["login", "link"] = "login",
 ) -> RedirectResponse:
     host_hdr = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+    qs = f"?{request.url.query}" if request.url.query else ""
     if host_hdr == "127.0.0.1" or host_hdr.startswith("127.0.0.1:"):
         localhost_hdr = host_hdr.replace("127.0.0.1", "localhost", 1)
-        qs = f"?{request.url.query}" if request.url.query else ""
         return RedirectResponse(f"{request.url.scheme}://{localhost_hdr}{request.url.path}{qs}", status_code=302)
+
+    canonical = _origin_tuple(settings.frontend_url)
+    req_origin = _origin_tuple(f"{'https' if _is_https(request) else request.url.scheme}://{host_hdr}") if host_hdr else None
+    if (
+        canonical
+        and canonical[0] == "https"
+        and not _is_loopback(canonical[1])
+        and req_origin
+        and not _is_loopback(req_origin[1])
+        and req_origin[1] != "testserver"
+        and (req_origin[0] != "https" or req_origin[1] != canonical[1])
+    ):
+        return RedirectResponse(f"{settings.frontend_url.rstrip('/')}{request.url.path}{qs}", status_code=302)
 
     frontend = _frontend_base(request, settings).replace("://127.0.0.1", "://localhost")
     safe_next = _safe_next_path(next, "/account" if intent == "link" else "/")
