@@ -670,10 +670,10 @@ class RecaptchaTokenProducer:
         try:
             if "/about" in page.url and page.url.startswith(self._settings.flow_base_url):
                 create_btn = page.locator(
-                    'button:has-text("Create with Google Flow"), button:has-text("Create with Flow"), '
-                    'a:has-text("Create with Google Flow")'
+                    'button:visible:has-text("Create with Google Flow"), button:visible:has-text("Create with Flow"), '
+                    'a:visible:has-text("Create with Google Flow"), a:visible:has-text("Create with Flow")'
                 ).first
-                if await create_btn.count() and await create_btn.is_visible():
+                if await create_btn.count():
                     await create_btn.click(timeout=8_000)
                     logger.info("Auto-login: clicked 'Create with Google Flow'")
                     await asyncio.sleep(4.0)
@@ -695,10 +695,10 @@ class RecaptchaTokenProducer:
 
                 if "/about" in cur and cur.startswith(self._settings.flow_base_url):
                     create_btn = page.locator(
-                        'button:has-text("Create with Google Flow"), button:has-text("Create with Flow"), '
-                        'a:has-text("Create with Google Flow")'
+                        'button:visible:has-text("Create with Google Flow"), button:visible:has-text("Create with Flow"), '
+                        'a:visible:has-text("Create with Google Flow"), a:visible:has-text("Create with Flow")'
                     ).first
-                    if await create_btn.count() and await create_btn.is_visible():
+                    if await create_btn.count():
                         await create_btn.click(timeout=8_000)
                         logger.info("Auto-login: clicked 'Create with Google Flow' after auth")
                         await asyncio.sleep(4.5)
@@ -720,6 +720,16 @@ class RecaptchaTokenProducer:
                     if interstitial:
                         continue
 
+                pw_inp = page.locator('input[type="password"], input[name="Passwd"]').first
+                if password and ("challenge/pwd" in cur or (await pw_inp.count() and await pw_inp.is_visible())):
+                    await pw_inp.wait_for(state="visible", timeout=10_000)
+                    await pw_inp.fill(password)
+                    await asyncio.sleep(0.6)
+                    await page.locator('#passwordNext button:visible, button:visible:has-text("Next"), button:visible:has-text("Далее")').first.click(force=True, timeout=5_000)
+                    logger.info("Auto-login: submitted Google password")
+                    await asyncio.sleep(6.0)
+                    continue
+
                 if not chooser_clicked and "accountchooser" in cur:
                     chooser_selectors = (
                         (f'[data-identifier="{email}"]', '[data-identifier]', 'li div[role="link"]')
@@ -730,14 +740,41 @@ class RecaptchaTokenProducer:
                     for sel in chooser_selectors:
                         loc = page.locator(sel).first
                         if await loc.count() and await loc.is_visible():
-                            await loc.click(timeout=5_000)
+                            await loc.click(force=True, timeout=5_000)
                             chooser_clicked = True
                             logger.info(f"Auto-login: clicked chooser {sel}")
-                            await asyncio.sleep(4.0)
+                            await asyncio.sleep(4.5)
                             clicked = True
                             break
                     if clicked:
                         continue
+
+                if "challenge/recaptcha" in cur:
+                    frame_el = page.frame_locator(
+                        'iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/enterprise/anchor"], iframe[title*="reCAPTCHA"]'
+                    ).first
+                    anchor = frame_el.locator("#recaptcha-anchor")
+                    try:
+                        await anchor.wait_for(state="visible", timeout=8_000)
+                        await anchor.click(timeout=6_000)
+                        await asyncio.sleep(5.0)
+                    except Exception:
+                        break
+                    if "challenge/recaptcha" not in page.url:
+                        logger.info("Auto-login: reCAPTCHA checkbox auto-advanced")
+                        continue
+                    try:
+                        checked = await anchor.get_attribute("aria-checked", timeout=3_000)
+                    except Exception:
+                        checked = None
+                    if checked == "true":
+                        nxt = page.locator('#recaptchaNext button:visible, button:visible:has-text("Next"), button:visible:has-text("Далее")').first
+                        if await nxt.count():
+                            await nxt.click(force=True, timeout=5_000)
+                            logger.info("Auto-login: submitted reCAPTCHA checkbox")
+                            await asyncio.sleep(5.0)
+                            continue
+                    break
 
                 email_inp = page.locator('#identifierId, input[name="identifier"]').first
                 if email and "gds.google.com" not in cur and (
@@ -777,15 +814,6 @@ class RecaptchaTokenProducer:
                             logger.info("Auto-login: selected password challenge")
                             await asyncio.sleep(4.5)
                             continue
-
-                pw_inp = page.locator('input[type="password"], input[name="Passwd"]').first
-                if password and await pw_inp.count() and await pw_inp.is_visible():
-                    await pw_inp.fill(password)
-                    await asyncio.sleep(0.6)
-                    await page.locator('#passwordNext button, button:has-text("Next"), button:has-text("Далее")').first.click(timeout=5_000)
-                    logger.info("Auto-login: submitted Google password")
-                    await asyncio.sleep(6.0)
-                    continue
 
                 totp_inp = page.locator('#totpPin, input[name="totpPin"], input[type="tel"][autocomplete="one-time-code"]').first
                 if totp_secret and ("challenge/totp" in page.url or (await totp_inp.count() and await totp_inp.is_visible())):
@@ -834,10 +862,10 @@ class RecaptchaTokenProducer:
                 await asyncio.sleep(4.0)
                 if "/about" in page.url:
                     create_btn = page.locator(
-                        'button:has-text("Create with Google Flow"), button:has-text("Create with Flow"), '
-                        'a:has-text("Create with Google Flow")'
+                        'button:visible:has-text("Create with Google Flow"), button:visible:has-text("Create with Flow"), '
+                        'a:visible:has-text("Create with Google Flow"), a:visible:has-text("Create with Flow")'
                     ).first
-                    if await create_btn.count() and await create_btn.is_visible():
+                    if await create_btn.count():
                         await create_btn.click(timeout=8_000)
                         await asyncio.sleep(4.0)
                         if "accounts.google.com" in page.url:
