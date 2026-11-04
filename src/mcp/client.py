@@ -150,6 +150,8 @@ class FlPlatformClient:
         ) or path.startswith("/api/prompts/niches/") or path.startswith("/api/prompts/templates/builtin/"):
             target = self.prompts_url or (None if self._asgi_app else self.base_url)
             return "fl-prompts", target, False
+        if self.settings.mcp_gateway_url and not path.startswith(("/api/auth", "/api/projects", "/api/infographics")):
+            return "fl-api", self.settings.mcp_gateway_url.rstrip("/"), False
         if self._asgi_app is not None:
             return "fl-api", "http://fl-internal.local", True
         return "fl-api", self.base_url, False
