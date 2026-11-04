@@ -169,6 +169,12 @@ async def retry_run(run_id: str, service: Service, caller: Caller) -> RunSummary
     return RunSummary(**_summary(await service.run(run_id, user_id=scope)))
 
 
+@router.get("/runs/{run_id}/log")
+async def get_run_log(run_id: str, service: Service, caller: Caller, lines: int = 80) -> dict[str, list[str]]:
+    scope = None if caller.is_admin else caller.user_id
+    return {"lines": await service.log_lines(run_id, limit=lines, user_id=scope)}
+
+
 @router.delete("/runs/{run_id}", status_code=204)
 async def delete_run(run_id: str, service: Service, caller: Caller) -> None:
     scope = None if caller.is_admin else caller.user_id

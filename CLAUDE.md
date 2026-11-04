@@ -39,11 +39,13 @@ src/
 │                categories.py (people / places / artifacts), services/ (Gemini detector, Wikidata, Wikimedia search with
 │                a 6s throttle, image relevance/selection — sync, stdlib logging), service.py (InfographicsService)
 ├── storage/     objects.py (ObjectStore protocol: LocalObjectStore → /files/{key}, S3ObjectStore → presigned links)
+├── mcp/         server.py (MCPServer factory, Streamable HTTP at /api/mcp & /mcp), client.py (FlPlatformClient:
+│                in-process ASGI + optional upstream HTTP), tools_monitor.py, tools_jobs.py, tools_pipeline.py
 └── api/         app.py (create_app, bearer token), routes.py (/api/…), prompts.py (/api/prompts/…),
                  infographics.py (/api/infographics/…), library.py (/api/projects, /api/avatars), schemas.py
 renderer/        Remotion project (PersonalityCard composition) + render.mjs (bundle once, one Chrome, images over a local
                  HTTP server — jobs never share public/); `npm install` once, Chrome Headless Shell downloads on first render
-scripts/         serve.py (web API), import_prompt_templates.py (hdoc-prompts data/prompts/*.json → DB), run_job.py (CLI, local output only), check_session.py, probe_image_model.py
+scripts/         serve.py (web API), mcp_server.py (stdio MCP server), import_prompt_templates.py (hdoc-prompts data/prompts/*.json → DB), run_job.py (CLI, local output only), check_session.py, probe_image_model.py
 tests/           fakes + tests for scheduler, runner, queue, session recovery
 ```
 
@@ -137,6 +139,12 @@ Wikimedia images picked by Gemini; slow — Wikimedia 429s are waited out) then 
 
 Not here: translation + Fish voiceover + mixing and their web API live in `../fl-voice_translator` (its own FastAPI app
 `api/`, `start_api.bat`, port 8010, same `API_TOKEN`). Caddy routes `/api/voice/*` to it before the `/api/*` rule.
+
+## MCP Control Plane (`/api/mcp` & `scripts/mcp_server.py`)
+
+Streamable HTTP MCP server (`mcp==2.3.0`) mounted at `/api/mcp` (and `/mcp`) plus standalone `stdio` entrypoint `uv run python scripts/mcp_server.py`.
+Exposes 46 tools, resources (`fl://modes`, `fl://pipeline`, `fl://jobs/{job_id}`), and prompts (`ops_health_check`, `launch_video_pipeline`, `troubleshoot_job`) across monitoring, browser account cooldowns/proxies, `JobQueue`, projects/avatars, prompts, infographics, and optional upstream microservices (`fl-scenario`, `fl-prompts`, `fl-voice`, `fl-footage`).
+Authenticated via personal MCP keys (`GET/POST/DELETE /api/auth/tokens`, `flk_…`), service `API_TOKEN`, or `fl_session` (`Authorization: Bearer …` or `?token=…`); Caddy `GET /api/auth/verify` also validates `flk_…` keys and emits signed `X-Fl-Gateway-Auth`.
 
 ## Usage
 

@@ -25,6 +25,7 @@ from src.api.routes import router
 from src.auth.mailer import MailDeliveryError, ResendMailer
 from src.auth.service import (
     AccountDisabledError,
+    ApiTokenNotFoundError,
     AuthError,
     AuthService,
     EmailAlreadyExistsError,
@@ -42,6 +43,7 @@ from src.infographics.service import NotFoundError as InfographicNotFoundError
 from src.jobs.queue import InputNotFoundError, JobNotFoundError, JobQueue
 from src.jobs.repository import JobRepository
 from src.jobs.runner import JobRunner
+from src.mcp import mcp_lifespan, mount_mcp_on_app
 from src.projects.service import ProjectNotFoundError, ProjectService
 from src.prompts.llm import LLMClient, LLMNotConfiguredError
 from src.prompts.service import NotFoundError, PromptService
@@ -96,7 +98,8 @@ def create_app(
         await prompts.start()
         await infographics.start()
         try:
-            yield
+            async with mcp_lifespan(app, settings):
+                yield
         finally:
             await infographics.stop()
             await prompts.stop()
@@ -128,6 +131,8 @@ def create_app(
     app.include_router(prompts_router, dependencies=[Depends(get_principal)])
     app.include_router(infographics_router, dependencies=[Depends(get_principal)])
     app.include_router(library_router, dependencies=[Depends(get_principal)])
+    if settings.mcp_enabled:
+        mount_mcp_on_app(app, settings)
 
     @app.get("/files/{key:path}", include_in_schema=False)
     async def local_file(key: str, request: Request, download: str | None = None) -> FileResponse:
@@ -194,6 +199,7 @@ def create_app(
     @app.exception_handler(ProjectNotFoundError)
     @app.exception_handler(AvatarNotFoundError)
     @app.exception_handler(SessionNotFoundError)
+    @app.exception_handler(ApiTokenNotFoundError)
     @app.exception_handler(UserNotFoundError)
     async def _library_not_found(request: Request, exc: LookupError) -> JSONResponse:
         return JSONResponse({"detail": f"{exc} not found"}, status_code=404)

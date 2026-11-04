@@ -27,6 +27,8 @@ _USERNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$")
 _HASHER = PasswordHasher(time_cost=2, memory_cost=65536, parallelism=2)
 _DUMMY_HASH = _HASHER.hash("dummy-timing-guard-password")
 _LAST_SEEN_THROTTLE = timedelta(minutes=5)
+API_TOKEN_PREFIX = "flk_"
+_MAX_API_TOKENS_PER_USER = 25
 
 
 class AuthError(ValueError):
@@ -64,6 +66,10 @@ class UserNotFoundError(LookupError):
 
 
 class SessionNotFoundError(LookupError):
+    pass
+
+
+class ApiTokenNotFoundError(LookupError):
     pass
 
 
@@ -109,6 +115,19 @@ class SessionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class ApiTokenRecord(Base):
+    __tablename__ = "user_api_tokens"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    token_prefix: Mapped[str] = mapped_column(String(20))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, index=True, default=None)
 
 
 @dataclass(slots=True)
@@ -1031,6 +1050,114 @@ class AuthService:
             await session.commit()
             return result.rowcount or 0
 
+    async def create_api_token(
+        self,
+        user_id: str,
+        name: str,
+        expires_in_days: int | None = None,
+    ) -> tuple[ApiTokenRecord, str]:
+        """Issue a personal `flk_...` API/MCP token; returns `(record, raw_token)` once."""
+        clean_name = name.strip()
+        if not clean_name or len(clean_name) > 64:
+            raise AuthError("Укажите название ключа (до 64 символов)")
+        if expires_in_days is not None and (expires_in_days < 1 or expires_in_days > 3650):
+            raise AuthError("Срок действия ключа должен быть от 1 до 3650 дней")
+
+        now = datetime.now()
+        raw_token = f"{API_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+        expires_at = now + timedelta(days=expires_in_days) if expires_in_days else None
+
+        async with self._session() as session:
+            user = await session.get(UserRecord, user_id)
+            if user is None or not user.is_active:
+                raise UserNotFoundError(user_id)
+
+            await session.execute(
+                delete(ApiTokenRecord).where(
+                    ApiTokenRecord.user_id == user_id,
+                    ApiTokenRecord.expires_at.is_not(None),
+                    ApiTokenRecord.expires_at <= now,
+                )
+            )
+            active_count = (
+                await session.scalar(
+                    select(func.count()).select_from(ApiTokenRecord).where(ApiTokenRecord.user_id == user_id)
+                )
+                or 0
+            )
+            if active_count >= _MAX_API_TOKENS_PER_USER:
+                raise AuthError(f"Достигнут лимит активных ключей ({_MAX_API_TOKENS_PER_USER}) — отзовите неиспользуемые")
+
+            record = ApiTokenRecord(
+                id=uuid.uuid4().hex[:16],
+                user_id=user_id,
+                name=clean_name,
+                token_prefix=raw_token[:12],
+                token_hash=hash_token(raw_token),
+                created_at=now,
+                last_used_at=None,
+                expires_at=expires_at,
+            )
+            session.add(record)
+            await session.commit()
+
+        logger.info(f"[auth] created API/MCP token {record.id} ({record.name}) for user {user_id}")
+        return record, raw_token
+
+    async def list_api_tokens(self, user_id: str) -> list[ApiTokenRecord]:
+        """Return active API/MCP tokens owned by `user_id`, pruning expired ones."""
+        now = datetime.now()
+        async with self._session() as session:
+            await session.execute(
+                delete(ApiTokenRecord).where(
+                    ApiTokenRecord.user_id == user_id,
+                    ApiTokenRecord.expires_at.is_not(None),
+                    ApiTokenRecord.expires_at <= now,
+                )
+            )
+            await session.commit()
+            rows = await session.scalars(
+                select(ApiTokenRecord)
+                .where(ApiTokenRecord.user_id == user_id)
+                .order_by(ApiTokenRecord.created_at.desc())
+            )
+            return list(rows)
+
+    async def revoke_api_token(self, user_id: str, token_id: str) -> bool:
+        """Delete a personal API/MCP token owned by `user_id`."""
+        async with self._session() as session:
+            record = await session.get(ApiTokenRecord, token_id)
+            if record is None or record.user_id != user_id:
+                raise ApiTokenNotFoundError(token_id)
+            await session.delete(record)
+            await session.commit()
+            return True
+
+    async def authenticate_api_token(self, raw_token: str) -> tuple[UserRecord, ApiTokenRecord] | None:
+        """Validate a `flk_...` personal API/MCP token; returns `(user, record)` or `None`."""
+        if not raw_token or not raw_token.startswith(API_TOKEN_PREFIX) or len(raw_token) > 256:
+            return None
+        digest = hash_token(raw_token)
+        now = datetime.now()
+
+        async with self._session() as session:
+            record = await session.scalar(select(ApiTokenRecord).where(ApiTokenRecord.token_hash == digest))
+            if record is None:
+                return None
+            if record.expires_at is not None and record.expires_at <= now:
+                await session.delete(record)
+                await session.commit()
+                return None
+            user = await session.get(UserRecord, record.user_id)
+            if user is None or not user.is_active or user.email_verified_at is None:
+                await session.delete(record)
+                await session.commit()
+                return None
+            if record.last_used_at is None or now - record.last_used_at >= _LAST_SEEN_THROTTLE:
+                record.last_used_at = now
+                await session.commit()
+            return user, record
+
     async def list_users(self) -> list[dict[str, Any]]:
         """Admin view: all users with active session counts."""
         now = datetime.now()
@@ -1073,6 +1200,7 @@ class AuthService:
                 user.is_active = is_active
                 if not is_active:
                     await session.execute(delete(SessionRecord).where(SessionRecord.user_id == target_id))
+                    await session.execute(delete(ApiTokenRecord).where(ApiTokenRecord.user_id == target_id))
             user.updated_at = datetime.now()
             await session.commit()
             return user

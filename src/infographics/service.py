@@ -169,6 +169,15 @@ class InfographicsService:
             raise NotFoundError(f"infographic run {run_id}")
         return record
 
+    async def log_lines(self, run_id: str, limit: int = 80, user_id: str | None = None) -> list[str]:
+        await self.run(run_id, user_id=user_id)
+        log_path = self._work_dir / run_id / "log.txt"
+        if not log_path.is_file():
+            return []
+        raw = await asyncio.to_thread(log_path.read_text, "utf-8", "replace")
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        return lines[-max(1, min(limit, 500)) :]
+
     async def create(
         self,
         scenario_name: str,

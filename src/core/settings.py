@@ -16,7 +16,16 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = Field(default="SUCCESS", description="Minimum log level (DEBUG, INFO, SUCCESS, WARNING, ERROR, CRITICAL)")
+    logs_dir: Path = Field(default=Path("logs"), description="Directory with server log files")
     monitor_url: str | None = Field(default=None, description="flow-stat base URL, e.g. http://192.168.1.100:8080")
+
+    # MCP server & upstream microservice URLs (optional; defaults to public_url when behind Caddy)
+    mcp_enabled: bool = Field(default=True, description="Mount the Streamable HTTP MCP endpoint at /api/mcp")
+    mcp_gateway_url: str | None = Field(default=None, description="Unified gateway base URL (e.g. Caddy URL) for upstream microservices")
+    scenario_api_url: str | None = Field(default=None, description="Direct base URL for fl-scenario (e.g. http://localhost:8020)")
+    prompts_api_url: str | None = Field(default=None, description="Direct base URL for fl-prompts (e.g. http://localhost:8040)")
+    voice_api_url: str | None = Field(default=None, description="Direct base URL for fl-voice_translator (e.g. http://localhost:8010)")
+    footage_api_url: str | None = Field(default=None, description="Direct base URL for fl-footage (e.g. http://localhost:8030)")
 
     # Antidetect browser backend ("dolphin" or "octo")
     browser_provider: Literal["dolphin", "octo"] = Field(

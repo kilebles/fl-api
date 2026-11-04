@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field
 
 from src.auth.mailer import ResendMailer
 from src.auth.service import (
+    API_TOKEN_PREFIX,
+    ApiTokenRecord,
     AuthError,
     AuthService,
     EmailNotVerifiedError,
@@ -166,6 +168,13 @@ async def get_principal(request: Request) -> Principal:
     if settings.api_token and candidate_token and secrets.compare_digest(candidate_token, settings.api_token):
         return Principal(user=None, session=None, is_service=True)
 
+    if candidate_token.startswith(API_TOKEN_PREFIX):
+        resolved_key = await auth.authenticate_api_token(candidate_token)
+        if resolved_key is None:
+            raise HTTPException(401, "Недействительный или отозванный ключ MCP")
+        user, _ = resolved_key
+        return Principal(user=user, session=None, is_service=False)
+
     raw_cookie = request.cookies.get(settings.auth_cookie_name) or (
         candidate_token if candidate_token and candidate_token != settings.api_token else ""
     )
@@ -282,6 +291,24 @@ class SessionOut(BaseModel):
     is_current: bool
 
 
+class ApiTokenCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class ApiTokenOut(BaseModel):
+    id: str
+    name: str
+    token_prefix: str
+    created_at: datetime
+    last_used_at: datetime | None
+    expires_at: datetime | None
+
+
+class ApiTokenCreatedOut(ApiTokenOut):
+    token: str
+
+
 class AdminUserOut(BaseModel):
     id: str
     username: str
@@ -354,6 +381,17 @@ def _session_out(sess: SessionRecord, current_id: str | None) -> SessionOut:
         last_seen_at=sess.last_seen_at,
         expires_at=sess.expires_at,
         is_current=sess.id == current_id,
+    )
+
+
+def _api_token_out(record: ApiTokenRecord) -> ApiTokenOut:
+    return ApiTokenOut(
+        id=record.id,
+        name=record.name,
+        token_prefix=record.token_prefix,
+        created_at=record.created_at,
+        last_used_at=record.last_used_at,
+        expires_at=record.expires_at,
     )
 
 
@@ -457,6 +495,23 @@ async def verify_gateway_auth(
 
     if settings.api_token and candidate_token and secrets.compare_digest(candidate_token, settings.api_token):
         response.headers[GATEWAY_AUTH_HEADER] = sign_oauth_state({"svc": True, "iat": int(time.time())}, secret)
+        return {"ok": True}
+
+    if candidate_token.startswith(API_TOKEN_PREFIX):
+        resolved_key = await auth.authenticate_api_token(candidate_token)
+        if resolved_key is None:
+            raise HTTPException(401, "Недействительный или отозванный ключ MCP")
+        user, _ = resolved_key
+        response.headers[GATEWAY_AUTH_HEADER] = sign_oauth_state(
+            {
+                "uid": user.id,
+                "email": user.email,
+                "username": display_username(user),
+                "role": user.role,
+                "iat": int(time.time()),
+            },
+            secret,
+        )
         return {"ok": True}
 
     raw_cookie = request.cookies.get(settings.auth_cookie_name) or (
@@ -783,6 +838,41 @@ async def revoke_others(principal: LoggedUser, auth: Auth) -> dict[str, int]:
         principal.session.id if principal.session else None,
     )
     return {"revoked": revoked}
+
+
+@auth_router.get("/tokens")
+async def list_api_tokens(principal: LoggedUser, auth: Auth) -> list[ApiTokenOut]:
+    assert principal.user is not None
+    records = await auth.list_api_tokens(principal.user.id)
+    return [_api_token_out(r) for r in records]
+
+
+@auth_router.post("/tokens", status_code=201)
+async def create_api_token(
+    body: ApiTokenCreateIn,
+    principal: LoggedUser,
+    auth: Auth,
+) -> ApiTokenCreatedOut:
+    assert principal.user is not None
+    record, raw_token = await auth.create_api_token(
+        user_id=principal.user.id,
+        name=body.name,
+        expires_in_days=body.expires_in_days,
+    )
+    return ApiTokenCreatedOut(
+        **_api_token_out(record).model_dump(),
+        token=raw_token,
+    )
+
+
+@auth_router.delete("/tokens/{token_id}", status_code=204)
+async def delete_api_token(
+    token_id: str,
+    principal: LoggedUser,
+    auth: Auth,
+) -> None:
+    assert principal.user is not None
+    await auth.revoke_api_token(principal.user.id, token_id)
 
 
 @auth_router.get("/google/start")

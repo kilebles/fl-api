@@ -50,8 +50,30 @@ class JobFile(BaseModel):
 class Account(BaseModel):
     name: str
     dolphin_id: str | None
+    provider: str = "dolphin"
+    enabled: bool = True
     proxies: int
     dead_proxies: int
+    dead_proxy_list: list[str] = []
     cooldown: float
     image_pause: float
     video_pause: float
+    active_image_model: str | None = None
+    image_quota_limited: bool = False
+    flow_project_id: str | None = None
+    has_credentials: bool = False
+    has_totp: bool = False
+
+
+class CooldownResetIn(BaseModel):
+    kind: str = "all"
+
+
+class ReviveProxiesIn(BaseModel):
+    proxy: str | None = None
+
+
+class LogTailOut(BaseModel):
+    file: str | None = None
+    total_matched: int = 0
+    lines: list[str] = []

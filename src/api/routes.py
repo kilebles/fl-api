@@ -1,15 +1,29 @@
 import asyncio
 import io
+import re
 import uuid
 from collections.abc import AsyncIterator
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
+from src.accounts.account import AccountInfo
+from src.accounts.repository import AccountNotFoundError, AccountRepository
 from src.api.auth import AdminCaller, Caller
-from src.api.schemas import Account, JobDetail, JobFile, ModeInfo, Rows, Upload
+from src.api.schemas import (
+    Account,
+    CooldownResetIn,
+    JobDetail,
+    JobFile,
+    LogTailOut,
+    ModeInfo,
+    ReviveProxiesIn,
+    Rows,
+    Upload,
+)
+from src.core.settings import Settings
 from src.dolphin import cooldowns
 from src.jobs.excel import load_rows
 from src.jobs.models import JobRequest, JobStatus
@@ -241,20 +255,111 @@ async def events(request: Request, queue: Queue, caller: Caller) -> StreamingRes
     )
 
 
+_SECRET_RE = re.compile(r"(Bearer\s+\S+|ya29\.[A-Za-z0-9_\-.]+|https?://[^:@/\s]+:[^@/\s]+@)")
+
+
+def _account_out(account: AccountInfo, repo: AccountRepository, settings: Settings) -> Account:
+    provider = settings.browser_provider
+    resolved = account.for_provider(provider)
+    profile_id = resolved.dolphin_id if resolved is not None else account.dolphin_id
+    enabled_set = set(settings.accounts_enabled)
+    is_enabled = resolved is not None and (not enabled_set or account.name in enabled_set)
+    dead = sorted(repo.dead_proxies(account.name))
+    login, _ = account.local_credentials()
+    image_models = settings.image_models
+    return Account(
+        name=account.name,
+        dolphin_id=profile_id,
+        provider=provider,
+        enabled=is_enabled,
+        proxies=len(account.proxies),
+        dead_proxies=len(dead),
+        dead_proxy_list=dead,
+        cooldown=round(cooldowns.cooldown_remaining(profile_id), 1),
+        image_pause=round(cooldowns.image_cooldown_remaining(profile_id, image_models), 1),
+        video_pause=round(cooldowns.video_denied_remaining(profile_id), 1),
+        active_image_model=cooldowns.pick_image_model(profile_id, image_models) if profile_id else None,
+        image_quota_limited=cooldowns.image_quota_limited(profile_id),
+        flow_project_id=account.project_id,
+        has_credentials=login is not None,
+        has_totp=account.local_totp_secret() is not None,
+    )
+
+
 @router.get("/accounts")
 async def accounts(request: Request, _admin: AdminCaller) -> list[Account]:
     """Accounts with their pauses in seconds (0 = free)."""
-    repo = request.app.state.accounts
-    result = []
-    for account in repo.all():
-        dolphin_id = account.dolphin_id
-        result.append(Account(
-            name=account.name,
-            dolphin_id=dolphin_id,
-            proxies=len(account.proxies),
-            dead_proxies=len(repo.dead_proxies(account.name)),
-            cooldown=cooldowns.cooldown_remaining(dolphin_id),
-            image_pause=cooldowns.image_cooldown_remaining(dolphin_id),
-            video_pause=cooldowns.video_denied_remaining(dolphin_id),
-        ))
-    return result
+    repo: AccountRepository = request.app.state.accounts
+    settings: Settings = request.app.state.settings
+    return [_account_out(acc, repo, settings) for acc in repo.all()]
+
+
+@router.post("/accounts/{account_name}/reset-cooldown")
+async def reset_account_cooldown(
+    account_name: str, body: CooldownResetIn, request: Request, _admin: AdminCaller
+) -> Account:
+    """Clear cooldowns ('all', 'account', 'image', or 'video') on one account."""
+    repo: AccountRepository = request.app.state.accounts
+    settings: Settings = request.app.state.settings
+    try:
+        acc = repo.get(account_name)
+    except AccountNotFoundError:
+        raise HTTPException(404, f"account {account_name} not found") from None
+    resolved = acc.for_provider(settings.browser_provider)
+    profile_id = resolved.dolphin_id if resolved is not None else acc.dolphin_id
+    kind = body.kind.strip().lower()
+    if kind not in ("all", "account", "image", "video"):
+        raise HTTPException(422, "kind must be 'all', 'account', 'image', or 'video'")
+    if kind in ("all", "account"):
+        cooldowns.reset_cooldown(profile_id)
+    if kind in ("all", "image"):
+        cooldowns.reset_image_cooldown(profile_id)
+    if kind in ("all", "video"):
+        cooldowns.reset_video_denied(profile_id)
+    return _account_out(acc, repo, settings)
+
+
+@router.post("/accounts/{account_name}/revive-proxies")
+async def revive_account_proxies(
+    account_name: str, body: ReviveProxiesIn, request: Request, _admin: AdminCaller
+) -> Account:
+    """Restore one dead proxy (`host:port`) or all dead proxies on an account."""
+    repo: AccountRepository = request.app.state.accounts
+    settings: Settings = request.app.state.settings
+    try:
+        acc = repo.get(account_name)
+    except AccountNotFoundError:
+        raise HTTPException(404, f"account {account_name} not found") from None
+    targets = [body.proxy.strip()] if body.proxy and body.proxy.strip() else list(repo.dead_proxies(account_name))
+    for proxy_key in targets:
+        repo.revive_proxy(account_name, proxy_key)
+    return _account_out(repo.get(account_name), repo, settings)
+
+
+@router.get("/admin/logs")
+async def admin_logs(
+    request: Request,
+    _admin: AdminCaller,
+    lines: int = 100,
+    level: str | None = None,
+    search: str | None = None,
+) -> LogTailOut:
+    """Return sanitized recent lines from the latest server log file."""
+    logs_dir: Path = request.app.state.settings.logs_dir
+    if not logs_dir.is_dir():
+        return LogTailOut()
+    files = sorted((p for p in logs_dir.glob("*.log") if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return LogTailOut()
+    latest = files[0]
+    raw = await asyncio.to_thread(latest.read_text, "utf-8", "replace")
+    entries = raw.splitlines()
+    if level:
+        lvl = f"| {level.strip().upper()}"
+        entries = [ln for ln in entries if lvl in ln]
+    if search:
+        needle = search.strip().lower()
+        entries = [ln for ln in entries if needle in ln.lower()]
+    capped = min(max(lines, 1), 500)
+    sanitized = [_SECRET_RE.sub("[REDACTED]", ln) for ln in entries[-capped:]]
+    return LogTailOut(file=latest.name, total_matched=len(entries), lines=sanitized)
