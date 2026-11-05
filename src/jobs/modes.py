@@ -10,6 +10,7 @@ class Mode(StrEnum):
     FLASH_T2V = "flash_t2v"
     IMG = "img"
     I2V = "i2v"
+    FL2V = "fl2v"
     FLASH_I2V = "flash_i2v"
     I2I2V = "i2i2v"
     F2V = "f2v"
@@ -45,6 +46,39 @@ def is_start_frame_model(model_key: str | None) -> bool:
     )
 
 
+def is_interpolation_model(model_key: str | None) -> bool:
+    """True when `model_key` targets Flow's `batchAsyncGenerateVideoStartAndEndImage` endpoint."""
+    if not model_key:
+        return False
+    return "_interpolation_" in model_key or model_key.endswith("_fl")
+
+
+def interpolation_model_candidates(model_key: str | None) -> list[str]:
+    """Ordered fallback model keys for Start + End frame interpolation across Flow cohorts."""
+    out: list[str] = []
+
+    def _add(k: str | None) -> None:
+        if k and k not in out:
+            out.append(k)
+
+    if model_key and is_interpolation_model(model_key):
+        _add(model_key)
+        if model_key.endswith("_low_priority"):
+            _add(model_key.removesuffix("_low_priority"))
+    elif model_key and "_4s" in model_key:
+        _add("veo_3_1_interpolation_lite_4s_low_priority")
+        _add("veo_3_1_interpolation_lite_4s")
+    elif model_key and "_6s" in model_key:
+        _add("veo_3_1_interpolation_lite_6s_low_priority")
+        _add("veo_3_1_interpolation_lite_6s")
+    else:
+        _add("veo_3_1_interpolation_lite_low_priority")
+
+    _add("veo_3_1_interpolation_lite")
+    _add("veo_3_1_i2v_s_fast_fl")
+    return out
+
+
 @dataclass(frozen=True)
 class ModeSpec:
     """What a mode needs from each row and what it produces."""
@@ -58,15 +92,24 @@ class ModeSpec:
     avatar: bool = False
     optional_avatar: bool = False
     static_image: bool = False
+    end_image: bool = False
+    requires_frames: bool = False
     durations: tuple[int, ...] = ()
     default_duration: int | None = None
     aspect_ratios: tuple[str, ...] = ("16:9", "9:16")
     default_aspect_ratio: str = "16:9"
     duration_models: dict[int, str] = field(default_factory=dict)
     frame_duration_models: dict[int, str] = field(default_factory=dict)
+    interpolation_duration_models: dict[int, str] = field(default_factory=dict)
     default_video_model: Callable[[Settings], str | None] = lambda settings: None
 
-    def video_model(self, settings: Settings, duration: int | None = None) -> str | None:
+    def video_model(self, settings: Settings, duration: int | None = None, *, has_end_image: bool = False) -> str | None:
+        if has_end_image:
+            if duration is not None and duration in self.interpolation_duration_models:
+                return self.interpolation_duration_models[duration]
+            if duration is not None and duration in self.duration_models and is_interpolation_model(self.duration_models[duration]):
+                return self.duration_models[duration]
+            return settings.interpolation_model_key
         if duration is not None and duration in self.duration_models:
             return self.duration_models[duration]
         return self.default_video_model(settings)
@@ -87,6 +130,12 @@ _VEO_I2V_BY_DURATION = {
     4: "veo_3_1_i2v_s_lite_4s_low_priority",
     6: "veo_3_1_i2v_s_lite_6s_low_priority",
     8: "veo_3_1_r2v_lite_low_priority",
+}
+
+_VEO_INTERPOLATION_BY_DURATION = {
+    4: "veo_3_1_interpolation_lite_4s_low_priority",
+    6: "veo_3_1_interpolation_lite_6s_low_priority",
+    8: "veo_3_1_interpolation_lite_low_priority",
 }
 
 _FLASH_T2V_BY_DURATION = {
@@ -141,9 +190,19 @@ MODES: dict[Mode, ModeSpec] = {
     Mode.I2V: ModeSpec(
         title="Text → image → video (or one static image → video)",
         makes_images=True, makes_videos=True, needs_video_prompt=True, needs_image_prompt=True,
-        static_image=True,
+        static_image=True, end_image=True,
         durations=(4, 6, 8), default_duration=8,
         duration_models=_VEO_I2V_BY_DURATION,
+        interpolation_duration_models=_VEO_INTERPOLATION_BY_DURATION,
+    ),
+    Mode.FL2V: ModeSpec(
+        title="Start + end frames → video",
+        makes_images=False, makes_videos=True, needs_video_prompt=True, needs_image_prompt=False,
+        static_image=True, end_image=True, requires_frames=True,
+        durations=(4, 6, 8), default_duration=8,
+        duration_models=_VEO_INTERPOLATION_BY_DURATION,
+        interpolation_duration_models=_VEO_INTERPOLATION_BY_DURATION,
+        default_video_model=lambda s: s.interpolation_model_key,
     ),
     Mode.FLASH_I2V: ModeSpec(
         title="Text → image → video (flash model)",

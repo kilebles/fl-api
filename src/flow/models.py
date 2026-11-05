@@ -162,6 +162,13 @@ class StartImage(BaseModel):
     cropCoordinates: CropCoordinates = Field(default_factory=CropCoordinates)
 
 
+class EndImage(BaseModel):
+    """End image for start-and-end-frame keyframe interpolation."""
+
+    mediaId: str
+    cropCoordinates: CropCoordinates = Field(default_factory=CropCoordinates)
+
+
 class F2vRequestItem(BaseModel):
     """Single frame-to-video request within a batch."""
 
@@ -179,6 +186,27 @@ class F2vGenerationRequest(BaseModel):
     clientContext: ClientContext
     mediaGenerationContext: MediaGenerationContext
     requests: list[F2vRequestItem]
+    useV2ModelConfig: bool = True
+
+
+class StartEndVideoRequestItem(BaseModel):
+    """Single start-and-end-frame interpolation request within a batch."""
+
+    aspectRatio: str = AspectRatio.LANDSCAPE.value
+    seed: int = Field(ge=1, le=99999)
+    textInput: TextInput
+    videoModelKey: str = "veo_3_1_interpolation_lite"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    startImage: StartImage
+    endImage: EndImage
+
+
+class StartEndVideoGenerationRequest(BaseModel):
+    """Request body for start-and-end-frame keyframe interpolation."""
+
+    clientContext: ClientContext
+    mediaGenerationContext: MediaGenerationContext
+    requests: list[StartEndVideoRequestItem]
     useV2ModelConfig: bool = True
 
 

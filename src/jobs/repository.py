@@ -53,6 +53,7 @@ class JobRecord(Base):
     avatar_key: Mapped[str | None] = mapped_column(String(300))
     avatar_keys: Mapped[list[str] | None] = mapped_column(JSON, default=None)
     static_image_key: Mapped[str | None] = mapped_column(String(300))
+    end_image_key: Mapped[str | None] = mapped_column(String(300), default=None)
     pass_num: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -129,6 +130,7 @@ class JobRepository:
                 avatar_key=request.avatar,
                 avatar_keys=request.avatar_keys,
                 static_image_key=request.static_image,
+                end_image_key=request.end_image,
                 pass_num=0,
                 created_at=utcnow(),
             )
@@ -296,6 +298,7 @@ class JobRepository:
                         avatar_key = meta.get("avatar_key")
                         avatar_keys = meta.get("avatar_keys")
                         static_image_key = meta.get("static_image_key")
+                        end_image_key = meta.get("end_image_key")
                         created_raw = meta.get("created_at")
                         created_at = parse_naive_utc(created_raw if isinstance(created_raw, str) else None)
                     else:
@@ -325,6 +328,7 @@ class JobRepository:
                         avatar_key = None
                         avatar_keys = None
                         static_image_key = None
+                        end_image_key = None
 
                     finished_at = max((obj.last_modified for _, _, _, obj in jfiles), default=created_at)
                     total = len(rows)
@@ -351,6 +355,7 @@ class JobRepository:
                         avatar_key=avatar_key,
                         avatar_keys=avatar_keys,
                         static_image_key=static_image_key,
+                        end_image_key=end_image_key,
                         pass_num=1,
                         created_at=created_at,
                         started_at=created_at,

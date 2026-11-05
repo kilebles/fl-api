@@ -65,6 +65,8 @@ async def modes() -> list[ModeInfo]:
             needs_image_prompt=spec.needs_image_prompt,
             avatar=spec.avatar,
             static_image=spec.static_image,
+            end_image=spec.end_image,
+            requires_frames=spec.requires_frames,
             chain=spec.chain,
             durations=list(spec.durations),
             default_duration=spec.default_duration,
@@ -165,7 +167,7 @@ async def sync_jobs(queue: Queue, _admin: AdminCaller) -> dict[str, int]:
 async def create_job(body: JobRequest, request: Request, queue: Queue, caller: Caller) -> JobStatus:
     if body.project_id:
         await request.app.state.projects.get(body.project_id, user_id=caller.user_id)
-    for key in (body.avatar, body.static_image, *(body.avatar_keys or ())):
+    for key in (body.avatar, body.static_image, body.end_image, *(body.avatar_keys or ())):
         if key is not None:
             check_upload_key_owner(key, caller)
     return await queue.submit(body, user_id=caller.user_id)
@@ -184,6 +186,7 @@ async def get_job(job_id: str, queue: Queue, caller: Caller) -> JobDetail:
         avatar=record.avatar_key,
         avatar_keys=record.resolved_avatar_keys,
         static_image=record.static_image_key,
+        end_image=record.end_image_key,
     )
 
 

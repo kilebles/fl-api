@@ -26,6 +26,7 @@ def check_rows(
     static_image: bool,
     duration: int | None = None,
     aspect_ratio: str | None = None,
+    end_image: bool = False,
 ) -> None:
     """Validate rows and input pictures against what the mode needs; raises ValueError."""
     spec = MODES[mode]
@@ -43,6 +44,12 @@ def check_rows(
         raise ValueError(f"mode {mode} needs an avatar picture")
     if static_image and not spec.static_image:
         raise ValueError(f"mode {mode} does not take a static image")
+    if end_image and not spec.end_image:
+        raise ValueError(f"mode {mode} does not take an end image")
+    if end_image and not static_image:
+        raise ValueError(f"mode {mode}: end_image requires static_image (start frame)")
+    if spec.requires_frames and not (static_image and end_image):
+        raise ValueError(f"mode {mode} requires both static_image (start frame) and end_image (end frame)")
     if duration is not None:
         if not spec.durations:
             raise ValueError(f"mode {mode} does not take a video duration")
@@ -67,7 +74,8 @@ class JobSpec(BaseModel):
     strategy: Strategy = Strategy.PARALLEL
     duration: int | None = Field(default=None, description="Video clip duration in seconds (4, 6, 8, or 10)")
     aspect_ratio: str | None = Field(default=None, description="Output aspect ratio ('16:9', '9:16', or '1:1')")
-    static_image: Path | None = Field(default=None, description="i2v: one picture used as the source of every video")
+    static_image: Path | None = Field(default=None, description="i2v / fl2v: start frame picture used as the source of every video")
+    end_image: Path | None = Field(default=None, description="fl2v / i2v: end frame picture for start+end keyframe interpolation")
     avatar: Path | None = Field(default=None, description="i2i2v: primary reference picture kept in every generated image")
     avatars: list[Path] = Field(default_factory=list, description="Multi-angle avatar reference pictures (ordered, primary first)")
     video_model_key: str | None = Field(default=None, description="Override of the mode's video model")
@@ -89,8 +97,13 @@ class JobSpec(BaseModel):
             self.static_image is not None,
             duration=self.duration,
             aspect_ratio=self.aspect_ratio,
+            end_image=self.end_image is not None,
         )
-        for path in (*self.avatars, *( [self.static_image] if self.static_image is not None else [] )):
+        for path in (
+            *self.avatars,
+            *([self.static_image] if self.static_image is not None else []),
+            *([self.end_image] if self.end_image is not None else []),
+        ):
             if not path.is_file():
                 raise ValueError(f"file not found: {path}")
         return self
@@ -106,7 +119,8 @@ class JobRequest(BaseModel):
     strategy: Strategy = Strategy.PARALLEL
     duration: int | None = Field(default=None, description="Video clip duration in seconds (4, 6, 8, or 10)")
     aspect_ratio: str | None = Field(default=None, max_length=16, description="Output aspect ratio ('16:9', '9:16', or '1:1')")
-    static_image: str | None = Field(default=None, description="i2v: key of the picture used for every video")
+    static_image: str | None = Field(default=None, description="i2v / fl2v: key of the start picture used for every video")
+    end_image: str | None = Field(default=None, description="fl2v / i2v: key of the end picture for start+end keyframe interpolation")
     avatar: str | None = Field(default=None, description="i2i2v: key of the primary reference picture")
     avatar_keys: list[str] | None = Field(default=None, max_length=8, description="Ordered multi-angle avatar reference keys")
     video_model_key: str | None = Field(default=None, description="Override of the mode's video model")
@@ -127,6 +141,7 @@ class JobRequest(BaseModel):
             self.static_image is not None,
             duration=self.duration,
             aspect_ratio=self.aspect_ratio,
+            end_image=self.end_image is not None,
         )
         return self
 

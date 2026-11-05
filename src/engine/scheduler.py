@@ -74,6 +74,7 @@ class WorkItem:
     video_prompt: str | None = None
     image_prompt: str | None = None
     image_path: Path | None = None
+    end_image_path: Path | None = None
     retries: int = 0
 
     @property
@@ -456,9 +457,14 @@ class BatchScheduler:
             else:
                 await self._settle(state, item, "failed", skip_reason=f"source image missing: {item.image_path}")
             return False
+        if item.end_image_path is not None and not item.end_image_path.exists():
+            await self._settle(state, item, "failed", skip_reason=f"end image missing: {item.end_image_path}")
+            return False
         try:
             extra_vid: dict[str, object] = {}
-            if self._options.reference_images:
+            if item.end_image_path is not None:
+                extra_vid["end_image"] = item.end_image_path
+            elif self._options.reference_images:
                 extra_vid["extra_references"] = self._options.reference_images[:2]
             if self._options.aspect_ratio is not None:
                 extra_vid["aspect_ratio"] = self._options.aspect_ratio

@@ -14,6 +14,7 @@ from src.flow.http import API_BASE, api_endpoint, api_headers, error_reason
 from src.flow.models import (
     ClientContext,
     CropCoordinates,
+    EndImage,
     F2vGenerationRequest,
     F2vRequestItem,
     ImageVideoGenerationRequest,
@@ -21,6 +22,8 @@ from src.flow.models import (
     MediaGenerationContext,
     RecaptchaContext,
     ReferenceImage,
+    StartEndVideoGenerationRequest,
+    StartEndVideoRequestItem,
     StartImage,
     StructuredPrompt,
     TextInput,
@@ -137,6 +140,43 @@ class VideoGenerationService:
         )
         url = f"{API_BASE}/video:batchAsyncGenerateVideoStartImage"
         return await self._submit(url, request.model_dump_json(), authorization, proxy_url, browser_headers, cookies, "F2V generation")
+
+    async def generate_from_start_and_end_frames(
+        self,
+        prompt: str,
+        start_media_id: str,
+        end_media_id: str,
+        authorization: str,
+        project_id: str,
+        recaptcha_token: str,
+        proxy_url: str | None = None,
+        browser_headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        model_key: str | None = None,
+        crop_coordinates: CropCoordinates | None = None,
+        aspect_ratio: str | None = None,
+    ) -> VideoGenerationResponse:
+        """Submit a keyframe interpolation request with both `startImage` and `endImage`."""
+        logger.info(f"Sending start+end frame interpolation request: {prompt}")
+        crop = crop_coordinates or CropCoordinates()
+        request = StartEndVideoGenerationRequest(
+            clientContext=self._client_context(project_id, recaptcha_token),
+            mediaGenerationContext=self._media_context(),
+            requests=[
+                StartEndVideoRequestItem(
+                    aspectRatio=resolve_video_aspect_ratio(aspect_ratio, self._settings.video_aspect_ratio),
+                    seed=random.randint(1, 99999),
+                    textInput=self._text_input(prompt),
+                    videoModelKey=model_key or self._settings.interpolation_model_key,
+                    startImage=StartImage(mediaId=start_media_id, cropCoordinates=crop),
+                    endImage=EndImage(mediaId=end_media_id, cropCoordinates=crop),
+                )
+            ],
+        )
+        url = f"{API_BASE}/video:batchAsyncGenerateVideoStartAndEndImage"
+        return await self._submit(
+            url, request.model_dump_json(), authorization, proxy_url, browser_headers, cookies, "FL2V generation"
+        )
 
     async def upload_image(
         self,

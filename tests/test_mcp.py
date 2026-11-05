@@ -316,6 +316,38 @@ async def test_mcp_full_pipeline_project_avatar_prompts_handoff_and_job(tmp_path
                     assert "veo_3_1_t2v_lite_4s_low_priority" in fake_session.model_keys
                     assert "9:16" in fake_session.video_aspect_ratios
 
+                    fl2v_meta = next(m for m in modes_catalog if m["id"] == "fl2v")
+                    assert fl2v_meta["end_image"] is True and fl2v_meta["requires_frames"] is True
+                    end_upload = _call_result_json(
+                        await session.call_tool("upload_input_image", {"file_path": str(avatar_pic)})
+                    )
+                    fl2v_job = _call_result_json(
+                        await session.call_tool(
+                            "submit_generation_job",
+                            {
+                                "mode": "fl2v",
+                                "duration": 6,
+                                "aspect_ratio": "16:9",
+                                "prompts": ["orbit camera from frame A to frame B"],
+                                "static_image_key": ref_analysis["key"],
+                                "end_image_key": end_upload["key"],
+                                "project_id": proj["id"],
+                            },
+                        )
+                    )
+                    for _ in range(80):
+                        fl_details = _call_result_json(
+                            await session.call_tool("get_job_details", {"job_id": fl2v_job["id"]})
+                        )
+                        if fl_details["job"]["state"] in ("done", "stopped", "failed"):
+                            break
+                        await asyncio.sleep(0.03)
+                    assert fl_details["job"]["state"] == "done"
+                    assert fl_details["job"]["static_image"] == ref_analysis["key"]
+                    assert fl_details["job"]["end_image"] == end_upload["key"]
+                    assert "veo_3_1_interpolation_lite_6s_low_priority" in fake_session.model_keys
+                    assert any(p is not None for p in fake_session.end_sources)
+
                     diag = _call_result_json(
                         await session.call_tool("diagnose_job", {"job_id": custom_job["id"]})
                     )

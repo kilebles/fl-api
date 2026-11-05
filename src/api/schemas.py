@@ -14,6 +14,8 @@ class ModeInfo(BaseModel):
     needs_image_prompt: bool
     avatar: bool
     static_image: bool
+    end_image: bool = False
+    requires_frames: bool = False
     chain: bool
     durations: list[int] = []
     default_duration: int | None = None
@@ -38,6 +40,7 @@ class JobDetail(JobStatus):
     avatar: str | None = None
     avatar_keys: list[str] = []
     static_image: str | None = None
+    end_image: str | None = None
 
 
 class JobFile(BaseModel):

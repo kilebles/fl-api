@@ -38,6 +38,7 @@ class FakeSession:
         self.videos_made: list[str] = []
         self.model_keys: list[str | None] = []
         self.sources: list[Path | None] = []
+        self.end_sources: list[Path | None] = []
         self.image_references: list[list[Path]] = []
         self.video_extra_references: list[list[Path]] = []
         self.image_aspect_ratios: list[str | None] = []
@@ -92,6 +93,7 @@ class FakeSession:
         prompt: str,
         image: Path | None = None,
         frame: Path | None = None,
+        end_image: Path | None = None,
         model_key: str | None = None,
         extra_references: list[Path] | None = None,
         aspect_ratio: str | None = None,
@@ -103,6 +105,7 @@ class FakeSession:
             raise GenerationFilteredError(f"filtered: {prompt}")
         self.model_keys.append(model_key)
         self.sources.append(image or frame)
+        self.end_sources.append(end_image)
         self.video_extra_references.append(list(extra_references or []))
         self.video_aspect_ratios.append(aspect_ratio)
         return SubmittedVideo(media_id=f"{self.name}-{index}-{prompt}", project_id="p", proxy_url=None, cookies={})

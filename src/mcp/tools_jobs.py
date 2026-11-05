@@ -104,6 +104,8 @@ def build_modes_catalog() -> list[dict[str, Any]]:
             "avatar": spec.avatar,
             "optional_avatar": spec.optional_avatar,
             "static_image": spec.static_image,
+            "end_image": spec.end_image,
+            "requires_frames": spec.requires_frames,
             "chain": spec.chain,
             "durations": list(spec.durations),
             "default_duration": spec.default_duration,
@@ -114,6 +116,10 @@ def build_modes_catalog() -> list[dict[str, Any]]:
             entry["video_models_by_duration"] = {str(k): v for k, v in spec.duration_models.items()}
         if spec.frame_duration_models:
             entry["frame_models_by_duration"] = {str(k): v for k, v in spec.frame_duration_models.items()}
+        if spec.interpolation_duration_models:
+            entry["interpolation_models_by_duration"] = {
+                str(k): v for k, v in spec.interpolation_duration_models.items()
+            }
         out.append(entry)
     return out
 
@@ -126,7 +132,7 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         annotations=READ_ONLY,
     )
     async def list_generation_modes(ctx: Context | None = None) -> list[dict[str, Any]]:
-        """List all Google Flow generation modes (t2v, flash_t2v, img, i2v, flash_i2v, i2i2v, f2v), supported video durations (4/6/8/10s), aspect ratios (16:9, 9:16, 1:1), and required inputs."""
+        """List all Google Flow generation modes (t2v, flash_t2v, img, i2v, fl2v, flash_i2v, i2i2v, f2v), supported video durations (4/6/8/10s), aspect ratios (16:9, 9:16, 1:1), and required inputs."""
         api_modes: list[dict[str, Any]] = await client.request("GET", "/api/modes", caller_headers=_ctx_headers(ctx))
         by_id = {m["id"]: m for m in build_modes_catalog()}
         return [{**by_id.get(m["id"], {}), **m} for m in api_modes]
@@ -241,7 +247,7 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         file_path: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Upload a local picture (.jpg, .jpeg, .png, .webp) to the object store for use as a static_image or avatar reference."""
+        """Upload a local picture (.jpg, .jpeg, .png, .webp) to the object store for use as a static_image, end_image, or avatar reference."""
         path = Path(file_path).expanduser().resolve()
         if not path.is_file():
             raise ValueError(f"Local file not found: {path}")
@@ -271,6 +277,7 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         avatar_key: str | None = None,
         avatar_keys: list[str] | None = None,
         static_image_key: str | None = None,
+        end_image_key: str | None = None,
         video_model_key: str | None = None,
         apply_project_style: bool = True,
         ctx: Context | None = None,
@@ -283,7 +290,11 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         - `prompts`: simple list of prompt strings `["shot 1...", "shot 2..."]` (auto-numbered 1..N)
         - `xlsx_path`: path to a local `.xlsx` file with `number`, `prompt` / `img_prompt` + `vid_prompt` columns.
 
-        Video duration (`duration`): `4`, `6`, or `8` sec for Veo 3.1 (`t2v`, `i2v`, `i2i2v`, default `8`);
+        Keyframe interpolation (Start + End Frame):
+        - Use `mode="fl2v"` (or `mode="i2v"`) with both `static_image_key` (start frame) and `end_image_key` (end frame)
+          for 3D camera orbits and smooth transitions between two keyframes (`duration`: `4`, `6`, or `8` sec).
+
+        Video duration (`duration`): `4`, `6`, or `8` sec for Veo 3.1 (`t2v`, `i2v`, `fl2v`, `i2i2v`, default `8`);
         `4`, `6`, `8`, or `10` sec for Omni 1.1 Flash (`flash_t2v`, `flash_i2v`, default `10`) and chained `f2v` (default `8`).
         Aspect ratio (`aspect_ratio`): `"16:9"` or `"9:16"` for video modes, plus `"1:1"` for `img`.
         """
@@ -348,6 +359,7 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             "avatar": resolved_avatar_key,
             "avatar_keys": resolved_avatar_keys,
             "static_image": static_image_key,
+            "end_image": end_image_key,
             "video_model_key": video_model_key,
         }
         return await client.request("POST", "/api/jobs", json_body=body, caller_headers=headers)

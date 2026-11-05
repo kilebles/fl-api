@@ -83,7 +83,9 @@ class JobRunner:
         output = output or JobOutput(spec)
         output.directory.mkdir(parents=True, exist_ok=True)
         mode = MODES[spec.mode]
-        model_key = spec.video_model_key or mode.video_model(self._settings, spec.duration)
+        model_key = spec.video_model_key or mode.video_model(
+            self._settings, spec.duration, has_end_image=spec.end_image is not None
+        )
         frame_model_key = mode.frame_video_model(self._settings, spec.duration)
         sessions = self._make_sessions(accounts, Strategy.SEQUENTIAL if mode.chain else spec.strategy)
         pass_num = 0

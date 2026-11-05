@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     flash_t2v_model_key: str = Field(default="abra_t2v_10s", description="Text-to-video model of the flash_t2v and f2v modes")
     flash_i2v_model_key: str = Field(default="abra_r2v_10s", description="Image-to-video model of the flash_i2v mode")
     f2v_model_key: str = Field(default="abra_t2v_10s", description="Frame-to-video model for f2v clips after the first one")
+    interpolation_model_key: str = Field(
+        default="veo_3_1_interpolation_lite_low_priority",
+        description="Start+end frame interpolation model key",
+    )
     image_model_name: str = Field(
         default="BELUGA",
         description="Primary image model for flowMedia:batchGenerateImages; BELUGA = Nano Banana 2.1, GEM_PIX_2 = Nano Banana Pro",

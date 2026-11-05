@@ -782,3 +782,54 @@ async def test_duration_and_aspect_ratio_routing_and_validation(tmp_path: Path, 
     assert st2 is JobState.DONE
     assert s_f2v.model_keys == ["veo_3_1_t2v_lite_4s_low_priority", "veo_3_1_i2v_s_lite_4s_low_priority"]
     assert s_f2v.video_aspect_ratios == ["9:16", "9:16"]
+
+
+async def test_fl2v_and_i2v_end_image_validation_and_runner(tmp_path: Path, monkeypatch):
+    start_pic = tmp_path / "start.jpg"
+    start_pic.write_bytes(b"start")
+    end_pic = tmp_path / "end.jpg"
+    end_pic.write_bytes(b"end")
+
+    # Validation: fl2v requires both start and end frames; i2v rejects end_image without static_image; t2v rejects end_image
+    with pytest.raises(ValidationError, match="requires both static_image"):
+        JobRequest(mode=Mode.FL2V, static_image="inputs/a.jpg", rows=[JobRow(name="1", prompt="orbit")])
+    with pytest.raises(ValidationError, match="end_image requires static_image"):
+        JobRequest(mode=Mode.I2V, end_image="inputs/b.jpg", rows=[JobRow(name="1", prompt="orbit", image_prompt="x")])
+    with pytest.raises(ValidationError, match="does not take an end image"):
+        JobRequest(mode=Mode.T2V, end_image="inputs/b.jpg", rows=[JobRow(name="1", prompt="orbit")])
+
+    # Runner: fl2v 6s routes both frames + interpolation 6s model key
+    s_fl = FakeSession("a", tmp_path / "tmp_fl")
+    runner = _runner_with(tmp_path, monkeypatch, [s_fl])
+    spec_fl = JobSpec(
+        mode=Mode.FL2V,
+        duration=6,
+        aspect_ratio="16:9",
+        static_image=start_pic,
+        end_image=end_pic,
+        rows=[JobRow(name="1", prompt="orbit camera 180 degrees")],
+        output_dir=tmp_path / "out_fl",
+    )
+    st, _, _ = await runner.run(spec_fl)
+    assert st is JobState.DONE
+    assert s_fl.model_keys == ["veo_3_1_interpolation_lite_6s_low_priority"]
+    assert s_fl.sources == [start_pic]
+    assert s_fl.end_sources == [end_pic]
+
+    # Runner: i2v with static_image + end_image ALSO upgrades to interpolation model without making images
+    s_i2v_fl = FakeSession("b", tmp_path / "tmp_i2v_fl")
+    runner2 = _runner_with(tmp_path, monkeypatch, [s_i2v_fl])
+    spec_i2v_fl = JobSpec(
+        mode=Mode.I2V,
+        duration=4,
+        static_image=start_pic,
+        end_image=end_pic,
+        rows=[JobRow(name="1", prompt="push in and orbit")],
+        output_dir=tmp_path / "out_i2v_fl",
+    )
+    st2, _, _ = await runner2.run(spec_i2v_fl)
+    assert st2 is JobState.DONE
+    assert s_i2v_fl.images_made == []
+    assert s_i2v_fl.model_keys == ["veo_3_1_interpolation_lite_4s_low_priority"]
+    assert s_i2v_fl.sources == [start_pic]
+    assert s_i2v_fl.end_sources == [end_pic]

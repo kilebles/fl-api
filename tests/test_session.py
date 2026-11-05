@@ -370,3 +370,58 @@ async def test_short_duration_i2v_routes_to_start_frame_endpoint_and_portrait_as
     assert r2v_calls[0]["model_key"] == "abra_r2v_4s"
     assert r2v_calls[0]["extra_media_ids"] == ["up-avatar"]
     await session.close()
+
+
+async def test_start_and_end_frame_interpolation_and_cohort_fallback(tmp_path: Path):
+    session, _, _ = await _session(tmp_path, 1, [])
+    start_f = tmp_path / "start.jpg"
+    start_f.write_bytes(b"start")
+    end_f = tmp_path / "end.jpg"
+    end_f.write_bytes(b"end")
+
+    interp_calls: list[dict] = []
+
+    class InterpVideo:
+        async def upload_image(self, image_path: Path, **kwargs) -> str:
+            return f"up-{image_path.stem}"
+
+        async def generate_from_start_and_end_frames(self, **kwargs):
+            interp_calls.append(dict(kwargs))
+            mk = kwargs.get("model_key", "")
+            # Simulate a cohort where `_low_priority` and `_4s` return 400 INVALID_ARGUMENT,
+            # while base `veo_3_1_interpolation_lite` succeeds!
+            if mk in ("veo_3_1_interpolation_lite_4s_low_priority", "veo_3_1_interpolation_lite_4s"):
+                raise _error(400, "INVALID_ARGUMENT")
+            return VideoGenerationResponse(media=[MediaInfo(media_id="v-interp", project_id="proj", workflow_id="", status="")])
+
+    session._video = InterpVideo()
+
+    sub1 = await session.submit_video(
+        0,
+        "180-degree camera orbit from back view to front view",
+        image=start_f,
+        end_image=end_f,
+        model_key="veo_3_1_interpolation_lite_4s_low_priority",
+        aspect_ratio="16:9",
+    )
+    assert sub1.media_id == "v-interp"
+    assert [c["model_key"] for c in interp_calls] == [
+        "veo_3_1_interpolation_lite_4s_low_priority",
+        "veo_3_1_interpolation_lite_4s",
+        "veo_3_1_interpolation_lite",
+    ]
+    assert interp_calls[-1]["start_media_id"] == "up-start"
+    assert interp_calls[-1]["end_media_id"] == "up-end"
+
+    # Second shot reuses the cached working key immediately without 400 retries!
+    interp_calls.clear()
+    sub2 = await session.submit_video(
+        1,
+        "second orbit",
+        image=start_f,
+        end_image=end_f,
+        model_key="veo_3_1_interpolation_lite_4s_low_priority",
+    )
+    assert sub2.media_id == "v-interp"
+    assert [c["model_key"] for c in interp_calls] == ["veo_3_1_interpolation_lite"]
+    await session.close()

@@ -78,7 +78,8 @@ POST /api/jobs (JobRequest) → jobs table (queued) → JobQueue worker:
 | `t2v` | prompt | mp4 | `VIDEO_MODEL_KEY` |
 | `flash_t2v` | prompt | mp4 | `FLASH_T2V_MODEL_KEY` (abra_t2v_10s) |
 | `img` | image_prompt | jpg | — (`IMAGE_MODEL_NAME`) |
-| `i2v` | prompt + image_prompt, or `static_image` for all rows | jpg + mp4 | `I2V_MODEL_KEY` |
+| `i2v` | prompt + image_prompt, or `static_image` (+ optional `end_image`) for all rows | jpg + mp4 | `I2V_MODEL_KEY` (`INTERPOLATION_MODEL_KEY` when `end_image` is set) |
+| `fl2v` | prompt + `static_image` (start) + `end_image` (end) | mp4 | `INTERPOLATION_MODEL_KEY` |
 | `flash_i2v` | prompt + image_prompt | jpg + mp4 | `FLASH_I2V_MODEL_KEY` (abra_r2v_10s) |
 | `i2i2v` | prompt + image_prompt + `avatar` (uploaded once per project, passed as `imageInputs`) | jpg + mp4 | `I2V_MODEL_KEY` |
 | `f2v` | prompt, in order; clip N starts from the last frame of the last good clip | mp4 (+ frames/) | first clip `FLASH_T2V_MODEL_KEY`, then `F2V_MODEL_KEY` |

@@ -78,7 +78,12 @@ class JobQueue:
                 pass
 
     async def submit(self, request: JobRequest, user_id: str | None = None) -> JobStatus:
-        for key in (*(request.avatar_keys or []), *([request.avatar] if request.avatar else []), *([request.static_image] if request.static_image else [])):
+        for key in (
+            *(request.avatar_keys or []),
+            *([request.avatar] if request.avatar else []),
+            *([request.static_image] if request.static_image else []),
+            *([request.end_image] if request.end_image else []),
+        ):
             if not await self._objects.exists(key):
                 raise InputNotFoundError(f"uploaded file not found: {key}")
         record = await self._repo.create(uuid.uuid4().hex[:12], request, user_id=user_id)
@@ -96,6 +101,7 @@ class JobQueue:
             "avatar_key": record.avatar_key,
             "avatar_keys": record.resolved_avatar_keys,
             "static_image_key": record.static_image_key,
+            "end_image_key": record.end_image_key,
             "created_at": f"{record.created_at.isoformat()}Z",
         }
         try:
@@ -301,6 +307,12 @@ class JobQueue:
             if not static_path.exists():
                 await self._objects.download(record.static_image_key, static_path)
 
+        end_path: Path | None = None
+        if record.end_image_key:
+            end_path = work / "inputs" / f"end_image{PurePosixPath(record.end_image_key).suffix}"
+            if not end_path.exists():
+                await self._objects.download(record.end_image_key, end_path)
+
         valid_rows = {r.name for r in record.job_rows}
         done_rows = {f.row for f in files if f.kind == "skip" or f.kind == ("video" if mode.makes_videos else "image")}
         for f in files:
@@ -328,4 +340,5 @@ class JobQueue:
             avatar=avatar_paths[0] if avatar_paths else None,
             avatars=avatar_paths,
             static_image=static_path,
+            end_image=end_path,
         )

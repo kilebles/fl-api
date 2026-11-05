@@ -66,12 +66,21 @@ class JobOutput:
     def work_items(self, rows: list[JobRow]) -> list[WorkItem]:
         """Scheduler items for the given (missing) rows."""
         static = self._spec.static_image
+        end_img = self._spec.end_image
         items = []
         for index, row in enumerate(rows):
             if not self.mode.makes_videos:
                 items.append(WorkItem(index=index, name=row.name, image_prompt=row.image_prompt, image_path=self.image(row.name)))
             elif not self.mode.makes_images:
-                items.append(WorkItem(index=index, name=row.name, video_prompt=row.prompt))
+                items.append(
+                    WorkItem(
+                        index=index,
+                        name=row.name,
+                        video_prompt=row.prompt,
+                        image_path=static,
+                        end_image_path=end_img,
+                    )
+                )
             else:
                 items.append(WorkItem(
                     index=index,
@@ -79,5 +88,6 @@ class JobOutput:
                     video_prompt=row.prompt,
                     image_prompt=None if static else row.image_prompt,
                     image_path=static or self.image(row.name),
+                    end_image_path=end_img,
                 ))
         return items

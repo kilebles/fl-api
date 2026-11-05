@@ -649,6 +649,7 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         avatar_key: str | None = None,
         avatar_keys: list[str] | None = None,
         static_image_key: str | None = None,
+        end_image_key: str | None = None,
         title: str | None = None,
         strategy: Strategy | None = None,
         duration: Literal[4, 6, 8, 10] | None = None,
@@ -728,6 +729,7 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             "avatar": resolved_avatar_key,
             "avatar_keys": resolved_avatar_keys,
             "static_image": static_image_key,
+            "end_image": end_image_key,
             "video_model_key": video_model_key,
         }
         return await client.request("POST", "/api/jobs", json_body=body, caller_headers=headers)

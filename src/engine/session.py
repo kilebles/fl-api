@@ -35,7 +35,7 @@ from src.flow.http import MODEL_ACCESS_DENIED, QUOTA_REACHED, TOO_MUCH_TRAFFIC, 
 from src.flow.image import ImageGenerationService
 from src.flow.polling import PollingService
 from src.flow.video import VideoGenerationService
-from src.jobs.modes import is_start_frame_model
+from src.jobs.modes import interpolation_model_candidates, is_start_frame_model
 
 T = TypeVar("T")
 
@@ -143,6 +143,7 @@ class AccountSession:
         self._last_timeout_index: int | None = None
         self._alive_token_timeouts = 0
         self._reference_media: dict[tuple[str, str], str] = {}
+        self._interpolation_overrides: dict[tuple[str, str], str] = {}
 
     @property
     def name(self) -> str:
@@ -258,17 +259,22 @@ class AccountSession:
         prompt: str,
         image: Path | None = None,
         frame: Path | None = None,
+        end_image: Path | None = None,
         model_key: str | None = None,
         extra_references: list[Path] | None = None,
         aspect_ratio: str | None = None,
     ) -> SubmittedVideo:
-        """Send a video request: text-to-video, image-to-video (`image`) or frame-to-video (`frame`)."""
+        """Send a video request: text-to-video, image-to-video (`image`), frame-to-video (`frame`), or start+end (`image` + `end_image`)."""
         if image is not None and frame is not None:
             raise ValueError("pass either image or frame, not both")
         source = image or frame
+        if end_image is not None and source is None:
+            raise ValueError("end_image requires a start image or frame")
         use_start_frame = frame is not None or (image is not None and is_start_frame_model(model_key))
         label = (
-            f"f2v {source.name}"
+            f"fl2v {source.name} -> {end_image.name}"
+            if end_image is not None and source is not None
+            else f"f2v {source.name}"
             if frame is not None
             else f"i2v-frame {source.name}"
             if use_start_frame
@@ -302,6 +308,49 @@ class AccountSession:
                     browser_headers=self._credentials.browser_headers or None,
                     cookies=cookies,
                 )
+                if end_image is not None:
+                    end_media_id = await self._video.upload_image(
+                        image_path=end_image,
+                        authorization=self._credentials.authorization,
+                        project_id=self._credentials.project_id,
+                        proxy_url=proxy_url,
+                        browser_headers=self._credentials.browser_headers or None,
+                        cookies=cookies,
+                    )
+                    did = self._manager.current.dolphin_id
+                    req_key = model_key or self._settings.interpolation_model_key
+                    cached_key = self._interpolation_overrides.get((did, req_key))
+                    candidates = interpolation_model_candidates(req_key)
+                    if cached_key and cached_key in candidates:
+                        candidates = [cached_key, *[c for c in candidates if c != cached_key]]
+                    for cand_idx, cand_key in enumerate(candidates):
+                        common["model_key"] = cand_key
+                        try:
+                            res = await self._video.generate_from_start_and_end_frames(
+                                prompt=prompt,
+                                start_media_id=media_id,
+                                end_media_id=end_media_id,
+                                **common,
+                            )
+                            if cand_key != req_key:
+                                self._interpolation_overrides[(did, req_key)] = cand_key
+                            return res
+                        except httpx.HTTPStatusError as exc:
+                            code = exc.response.status_code
+                            rsn = error_reason(exc.response)
+                            is_model_err = code == 404 or (code == 403 and rsn == MODEL_ACCESS_DENIED) or (
+                                code == 400 and not (rsn.startswith("PUBLIC_ERROR_") and "MODEL" not in rsn)
+                            )
+                            if not is_model_err or cand_idx >= len(candidates) - 1:
+                                raise
+                            next_key = candidates[cand_idx + 1]
+                            logger.warning(
+                                f"[{index}] Interpolation model {cand_key!r} returned {code} ({rsn or 'rejected'}) "
+                                f"— falling back to {next_key!r}"
+                            )
+                            common["recaptcha_token"] = await asyncio.wait_for(
+                                self._producer.get_token(), timeout=TOKEN_TIMEOUT
+                            )
                 if not use_start_frame:
                     extra_ids = [
                         await self._reference_media_id(ref, proxy_url)
