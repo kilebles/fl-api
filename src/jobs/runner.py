@@ -126,8 +126,7 @@ class JobRunner:
                         return await self._finish(JobState.STOPPED, output, pass_num, message, report)
                     logger.warning(f"[job] {message}")
                     await report(JobState.WAITING, message)
-                    for session in sessions:
-                        await session.close(stop_browser=True)
+                    await asyncio.gather(*(s.close(stop_browser=True) for s in sessions), return_exceptions=True)
                     await asyncio.sleep(wait)
                     prev_progress = None
                     continue
@@ -162,8 +161,7 @@ class JobRunner:
                     )
                     logger.warning(f"[job] {message}")
                     await report(JobState.WAITING, message)
-                    for session in sessions:
-                        await session.close(stop_browser=True)
+                    await asyncio.gather(*(s.close(stop_browser=True) for s in sessions), return_exceptions=True)
                     await asyncio.sleep(INFRA_RETRY_WAIT)
                     prev_progress = None
                     continue
@@ -172,17 +170,29 @@ class JobRunner:
             logger.error(f"[job] stopped: {message}")
             return await self._finish(JobState.FAILED, output, pass_num, message, report)
         finally:
-            for session in sessions:
-                await session.close(stop_browser=True)
+            await asyncio.gather(*(s.close(stop_browser=True) for s in sessions), return_exceptions=True)
 
     def _make_sessions(self, accounts: list[AccountInfo], strategy: Strategy) -> list[AccountSession]:
         if strategy is Strategy.SEQUENTIAL:
             manager = DolphinAntyManager(accounts, self._public_api, self._local_api)
             return [AccountSession(self._settings, manager)]
-        pause = scaled_poll_pause(len(accounts))
+        ordered = sorted(
+            accounts,
+            key=lambda a: (
+                cooldowns.cooldown_remaining(a.dolphin_id) > 0,
+                cooldowns.video_denied_remaining(a.dolphin_id) > 0,
+            ),
+        )
+        pause = scaled_poll_pause(len(ordered))
+        fast_cooldown = len(ordered) > 1
         return [
-            AccountSession(self._settings, DolphinAntyManager([account], self._public_api, self._local_api), poll_pause=pause)
-            for account in accounts
+            AccountSession(
+                self._settings,
+                DolphinAntyManager([account], self._public_api, self._local_api),
+                poll_pause=pause,
+                fast_403_cooldown=fast_cooldown,
+            )
+            for account in ordered
         ]
 
     def _cooldown_wait(self, accounts: list[AccountInfo], images_needed: bool) -> float:

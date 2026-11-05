@@ -179,7 +179,13 @@ def reset_video_denied(dolphin_id: str | None) -> None:
         _VIDEO_DENIED_HITS.pop(dolphin_id, None)
 
 
-def mark_cooldown(dolphin_id: str | None, account_name: str = "", max_seconds: float = 7200.0) -> float:
+def mark_cooldown(
+    dolphin_id: str | None,
+    account_name: str = "",
+    max_seconds: float = 7200.0,
+    *,
+    min_seconds: float = 300.0,
+) -> float:
     """Put the whole account on exponential cooldown (5m → 10m → … → max). Returns seconds.
 
     403 limit uses the default 2h cap, the daily video quota passes 4h.
@@ -188,7 +194,7 @@ def mark_cooldown(dolphin_id: str | None, account_name: str = "", max_seconds: f
         return 0.0
     hits = _COOLDOWN_HITS.get(dolphin_id, 0) + 1
     _COOLDOWN_HITS[dolphin_id] = hits
-    delay = min(300 * (2 ** (hits - 1)), max_seconds)
+    delay = min(max(min_seconds, 300 * (2 ** (hits - 1))), max_seconds)
     _COOLDOWNS[dolphin_id] = time.monotonic() + delay
     logger.bind(event_type="cooldown", account=account_name or None).warning(
         f"{account_name or dolphin_id} on cooldown for {delay / 60:.0f}m (hit #{hits})"

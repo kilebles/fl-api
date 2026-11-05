@@ -45,7 +45,7 @@ PROXY_COOLDOWN_AFTER_ROTATIONS = 2  # 403-limit rotations on the same proxy befo
 PROXY_ERROR_ROTATION_LIMIT = 3      # consecutive proxy/transport errors before rotating without reloading Flow
 MAX_POLL_PROXY_ERRORS = 6           # cap polling proxy/network retries so a dead proxy never hangs inflight forever
 DELAY_403 = (7.0, 14.0)
-DELAY_403_REPEAT = (30.0, 60.0)
+DELAY_403_REPEAT = (12.0, 22.0)
 DELAY_PROXY_ERROR = (4.0, 9.0)
 DELAY_429_STEPS = (7.0, 30.0, 90.0)  # pause for all requests of the session after the 1st, 2nd, 3rd consecutive 429
 DELAY_USER_QUOTA_STEPS = (15.0, 30.0, 60.0)  # pause when concurrent in-flight video slots per user are full
@@ -105,10 +105,18 @@ class AccountSession:
     while that account is on cooldown so the caller can stop using it.
     """
 
-    def __init__(self, settings: Settings, manager: DolphinAntyManager, poll_pause: tuple[float, float] = (11.0, 14.0)) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        manager: DolphinAntyManager,
+        poll_pause: tuple[float, float] = (11.0, 14.0),
+        *,
+        fast_403_cooldown: bool = False,
+    ) -> None:
         self._settings = settings
         self._manager = manager
         self._poll_pause = poll_pause
+        self._fast_403_cooldown = fast_403_cooldown
         self._credentials = CredentialsService(origin=settings.flow_base_url)
         self._video = VideoGenerationService(settings)
         self._image = ImageGenerationService(settings)
@@ -193,7 +201,12 @@ class AccountSession:
             except FATAL_ERRORS:
                 raise
             except GoogleNotSignedInError as e:
-                self._manager.mark_current_on_cooldown()
+                cooldowns.mark_cooldown(
+                    self._manager.current.dolphin_id,
+                    self._manager.current.name,
+                    max_seconds=7200.0,
+                    min_seconds=3600.0,
+                )
                 if self.can_rotate:
                     logger.warning(f"[{self.name}] Google account not signed in ({e}) — rotating to next account")
                     self._stop_generations = True
@@ -595,8 +608,9 @@ class AccountSession:
                 proxy_key = self._manager.current_proxy_key
                 failures = self._proxy_failures.get(proxy_key, 0) + 1
                 self._proxy_failures[proxy_key] = failures
-                logger.critical(f"[{index}] 403 limit on {account.name} / {proxy_key} ({failures}/{PROXY_COOLDOWN_AFTER_ROTATIONS}) — rotating")
-                if failures >= PROXY_COOLDOWN_AFTER_ROTATIONS:
+                required = 1 if self._fast_403_cooldown else PROXY_COOLDOWN_AFTER_ROTATIONS
+                logger.critical(f"[{index}] 403 limit on {account.name} / {proxy_key} ({failures}/{required}) — rotating")
+                if failures >= required:
                     self._proxy_failures.pop(proxy_key, None)
                     self._manager.mark_current_on_cooldown()
             await self._rotate_account()

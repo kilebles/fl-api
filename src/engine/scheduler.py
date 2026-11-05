@@ -224,13 +224,17 @@ class BatchScheduler:
             else:
                 state.pending.discard(item.index)
 
-        slot_sem = (
-            asyncio.Semaphore(self._options.max_active_browsers)
+        effective_browsers = (
+            min(self._options.max_active_browsers, max(2, len(items) + 1))
             if self._options.max_active_browsers > 0
-            else None
+            else 0
         )
+        slot_sem = asyncio.Semaphore(effective_browsers) if effective_browsers > 0 else None
         workers = [
-            asyncio.create_task(self._worker(_Worker(session), state, slot_sem), name=f"worker_{session.name}")
+            asyncio.create_task(
+                self._worker(_Worker(session), state, slot_sem, effective_browsers),
+                name=f"worker_{session.name}",
+            )
             for session in self._sessions
         ]
         watchdog = asyncio.create_task(self._watchdog(workers, state))
@@ -274,9 +278,11 @@ class BatchScheduler:
         w: _Worker,
         state: _BatchState,
         slot_sem: asyncio.Semaphore | None = None,
+        effective_browsers: int = 0,
     ) -> None:
         session = w.session
-        pooled = slot_sem is not None and len(self._sessions) > self._options.max_active_browsers
+        cap = effective_browsers or self._options.max_active_browsers
+        pooled = slot_sem is not None and len(self._sessions) > cap
 
         while state.fatal is None and state.pending:
             if not session.can_rotate and not self._has_work_for(session, state):
