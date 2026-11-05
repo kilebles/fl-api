@@ -13,6 +13,8 @@ class PersonalityMention(BaseModel):
     name: str
     query: str
     category: str = "people"
+    # A given subject (order of the reels brain): its card is named by this key, not by the image number.
+    key: str | None = None
 
 
 class PersonalityInfo(BaseModel):
@@ -45,3 +47,5 @@ class PersonalityEntry(BaseModel):
     # instead of the bare name.
     query: str | None = None
     images: list[PersonalityImage] = Field(default_factory=list)
+    # Given subjects only: the caller's id of the card (the reels brain uses its shot id, e.g. "12.3").
+    key: str | None = None

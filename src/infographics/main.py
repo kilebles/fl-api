@@ -70,7 +70,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Extract historical subjects (people, places, artifacts) and their Wikimedia images from a scenario docx"
     )
-    parser.add_argument("docx_path", type=Path)
+    parser.add_argument("docx_path", type=Path, nargs="?")
+    parser.add_argument(
+        "--subjects",
+        type=Path,
+        default=None,
+        help="JSON list of given subjects {key, paragraph_number, paragraph, name, query, category}: no detection, one card each",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(
         "--categories",
@@ -98,13 +104,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    output_dir = args.output_dir or args.docx_path.with_suffix("")
+    source = args.subjects or args.docx_path
+    if source is None:
+        parser.error("docx_path or --subjects is required")
+    output_dir = args.output_dir or source.with_suffix("")
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_json = output_dir / f"{args.docx_path.stem}.json"
+    output_json = output_dir / ("scenario.json" if args.subjects else f"{args.docx_path.stem}.json")
 
     pipeline = _build_pipeline()
 
-    if args.fill_missing or args.refresh_years:
+    if args.subjects:
+        entries = pipeline.run_subjects(json.loads(args.subjects.read_text(encoding="utf-8")), output_dir)
+    elif args.fill_missing or args.refresh_years:
         entries = [
             PersonalityEntry.model_validate(item)
             for item in json.loads(output_json.read_text(encoding="utf-8"))

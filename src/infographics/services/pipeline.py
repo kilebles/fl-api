@@ -128,6 +128,36 @@ class ScenarioPipeline:
             entry.images.sort(key=lambda image: image.file)
         return entries
 
+    def run_subjects(self, subjects: list[dict], output_dir: Path) -> list[PersonalityEntry]:
+        """Given subjects instead of detection (an order of the reels brain): each item is
+        {key, paragraph_number, paragraph, name, query, category}; one card per item, in order."""
+        entries: list[PersonalityEntry] = []
+        next_index_by_paragraph: dict[int, int] = {}
+        total = len(subjects)
+        for position, item in enumerate(subjects, start=1):
+            mention = PersonalityMention(
+                paragraph_number=int(item["paragraph_number"]),
+                name=str(item["name"]),
+                query=str(item.get("query") or item["name"]),
+                category=str(item.get("category") or "people"),
+                key=str(item.get("key") or "") or None,
+            )
+            info = self._get_biography(mention.name, mention.query, mention.category)
+            entry = PersonalityEntry(
+                paragraph_number=mention.paragraph_number,
+                paragraph=str(item.get("paragraph") or ""),
+                personality=info,
+                category=mention.category,
+                query=mention.query,
+                key=mention.key,
+            )
+            entries.append(entry)
+            start_index = next_index_by_paragraph.get(mention.paragraph_number, 1)
+            next_index_by_paragraph[mention.paragraph_number] = self._collect_images(entry, output_dir, start_index)
+            found = sum(1 for e in entries if e.images)
+            logger.info("PROGRESS images %d/%d found=%d", position, total, found)
+        return entries
+
     def fill_missing_images(self, entries: list[PersonalityEntry], output_dir: Path) -> None:
         """Tops up any entry with fewer than IMAGES_PER_PERSONALITY images —
         for a JSON left incomplete by transient Wikimedia rate limiting or

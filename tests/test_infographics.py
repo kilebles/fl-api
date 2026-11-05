@@ -120,3 +120,51 @@ async def test_infographics_sigterm_is_requeued_not_failed(tmp_path: Path, monke
     await svc.stop()
     assert (await svc.run(rec.id)).state == "done"
     await db.close()
+
+
+async def fake_subjects_stage(self, run_id, stage, args, cwd, log_path, entries=None, videos_dir=None):
+    """search with given subjects: no docx, one card per subject named by its key."""
+    if stage == "search":
+        assert "--subjects" in args and "--categories" not in args
+        given = json.loads(Path(args[args.index("--subjects") + 1]).read_text())
+        out = Path(args[args.index("--output-dir") + 1])
+        out.mkdir(parents=True, exist_ok=True)
+        subjects = []
+        for i, s in enumerate(given, 1):
+            (out / f"{s['paragraph_number']}.{i}.jpg").write_bytes(b"jpg")
+            subjects.append({"paragraph_number": s["paragraph_number"], "paragraph": s["paragraph"], "key": s["key"],
+                             "personality": {"name": s["name"]}, "category": s["category"],
+                             "images": [{"file": f"{s['paragraph_number']}.{i}.jpg", "source_id": str(i), "url": "u"}]})
+        (out / "scenario.json").write_text(json.dumps(subjects))
+    else:
+        await fake_stage(self, run_id, stage, args, cwd, log_path, entries, videos_dir)
+
+
+def test_given_subjects_from_the_reels_brain(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(service_module.InfographicsService, "_stage", fake_subjects_stage)
+    settings = Settings(
+        _env_file=None,
+        auth_required=False,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}",
+        work_dir=tmp_path / "work",
+        storage_dir=tmp_path / "storage",
+        accounts_dir=tmp_path / "accounts",
+    )
+    subjects = [{"key": "3.2", "paragraph_number": 3, "paragraph": "Harold fell.", "name": "Harold Godwinson",
+                 "query": "Harold Godwinson, King of England", "category": "people"},
+                {"key": "5.1", "paragraph_number": 5, "paragraph": "The battle.", "name": "Battle of Hastings",
+                 "category": "places"}]
+    with TestClient(create_app(settings)) as client:
+        bad = client.post("/api/infographics/runs", data={"subjects": json.dumps([{"key": "a", "name": "x", "category": "dragons"}])})
+        assert bad.status_code == 422
+        assert client.post("/api/infographics/runs", data={"subjects": "[]"}).status_code == 422
+        run = client.post("/api/infographics/runs", data={"subjects": json.dumps(subjects), "title": "Ролик"}).json()
+        assert run["scenario_name"] == "Ролик" and run["categories"] == ["people", "places"]
+        for _ in range(100):
+            detail = client.get(f"/api/infographics/runs/{run['id']}").json()
+            if detail["state"] in ("done", "failed"):
+                break
+            time.sleep(0.02)
+        assert detail["state"] == "done", detail
+        assert [c["id"] for c in detail["cards"]] == ["3.2", "5.1"]
+        assert detail["cards"][0]["video_url"].endswith(f"/infographics/{run['id']}/videos/3.2.mp4")
