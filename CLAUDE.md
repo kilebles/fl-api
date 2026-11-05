@@ -132,7 +132,9 @@ Keys: `GOOGLE_API_KEY`, `OPENAI_API_KEY` (the hdoc-prompts Google key is invalid
 Scenario .docx + categories → `POST /runs` → one run at a time, two subprocess stages with `PROGRESS` lines in
 `work/infographics/{id}/log.txt`: `python -m src.infographics.main` (searching: Gemini detects subjects, Wikidata years,
 Wikimedia images picked by Gemini; slow — Wikimedia 429s are waited out) then `node renderer/render.mjs plan.json`
-(rendering, ~1 min per 10 s card). Clips go to the store as they appear (`infographics/{id}/videos/`); a restart resumes
+(rendering, ~1 min per 10 s card). `subjects` (JSON form field) instead of a file — an order of the reels brain
+(fl-reel): given subjects `{key, paragraph_number, paragraph, name, query, category}`, no detection
+(`main.py --subjects`), one card per item named by its key. Clips go to the store as they appear (`infographics/{id}/videos/`); a restart resumes
 (scenario.json present → no new search, uploaded clips are not rendered again). Remotion may need a company license for SaaS.
 
 ## Voice (`/api/voice`)

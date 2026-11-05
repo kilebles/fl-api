@@ -1,5 +1,7 @@
 """/api/infographics: animated cards of the people, places and artifacts of a scenario."""
 
+import json
+import re
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Annotated
@@ -79,6 +81,34 @@ def _summary(record: InfographicRunRecord) -> dict:
     }
 
 
+def _subjects(raw: str) -> list[dict]:
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise HTTPException(422, "subjects must be JSON") from None
+    if not isinstance(data, list) or not data or len(data) > 500:
+        raise HTTPException(422, "subjects must be a list of 1–500 items")
+    out, keys = [], set()
+    for d in data:
+        if not isinstance(d, dict) or not str(d.get("name") or "").strip():
+            raise HTTPException(422, "every subject needs a name")
+        key = str(d.get("key") or "").strip()
+        if not re.fullmatch(r"[\w.-]{1,40}", key) or key in keys:
+            raise HTTPException(422, f"bad or repeated subject key: {key or '—'}")
+        keys.add(key)
+        category = str(d.get("category") or "people")
+        if category not in CATEGORIES:
+            raise HTTPException(422, f"category must be one of {', '.join(CATEGORIES)}")
+        try:
+            number = int(d.get("paragraph_number") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "paragraph_number must be a number") from None
+        out.append({"key": key, "paragraph_number": number, "paragraph": str(d.get("paragraph") or "")[:4000],
+                    "name": str(d["name"]).strip()[:200], "query": str(d.get("query") or d["name"]).strip()[:300],
+                    "category": category})
+    return out
+
+
 @router.get("/categories")
 async def categories() -> list[Category]:
     return [Category(id=c.id, label=c.label) for c in CATEGORIES.values()]
@@ -94,14 +124,28 @@ async def create_run(
     service: Service,
     request: Request,
     caller: Caller,
-    file: UploadFile,
+    file: UploadFile | None = None,
     categories: Annotated[str, Form()] = "people",
     one_per_person: Annotated[bool, Form()] = False,
     project_id: Annotated[str | None, Form()] = None,
+    subjects: Annotated[str | None, Form()] = None,
+    title: Annotated[str | None, Form()] = None,
 ) -> RunSummary:
-    """Find the subjects of a scenario (.docx) and render a card for each; takes from minutes to hours."""
+    """Find the subjects of a scenario (.docx) and render a card for each; takes from minutes to hours.
+
+    `subjects` instead of a file — an order of the reels brain: a JSON list of
+    {key, paragraph_number, paragraph, name, query, category}; no detection, one card per item named by its key."""
     if project_id:
         await request.app.state.projects.get(project_id, user_id=caller.user_id)
+    if subjects is not None:
+        items = _subjects(subjects)
+        record = await service.create(
+            (title or "subjects")[:200], json.dumps(items, ensure_ascii=False).encode(),
+            sorted({i["category"] for i in items}), False, project_id or None, user_id=caller.user_id, subjects=True,
+        )
+        return RunSummary(**_summary(record))
+    if file is None:
+        raise HTTPException(422, "send a scenario .docx or subjects")
     name = file.filename or "scenario.docx"
     if not name.lower().endswith(".docx"):
         raise HTTPException(422, "scenario must be .docx")

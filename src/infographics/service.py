@@ -93,7 +93,7 @@ def _entries(scenario_json: Path) -> list[dict[str, Any]]:
             continue
         image = images[0]["file"]
         cards.append({
-            "id": Path(image).stem,
+            "id": entry.get("key") or Path(image).stem,
             "name": entry["personality"]["name"],
             "years": entry["personality"].get("years") or "",
             "category": entry.get("category", "people"),
@@ -187,10 +187,13 @@ class InfographicsService:
         one_per_person: bool,
         project_id: str | None = None,
         user_id: str | None = None,
+        subjects: bool = False,
     ) -> InfographicRunRecord:
+        """subjects=True — content is a JSON list of given subjects (no detection), see main.py --subjects."""
         run_id = uuid.uuid4().hex[:12]
-        scenario_key = _key(run_id, "scenario.docx")
-        await self._objects.put(content, scenario_key, "scenario.docx")
+        name = "subjects.json" if subjects else "scenario.docx"
+        scenario_key = _key(run_id, name)
+        await self._objects.put(content, scenario_key, name)
         record = InfographicRunRecord(
             id=run_id,
             user_id=user_id,
@@ -266,7 +269,8 @@ class InfographicsService:
         work = self._work_dir / run_id
         scenario_dir, videos_dir = work / "scenario", work / "videos"
         log_path = work / "log.txt"
-        docx = work / "scenario.docx"
+        given = record.scenario_key.endswith("/subjects.json")  # an order of the reels brain: no detection
+        docx = work / ("subjects.json" if given else "scenario.docx")
         work.mkdir(parents=True, exist_ok=True)
         videos_dir.mkdir(exist_ok=True)
         scenario_json = scenario_dir / "scenario.json"
@@ -276,8 +280,11 @@ class InfographicsService:
 
             if not scenario_json.exists():
                 await self._set(run_id, state=InfographicState.SEARCHING.value, done=0, total=0, found=0)
-                args = [sys.executable, "-m", "src.infographics.main", str(docx), "--output-dir", str(scenario_dir), "--categories", ",".join(record.categories)]
-                if record.one_per_person:
+                if given:
+                    args = [sys.executable, "-m", "src.infographics.main", "--subjects", str(docx), "--output-dir", str(scenario_dir)]
+                else:
+                    args = [sys.executable, "-m", "src.infographics.main", str(docx), "--output-dir", str(scenario_dir), "--categories", ",".join(record.categories)]
+                if record.one_per_person and not given:
                     args.append("--one-per-person")
                 await self._stage(run_id, "search", args, PROJECT_ROOT, log_path)
 
