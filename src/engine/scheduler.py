@@ -227,7 +227,7 @@ class BatchScheduler:
                 state.pending.discard(item.index)
 
         effective_browsers = (
-            min(self._options.max_active_browsers, max(2, len(items) + 1))
+            min(self._options.max_active_browsers, max(1, len(items)))
             if self._options.max_active_browsers > 0
             else 0
         )

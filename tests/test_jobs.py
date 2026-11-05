@@ -833,3 +833,50 @@ async def test_fl2v_and_i2v_end_image_validation_and_runner(tmp_path: Path, monk
     assert s_i2v_fl.model_keys == ["veo_3_1_interpolation_lite_4s_low_priority"]
     assert s_i2v_fl.sources == [start_pic]
     assert s_i2v_fl.end_sources == [end_pic]
+
+
+async def test_fast_lane_priority_and_preempts_large_batch(tmp_path: Path, monkeypatch):
+    import asyncio
+
+    class SlowSession(FakeSession):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.started_first = asyncio.Event()
+
+        async def make_image(self, index, prompt, output_path, reference=None, **kwargs):
+            self.started_first.set()
+            await asyncio.sleep(0.03)
+            return await super().make_image(index, prompt, output_path, reference=reference, **kwargs)
+
+    session = SlowSession("a", tmp_path / "tmp")
+    queue, repo, _ = await _queue(tmp_path, _runner_with(tmp_path, monkeypatch, [session]))
+    await queue.start()
+
+    # Submit a 25-row batch job (batch lane: > 20 rows) and wait until it starts working
+    batch_rows = [JobRow(name=f"b{i}", image_prompt=f"bp{i}") for i in range(25)]
+    batch = await queue.submit(JobRequest(mode=Mode.IMG, rows=batch_rows, title="big batch"))
+    await asyncio.wait_for(session.started_first.wait(), timeout=2.0)
+
+    # Queue another 22-row batch AND then two 2-row fast jobs
+    batch2 = await queue.submit(JobRequest(mode=Mode.IMG, rows=[JobRow(name=f"c{i}", image_prompt=f"cp{i}") for i in range(22)], title="batch 2"))
+    fast1 = await queue.submit(JobRequest(mode=Mode.IMG, rows=[JobRow(name=f"f{i}", image_prompt=f"fp{i}") for i in range(2)], title="fast 1"))
+    fast2 = await queue.submit(JobRequest(mode=Mode.IMG, rows=[JobRow(name="g0", image_prompt="gp0")], title="fast 2"))
+
+    # Fast jobs jump ahead of batch2 in queue position AND preempt the running big batch
+    assert await queue.position(fast1.id) < await queue.position(batch2.id)
+    assert await queue.position(fast2.id) < await queue.position(batch2.id)
+
+    s_fast1 = await _until_finished(queue, fast1.id)
+    s_fast2 = await _until_finished(queue, fast2.id)
+    assert s_fast1.state is JobState.DONE and s_fast2.state is JobState.DONE
+
+    # Cancel batch2 so test finishes fast, and verify the preempted first batch auto-resumes & finishes all 25 rows
+    await queue.cancel(batch2.id)
+    s_batch = await _until_finished(queue, batch.id)
+    await queue.stop()
+
+    assert s_batch.state is JobState.DONE
+    assert s_batch.progress.images_done == 25 and s_batch.progress.remaining == 0
+    assert s_fast1.finished_at <= s_batch.finished_at
+    assert s_fast2.finished_at <= s_batch.finished_at
+    await repo.close()

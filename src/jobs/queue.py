@@ -14,7 +14,7 @@ from loguru import logger
 from src.core.time import utcnow
 from src.jobs.models import JobProgress, JobRequest, JobSpec, JobState, JobStatus
 from src.jobs.modes import MODES, Mode, Strategy
-from src.jobs.repository import JobFileRecord, JobRecord, JobRepository
+from src.jobs.repository import FAST_LANE_MAX_ROWS, JobFileRecord, JobRecord, JobRepository
 from src.jobs.runner import JobRunner
 from src.jobs.storage import JobOutput
 from src.jobs.sync import ResultSync
@@ -47,7 +47,9 @@ class JobQueue:
         self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
         self._running_id: str | None = None
+        self._running_total: int = 0
         self._running_task: asyncio.Task | None = None
+        self._preempting_id: str | None = None
         self._subscribers: set[tuple[str | None, asyncio.Queue[JobStatus]]] = set()
         self._hooks: list[Callable[[JobStatus], Awaitable[None]]] = []
         self._stopping = False
@@ -70,6 +72,9 @@ class JobQueue:
     async def stop(self) -> None:
         """Stop taking jobs; a running job is interrupted and resumes on the next start."""
         self._stopping = True
+        self._wake.set()
+        if self._running_task is not None:
+            self._running_task.cancel()
         if self._worker is not None:
             self._worker.cancel()
             try:
@@ -115,6 +120,7 @@ class JobQueue:
         logger.info(f"[queue] job {record.id} queued: {record.mode}, {record.total} rows")
         status = await self._repo.status(record)
         await self._publish(status, record.user_id)
+        self._maybe_preempt(record)
         self._wake.set()
         return status
 
@@ -138,11 +144,29 @@ class JobQueue:
         queued = await self._repo.queued_ids()
         return queued.index(job_id) + 1 if job_id in queued else None
 
+    def _maybe_preempt(self, record: JobRecord) -> None:
+        """Pause a running large batch so a fast-lane job runs immediately, then auto-resume the batch."""
+        if (
+            record.total <= FAST_LANE_MAX_ROWS
+            and self._running_id is not None
+            and self._running_total > FAST_LANE_MAX_ROWS
+            and self._running_task is not None
+            and self._preempting_id != self._running_id
+        ):
+            logger.info(
+                f"[queue] fast job {record.id} ({record.total} rows) preempting batch "
+                f"{self._running_id} ({self._running_total} rows)"
+            )
+            self._preempting_id = self._running_id
+            self._running_task.cancel()
+
     async def cancel(self, job_id: str, user_id: str | None = None) -> bool:
         """Cancel a queued or running job; False when it has already finished."""
         record = await self._record(job_id, user_id=user_id)
         if JobState(record.state).finished:
             return False
+        if self._preempting_id == job_id:
+            self._preempting_id = None
         if job_id == self._running_id and self._running_task is not None:
             self._running_task.cancel()
             return True
@@ -156,6 +180,7 @@ class JobQueue:
             return False
         await self._repo.update(job_id, state=JobState.QUEUED.value, message=None, finished_at=None)
         await self._publish(await self.get(job_id), record.user_id)
+        self._maybe_preempt(record)
         self._wake.set()
         return True
 
@@ -226,17 +251,26 @@ class JobQueue:
                 raise
             except Exception as e:
                 logger.warning(f"[queue] startup store sync failed: {e}")
-        while True:
+        while not self._stopping:
             record = await self._repo.next_queued()
+            if self._stopping:
+                break
             if record is None:
                 self._wake.clear()
+                if self._stopping:
+                    break
                 await self._wake.wait()
                 continue
             self._running_id = record.id
-            self._running_task = asyncio.create_task(self._run(record), name=f"job_{record.id}")
+            self._running_total = record.total
+            task = asyncio.create_task(self._run(record), name=f"job_{record.id}")
+            self._running_task = task
             try:
-                await self._running_task
+                await task
             except asyncio.CancelledError:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
@@ -244,6 +278,7 @@ class JobQueue:
                 logger.exception(f"[queue] job {record.id} crashed")
             finally:
                 self._running_id = None
+                self._running_total = 0
                 self._running_task = None
 
     async def _run(self, record: JobRecord) -> None:
@@ -279,13 +314,19 @@ class JobQueue:
             else:
                 message = (message + "; " if message else "") + f"some results are still only in {work}"
                 logger.error(f"[queue] job {job_id}: {message}")
+            preempted = self._preempting_id == job_id
+            if preempted:
+                self._preempting_id = None
             if await self._repo.get(job_id) is None:
                 pass
-            elif self._stopping:
+            elif self._stopping and state is JobState.CANCELLED:
                 await self._set(job_id, JobState.QUEUED, "interrupted by a restart")
+            elif preempted and state is JobState.CANCELLED:
+                await self._set(job_id, JobState.QUEUED, "Ожидает завершения коротких задач")
+                logger.info(f"[queue] job {job_id} preempted -> re-queued")
             else:
                 await self._set(job_id, state, message, finished=True)
-            logger.info(f"[queue] job {job_id} finished: {state}")
+                logger.info(f"[queue] job {job_id} finished: {state}")
 
     async def _prepare(self, record: JobRecord, work: Path, files: list[JobFileRecord]) -> JobSpec:
         """Download the inputs and put back what the run needs from earlier runs of this job."""

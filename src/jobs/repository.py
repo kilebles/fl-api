@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    case,
     delete,
     func,
     select,
@@ -32,6 +33,9 @@ from src.storage.objects import ObjectStore, StoredObject
 from src.storage.zip_stream import natural_key
 
 _UUID_STEM_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# Jobs up to this many rows run in the fast lane (ahead of large batches and preempting a running batch).
+FAST_LANE_MAX_ROWS = 20
 
 
 class JobRecord(Base):
@@ -151,16 +155,25 @@ class JobRepository:
         async with self._session() as session:
             return list(await session.scalars(query))
 
+    @staticmethod
+    def _queue_order():
+        return (case((JobRecord.total <= FAST_LANE_MAX_ROWS, 0), else_=1), JobRecord.created_at)
+
     async def next_queued(self) -> JobRecord | None:
         async with self._session() as session:
             return await session.scalar(
-                select(JobRecord).where(JobRecord.state == JobState.QUEUED.value).order_by(JobRecord.created_at).limit(1)
+                select(JobRecord)
+                .where(JobRecord.state == JobState.QUEUED.value)
+                .order_by(*self._queue_order())
+                .limit(1)
             )
 
     async def queued_ids(self) -> list[str]:
         async with self._session() as session:
             result = await session.scalars(
-                select(JobRecord.id).where(JobRecord.state == JobState.QUEUED.value).order_by(JobRecord.created_at)
+                select(JobRecord.id)
+                .where(JobRecord.state == JobState.QUEUED.value)
+                .order_by(*self._queue_order())
             )
             return list(result)
 
