@@ -33,6 +33,7 @@ from sqlalchemy.orm import Mapped, defer, mapped_column
 
 from src.core.db import Base, Database
 from src.core.settings import Settings
+from src.core.time import utcnow
 from src.storage.objects import ObjectStore
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -67,7 +68,7 @@ class InfographicRunRecord(Base):
     found: Mapped[int] = mapped_column(Integer, default=0)
     entries: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
@@ -200,7 +201,7 @@ class InfographicsService:
             one_per_person=one_per_person,
             state=InfographicState.QUEUED.value,
             entries=[],
-            created_at=datetime.now(),
+            created_at=utcnow(),
         )
         async with self._session() as session:
             session.add(record)
@@ -313,7 +314,7 @@ class InfographicsService:
             missing = sum(1 for e in entries if e["video_key"] is None)
             if missing:
                 raise StageError(f"{missing} of {len(entries)} cards failed to render — see {log_path}")
-            await self._set(run_id, state=InfographicState.DONE.value, done=len(entries), finished_at=datetime.now())
+            await self._set(run_id, state=InfographicState.DONE.value, done=len(entries), finished_at=utcnow())
             shutil.rmtree(work, ignore_errors=True)
             logger.success(f"[infographics] run {run_id}: {len(entries)} cards")
         except asyncio.CancelledError:
@@ -325,7 +326,7 @@ class InfographicsService:
                 await self._set(run_id, state=InfographicState.QUEUED.value, error=None, finished_at=None)
                 return
             logger.error(f"[infographics] run {run_id} failed: {type(e).__name__}: {e}")
-            await self._set(run_id, state=InfographicState.FAILED.value, error=f"{e}", finished_at=datetime.now())
+            await self._set(run_id, state=InfographicState.FAILED.value, error=f"{e}", finished_at=utcnow())
 
     async def _stage(
         self,

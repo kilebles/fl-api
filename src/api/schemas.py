@@ -1,7 +1,6 @@
-from datetime import datetime
-
 from pydantic import BaseModel
 
+from src.core.time import UtcDatetime
 from src.jobs.models import JobRow, JobStatus
 from src.jobs.modes import Mode
 
@@ -45,7 +44,7 @@ class JobFile(BaseModel):
     reason: str | None = None
     url: str | None = None
     download_url: str | None = None
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class Account(BaseModel):

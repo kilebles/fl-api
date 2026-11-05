@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from loguru import logger
 
+from src.core.time import utcnow
 from src.jobs.models import JobProgress, JobRequest, JobSpec, JobState, JobStatus
 from src.jobs.modes import MODES, Mode, Strategy
 from src.jobs.repository import JobFileRecord, JobRecord, JobRepository
@@ -93,7 +94,7 @@ class JobQueue:
             "avatar_key": record.avatar_key,
             "avatar_keys": record.resolved_avatar_keys,
             "static_image_key": record.static_image_key,
-            "created_at": record.created_at.isoformat(),
+            "created_at": f"{record.created_at.isoformat()}Z",
         }
         try:
             await self._objects.put(
@@ -202,7 +203,7 @@ class JobQueue:
         if message is not None or state is not JobState.RUNNING:
             fields["message"] = message
         if finished:
-            fields["finished_at"] = datetime.now()
+            fields["finished_at"] = utcnow()
         await self._repo.update(job_id, **fields)
         await self._publish_id(job_id)
 
@@ -240,7 +241,7 @@ class JobQueue:
     async def _run(self, record: JobRecord) -> None:
         job_id = record.id
         work = self._work_dir / job_id
-        await self._set(job_id, JobState.RUNNING, started_at=datetime.now())
+        await self._set(job_id, JobState.RUNNING, started_at=utcnow())
         sync: ResultSync | None = None
         state, message = JobState.FAILED, None
         try:

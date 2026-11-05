@@ -14,6 +14,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from src.core.settings import Settings
+from src.core.time import utcnow
 
 
 def content_type(name: str) -> str:
@@ -178,7 +179,7 @@ class S3ObjectStore:
                         StoredObject(
                             key=obj["Key"],
                             size=int(obj.get("Size", 0)),
-                            last_modified=lm or datetime.now(),
+                            last_modified=lm or utcnow(),
                         )
                     )
             return items

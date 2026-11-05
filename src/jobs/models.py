@@ -5,6 +5,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.core.time import UtcDatetime, utcnow
 from src.jobs.modes import MODES, Mode, Strategy
 
 _NAME_RE = re.compile(r"^[\w\-.]+$")
@@ -132,6 +133,6 @@ class JobStatus(BaseModel):
     state: JobState = JobState.QUEUED
     progress: JobProgress
     message: str | None = None
-    created_at: datetime = Field(default_factory=datetime.now)
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
+    created_at: UtcDatetime = Field(default_factory=utcnow)
+    started_at: UtcDatetime | None = None
+    finished_at: UtcDatetime | None = None

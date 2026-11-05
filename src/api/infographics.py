@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.api.auth import Caller
+from src.core.time import UtcDatetime
 from src.infographics.categories import CATEGORIES
 from src.infographics.service import InfographicRunRecord, InfographicsService
 from src.storage.zip_stream import stream_zip, zip_headers
@@ -53,8 +54,8 @@ class RunSummary(BaseModel):
     total: int
     found: int
     error: str | None
-    created_at: datetime
-    finished_at: datetime | None
+    created_at: UtcDatetime
+    finished_at: UtcDatetime | None
 
 
 class RunDetail(RunSummary):

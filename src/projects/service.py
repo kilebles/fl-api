@@ -9,6 +9,8 @@ from sqlalchemy import DateTime, String, Text, delete, select, update
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db import Base, Database
+from src.core.time import parse_naive_utc, utcnow
+from src.core.titles import unique_title
 from src.storage.objects import ObjectStore
 
 
@@ -19,7 +21,7 @@ class ProjectRecord(Base):
     user_id: Mapped[str | None] = mapped_column(String(32), index=True, default=None)
     title: Mapped[str] = mapped_column(String(300))
     style: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class ProjectNotFoundError(LookupError):
@@ -43,7 +45,7 @@ class ProjectService:
             "user_id": record.user_id,
             "title": record.title,
             "style": record.style,
-            "created_at": record.created_at.isoformat(),
+            "created_at": f"{record.created_at.isoformat()}Z",
         }
         try:
             await self._objects.put(
@@ -66,7 +68,7 @@ class ProjectService:
             logger.warning(f"[projects] could not restore project {project_id} from object store: {e}")
             return None
         created_raw = data.get("created_at")
-        created_at = datetime.fromisoformat(created_raw) if isinstance(created_raw, str) else datetime.now()
+        created_at = parse_naive_utc(created_raw if isinstance(created_raw, str) else None)
         record = ProjectRecord(
             id=str(data.get("id") or project_id),
             user_id=data.get("user_id"),
@@ -96,14 +98,22 @@ class ProjectService:
         return record
 
     async def create(self, title: str, style: str = "", user_id: str | None = None) -> ProjectRecord:
-        record = ProjectRecord(
-            id=uuid.uuid4().hex[:12],
-            user_id=user_id,
-            title=title.strip() or "Без названия",
-            style=style,
-            created_at=datetime.now(),
-        )
+        base_title = title.strip() or "Без названия"
         async with self._session() as session:
+            existing_query = select(ProjectRecord.title)
+            if user_id is not None:
+                existing_query = existing_query.where(ProjectRecord.user_id == user_id)
+            else:
+                existing_query = existing_query.where(ProjectRecord.user_id.is_(None))
+            existing_titles = list(await session.scalars(existing_query))
+            final_title = unique_title(base_title, existing_titles, max_len=300)
+            record = ProjectRecord(
+                id=uuid.uuid4().hex[:12],
+                user_id=user_id,
+                title=final_title,
+                style=style,
+                created_at=utcnow(),
+            )
             session.add(record)
             await session.commit()
         await self._mirror(record)

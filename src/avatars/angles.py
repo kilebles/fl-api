@@ -579,17 +579,20 @@ class AvatarStudio:
                     merged_keys.append(k)
 
             pending["imported"] = imported
+            all_expected_imported = bool(expected) and all(row_name in imported for row_name in expected)
+            follow_up: list[AngleId] = [
+                a for a in (pending.get("angles") or []) if a in ANGLES and a != "front"
+            ]
 
             try:
                 if not status.state.finished:
-                    if new_keys:
+                    if all_expected_imported and (record.pack_stage == "angles" or not follow_up):
+                        await self._avatars.update(record.id, image_keys=merged_keys, clear_pack=True)
+                    elif new_keys:
                         await self._avatars.update(record.id, image_keys=merged_keys, pack_pending=pending)
                     return
 
                 # Job finished: check if Stage 1 ("base") should chain into Stage 2 ("angles")
-                follow_up: list[AngleId] = [
-                    a for a in (pending.get("angles") or []) if a in ANGLES and a != "front"
-                ]
                 if (
                     record.pack_stage == "base"
                     and status.state == JobState.DONE

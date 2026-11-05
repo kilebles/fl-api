@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from src.accounts.account import AccountInfo
@@ -106,6 +106,31 @@ async def download_upload(request: Request, key: str, caller: Caller, name: str 
     clean_base = re.sub(r'[\\/:*?"<>|]+', "-", (name or "avatar").strip()).strip() or "avatar"
     download_name = clean_base if clean_base.lower().endswith(tuple(IMAGE_TYPES)) else f"{clean_base}{suffix}"
     return RedirectResponse(request.app.state.objects.url(key, download_name=download_name), status_code=302)
+
+
+@router.get("/uploads/zip")
+async def download_uploads_zip(
+    request: Request,
+    caller: Caller,
+    key: Annotated[list[str], Query(min_length=1, max_length=16)],
+    name: str | None = None,
+) -> StreamingResponse:
+    """Stream multiple uploaded reference images as a single .zip archive."""
+    objects = request.app.state.objects
+    clean_base = re.sub(r'[\\/:*?"<>|]+', "-", (name or "avatar").strip()).strip() or "avatar"
+    items: list[tuple[str, str]] = []
+    for idx, k in enumerate(key, start=1):
+        check_upload_key_owner(k, caller)
+        if not await objects.exists(k):
+            raise HTTPException(404, f"uploaded file not found: {k}")
+        ext = PurePosixPath(k).suffix.lower() or ".jpg"
+        arcname = f"{clean_base} - {idx}{ext}" if len(key) > 1 else f"{clean_base}{ext}"
+        items.append((arcname, k))
+    return StreamingResponse(
+        stream_zip(objects, items),
+        media_type="application/zip",
+        headers=zip_headers(f"{clean_base}.zip", "avatar_refs.zip"),
+    )
 
 
 @router.post("/rows/xlsx")

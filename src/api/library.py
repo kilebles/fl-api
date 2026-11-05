@@ -1,17 +1,21 @@
 """/api/projects and /api/avatars."""
 
-from datetime import datetime
+import re
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.api.auth import Caller
 from src.api.routes import check_upload_key_owner
 from src.avatars.angles import ANGLES, AngleId, AvatarStudio, ReferenceAnalyzer, ReferenceAngle, ReferenceFraming
 from src.avatars.service import AvatarRecord, AvatarService
+from src.core.time import UtcDatetime
 from src.jobs.models import JobState
 from src.projects.service import ProjectRecord, ProjectService
+from src.storage.zip_stream import stream_zip, zip_headers
 
 router = APIRouter(prefix="/api")
 
@@ -42,7 +46,7 @@ class Project(BaseModel):
     id: str
     title: str
     style: str
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class ProjectIn(BaseModel):
@@ -68,7 +72,7 @@ class Avatar(BaseModel):
     pack_angles: list[AngleId] = []
     pack_done: int = 0
     pack_total: int = 0
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class AvatarIn(BaseModel):
@@ -139,20 +143,24 @@ async def _avatar(r: AvatarRecord, request: Request) -> Avatar:
             imported = pending.get("imported") or {}
             expected: list[AngleId] = [a for a in (pending.get("expected") or []) if a in ANGLES]
             follow_up: list[AngleId] = [a for a in (pending.get("angles") or []) if a in ANGLES and a != "front"]
-            if r.pack_stage == "base":
-                planned: list[AngleId] = ["front", *follow_up]
-                pack_stage = "base"
-                pack_done = sum(1 for a in planned if a in imported)
-                pack_total = len(planned)
-                pack_angles = [a for a in planned if a not in imported]
-            else:
-                base_done = int(pending.get("base_done") or 0)
-                pack_stage = "angles"
-                pack_done = base_done + sum(1 for a in expected if a in imported)
-                pack_total = base_done + len(expected)
-                pack_angles = [a for a in expected if a not in imported]
-            pack_job_id = r.pack_job_id
-            pack_state = status.state
+            already_complete = bool(expected) and all(a in imported for a in expected) and (
+                r.pack_stage == "angles" or not follow_up
+            )
+            if not already_complete:
+                if r.pack_stage == "base":
+                    planned: list[AngleId] = ["front", *follow_up]
+                    pack_stage = "base"
+                    pack_done = sum(1 for a in planned if a in imported)
+                    pack_total = len(planned)
+                    pack_angles = [a for a in planned if a not in imported]
+                else:
+                    base_done = int(pending.get("base_done") or 0)
+                    pack_stage = "angles"
+                    pack_done = base_done + sum(1 for a in expected if a in imported)
+                    pack_total = base_done + len(expected)
+                    pack_angles = [a for a in expected if a not in imported]
+                pack_job_id = r.pack_job_id
+                pack_state = status.state
 
     return Avatar(
         id=r.id,
@@ -284,6 +292,31 @@ async def generate_avatar_angles(
 async def cancel_avatar_angles(avatar_id: str, studio: Studio, request: Request, caller: Caller) -> Avatar:
     record = await studio.cancel_angles(avatar_id, user_id=caller.user_id)
     return await _avatar(record, request)
+
+
+@router.get("/avatars/{avatar_id}/zip")
+async def download_avatar_zip(avatar_id: str, avatars: Avatars, request: Request, caller: Caller) -> StreamingResponse:
+    """Stream all reference images of an avatar as a single .zip archive."""
+    record = await avatars.get(avatar_id, user_id=caller.user_id)
+    if not record.image_keys:
+        raise HTTPException(404, "avatar has no reference images")
+    objects = request.app.state.objects
+    clean_base = re.sub(r'[\\/:*?"<>|]+', "-", (record.name or "avatar").strip()).strip() or "avatar"
+    total = len(record.image_keys)
+    items = [
+        (
+            f"{clean_base} - {i + 1}{PurePosixPath(k).suffix.lower() or '.jpg'}"
+            if total > 1
+            else f"{clean_base}{PurePosixPath(k).suffix.lower() or '.jpg'}",
+            k,
+        )
+        for i, k in enumerate(record.image_keys)
+    ]
+    return StreamingResponse(
+        stream_zip(objects, items),
+        media_type="application/zip",
+        headers=zip_headers(f"{clean_base}.zip", f"avatar_{avatar_id}.zip"),
+    )
 
 
 @router.patch("/avatars/{avatar_id}")

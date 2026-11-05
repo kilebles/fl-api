@@ -8,6 +8,7 @@ from sqlalchemy import JSON, DateTime, String, Text, delete, select, update
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db import Base, Database
+from src.core.time import utcnow
 
 
 class AvatarRecord(Base):
@@ -21,7 +22,7 @@ class AvatarRecord(Base):
     pack_job_id: Mapped[str | None] = mapped_column(String(32), index=True, default=None)
     pack_stage: Mapped[str | None] = mapped_column(String(32), default=None)
     pack_pending: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class AvatarNotFoundError(LookupError):
@@ -57,7 +58,7 @@ class AvatarService:
             name=name.strip() or "Без имени",
             appearance=appearance.strip(),
             image_keys=image_keys,
-            created_at=datetime.now(),
+            created_at=utcnow(),
         )
         async with self._session() as session:
             session.add(record)

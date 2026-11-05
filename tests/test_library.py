@@ -235,3 +235,46 @@ def test_smart_reference_framing_analysis_no_duplicates(tmp_path: Path, monkeypa
         job_detail = client.get(f"/api/jobs/{started['pack_job_id']}").json()
         assert [row["name"] for row in job_detail["rows"]] == ["front", "three_quarter", "back"]
 
+
+def test_duplicate_title_numbering_utc_timestamps_and_avatar_zip(tmp_path: Path):
+    import io
+    import zipfile
+
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        # 1. Projects get #2, #3 when created with duplicate titles, and created_at ends with Z
+        p1 = client.post("/api/projects", json={"title": "360 градусов"}).json()
+        p2 = client.post("/api/projects", json={"title": "360 градусов"}).json()
+        p3 = client.post("/api/projects", json={"title": "360 градусов"}).json()
+        assert [p1["title"], p2["title"], p3["title"]] == ["360 градусов", "360 градусов #2", "360 градусов #3"]
+        assert p1["created_at"].endswith("Z")
+
+        # 2. Batch jobs get #2, #3 on duplicate titles; single manual prompts stay untouched
+        rows2 = [{"name": "1", "prompt": "a"}, {"name": "2", "prompt": "b"}]
+        j1 = client.post("/api/jobs", json={"mode": "t2v", "title": "Глава 1", "rows": rows2}).json()
+        j2 = client.post("/api/jobs", json={"mode": "t2v", "title": "Глава 1", "rows": rows2}).json()
+        assert [j1["title"], j2["title"]] == ["Глава 1", "Глава 1 #2"]
+        assert j1["created_at"].endswith("Z")
+
+        s1 = client.post("/api/jobs", json={"mode": "t2v", "title": "римский легионер", "rows": [{"name": "1", "prompt": "p"}]}).json()
+        s2 = client.post("/api/jobs", json={"mode": "t2v", "title": "римский легионер", "rows": [{"name": "1", "prompt": "p"}]}).json()
+        assert s1["title"] == "римский легионер" and s2["title"] == "римский легионер"
+
+        # 3. Avatar ZIP download (both /api/avatars/{id}/zip and /api/uploads/zip)
+        k1 = client.post("/api/uploads", files={"file": ("a.png", b"\x89PNG\r\n\x1a\none")}).json()["key"]
+        k2 = client.post("/api/uploads", files={"file": ("b.jpg", b"\xff\xd8\xff\xe0two")}).json()["key"]
+        av = client.post("/api/avatars", json={"name": "Гладиатор", "appearance": "шлем", "image_keys": [k1, k2]}).json()
+
+        z_av = client.get(f"/api/avatars/{av['id']}/zip")
+        assert z_av.status_code == 200
+        assert z_av.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(z_av.content)) as zf:
+            assert zf.namelist() == ["Гладиатор - 1.png", "Гладиатор - 2.jpg"]
+            assert zf.read("Гладиатор - 1.png") == b"\x89PNG\r\n\x1a\none"
+            assert zf.read("Гладиатор - 2.jpg") == b"\xff\xd8\xff\xe0two"
+
+        z_up = client.get("/api/uploads/zip", params=[("key", k2), ("key", k1), ("name", "Тест")])
+        assert z_up.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(z_up.content)) as zf:
+            assert zf.namelist() == ["Тест - 1.jpg", "Тест - 2.png"]
+
+

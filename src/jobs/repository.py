@@ -24,6 +24,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, defer, mapped_column
 
 from src.core.db import Base, Database
+from src.core.time import parse_naive_utc, utcnow
+from src.core.titles import unique_title
 from src.jobs.models import JobProgress, JobRequest, JobRow, JobState, JobStatus
 from src.jobs.modes import MODES, Mode, Strategy
 from src.storage.objects import ObjectStore, StoredObject
@@ -50,7 +52,7 @@ class JobRecord(Base):
     avatar_keys: Mapped[list[str] | None] = mapped_column(JSON, default=None)
     static_image_key: Mapped[str | None] = mapped_column(String(300))
     pass_num: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -79,7 +81,7 @@ class JobFileRecord(Base):
     key: Mapped[str | None] = mapped_column(String(400))
     size: Mapped[int] = mapped_column(Integer, default=0)
     reason: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 KIND_BY_SUFFIX = {".jpg": "image", ".mp4": "video", ".skip": "skip"}
@@ -90,24 +92,42 @@ class JobRepository:
         self._session = db.session
 
     async def create(self, job_id: str, request: JobRequest, user_id: str | None = None) -> JobRecord:
-        record = JobRecord(
-            id=job_id,
-            user_id=user_id,
-            title=request.title,
-            project_id=request.project_id,
-            mode=request.mode.value,
-            strategy=request.strategy.value,
-            state=JobState.QUEUED.value,
-            rows=[row.model_dump() for row in request.rows],
-            total=len(request.rows),
-            video_model_key=request.video_model_key,
-            avatar_key=request.avatar,
-            avatar_keys=request.avatar_keys,
-            static_image_key=request.static_image,
-            pass_num=0,
-            created_at=datetime.now(),
+        raw_title = (request.title or "").strip()
+        is_batch_or_studio = (
+            len(request.rows) > 1
+            or request.mode == Mode.F2V
+            or raw_title.startswith(("360° ракурсы · ", "Аватар · "))
         )
         async with self._session() as session:
+            final_title: str | None = request.title
+            if is_batch_or_studio and raw_title:
+                existing_q = select(JobRecord.title).where(JobRecord.title.is_not(None))
+                if user_id is not None:
+                    existing_q = existing_q.where(JobRecord.user_id == user_id)
+                else:
+                    existing_q = existing_q.where(JobRecord.user_id.is_(None))
+                if request.project_id is not None:
+                    existing_q = existing_q.where(JobRecord.project_id == request.project_id)
+                existing_titles = list(await session.scalars(existing_q))
+                final_title = unique_title(raw_title, existing_titles, max_len=200)
+
+            record = JobRecord(
+                id=job_id,
+                user_id=user_id,
+                title=final_title,
+                project_id=request.project_id,
+                mode=request.mode.value,
+                strategy=request.strategy.value,
+                state=JobState.QUEUED.value,
+                rows=[row.model_dump() for row in request.rows],
+                total=len(request.rows),
+                video_model_key=request.video_model_key,
+                avatar_key=request.avatar,
+                avatar_keys=request.avatar_keys,
+                static_image_key=request.static_image,
+                pass_num=0,
+                created_at=utcnow(),
+            )
             session.add(record)
             await session.commit()
         return record
@@ -170,7 +190,7 @@ class JobRepository:
             key=key,
             size=size,
             reason=reason,
-            created_at=datetime.now(),
+            created_at=utcnow(),
         )
         async with self._session() as session:
             await session.execute(delete(JobFileRecord).where(JobFileRecord.job_id == job_id, JobFileRecord.name == name))
@@ -271,7 +291,7 @@ class JobRepository:
                         avatar_keys = meta.get("avatar_keys")
                         static_image_key = meta.get("static_image_key")
                         created_raw = meta.get("created_at")
-                        created_at = datetime.fromisoformat(created_raw) if isinstance(created_raw, str) else datetime.now()
+                        created_at = parse_naive_utc(created_raw if isinstance(created_raw, str) else None)
                     else:
                         if not jfiles:
                             continue
