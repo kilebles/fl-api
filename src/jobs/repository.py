@@ -47,6 +47,8 @@ class JobRecord(Base):
     message: Mapped[str | None] = mapped_column(Text)
     rows: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     total: Mapped[int] = mapped_column(Integer)
+    duration: Mapped[int | None] = mapped_column(Integer, default=None)
+    aspect_ratio: Mapped[str | None] = mapped_column(String(16), default=None)
     video_model_key: Mapped[str | None] = mapped_column(String(100))
     avatar_key: Mapped[str | None] = mapped_column(String(300))
     avatar_keys: Mapped[list[str] | None] = mapped_column(JSON, default=None)
@@ -121,6 +123,8 @@ class JobRepository:
                 state=JobState.QUEUED.value,
                 rows=[row.model_dump() for row in request.rows],
                 total=len(request.rows),
+                duration=request.duration,
+                aspect_ratio=request.aspect_ratio,
                 video_model_key=request.video_model_key,
                 avatar_key=request.avatar,
                 avatar_keys=request.avatar_keys,
@@ -286,6 +290,8 @@ class JobRepository:
                         title = meta.get("title")
                         project_id = meta.get("project_id")
                         strategy = meta.get("strategy", Strategy.PARALLEL.value)
+                        duration = meta.get("duration")
+                        aspect_ratio = meta.get("aspect_ratio")
                         video_model_key = meta.get("video_model_key")
                         avatar_key = meta.get("avatar_key")
                         avatar_keys = meta.get("avatar_keys")
@@ -313,6 +319,8 @@ class JobRepository:
                         )
                         project_id = None
                         strategy = Strategy.PARALLEL.value
+                        duration = None
+                        aspect_ratio = None
                         video_model_key = None
                         avatar_key = None
                         avatar_keys = None
@@ -337,6 +345,8 @@ class JobRepository:
                         state=state,
                         rows=rows,
                         total=total,
+                        duration=duration,
+                        aspect_ratio=aspect_ratio,
                         video_model_key=video_model_key,
                         avatar_key=avatar_key,
                         avatar_keys=avatar_keys,
@@ -408,6 +418,8 @@ def to_status(record: JobRecord, counts: Counter[str]) -> JobStatus:
         project_id=record.project_id,
         mode=Mode(record.mode),
         strategy=Strategy(record.strategy),
+        duration=record.duration,
+        aspect_ratio=record.aspect_ratio,
         state=JobState(record.state),
         progress=JobProgress(
             total=record.total,

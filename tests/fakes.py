@@ -40,6 +40,8 @@ class FakeSession:
         self.sources: list[Path | None] = []
         self.image_references: list[list[Path]] = []
         self.video_extra_references: list[list[Path]] = []
+        self.image_aspect_ratios: list[str | None] = []
+        self.video_aspect_ratios: list[str | None] = []
 
     def can_make_images(self) -> bool:
         return not self.on_cooldown and self._images
@@ -68,6 +70,7 @@ class FakeSession:
         dest: Path,
         reference: Path | None = None,
         references: list[Path] | None = None,
+        aspect_ratio: str | None = None,
     ) -> Path:
         await asyncio.sleep(0)
         if self._image_quota_after is not None and len(self.images_made) >= self._image_quota_after:
@@ -77,6 +80,7 @@ class FakeSession:
             raise GenerationFilteredError(f"filtered: {prompt}")
         refs = list(references) if references else ([reference] if reference else [])
         self.image_references.append(refs)
+        self.image_aspect_ratios.append(aspect_ratio)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(f"{prompt}|ref={reference.name if reference else ''}")
         self.images_made.append(prompt)
@@ -90,6 +94,7 @@ class FakeSession:
         frame: Path | None = None,
         model_key: str | None = None,
         extra_references: list[Path] | None = None,
+        aspect_ratio: str | None = None,
     ) -> SubmittedVideo:
         await asyncio.sleep(0)
         if not self._videos:
@@ -99,6 +104,7 @@ class FakeSession:
         self.model_keys.append(model_key)
         self.sources.append(image or frame)
         self.video_extra_references.append(list(extra_references or []))
+        self.video_aspect_ratios.append(aspect_ratio)
         return SubmittedVideo(media_id=f"{self.name}-{index}-{prompt}", project_id="p", proxy_url=None, cookies={})
 
     async def finish_video(self, index: int, submitted: SubmittedVideo) -> Path:

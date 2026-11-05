@@ -83,7 +83,8 @@ class JobRunner:
         output = output or JobOutput(spec)
         output.directory.mkdir(parents=True, exist_ok=True)
         mode = MODES[spec.mode]
-        model_key = spec.video_model_key or mode.video_model(self._settings)
+        model_key = spec.video_model_key or mode.video_model(self._settings, spec.duration)
+        frame_model_key = mode.frame_video_model(self._settings, spec.duration)
         sessions = self._make_sessions(accounts, Strategy.SEQUENTIAL if mode.chain else spec.strategy)
         pass_num = 0
 
@@ -141,11 +142,20 @@ class JobRunner:
                 try:
                     if mode.chain:
                         clips = [(row.name, row.prompt) for row in spec.rows]
-                        await run_chain(sessions[0], clips, output.directory, first_model_key=model_key, on_change=on_change)
+                        await run_chain(
+                            sessions[0],
+                            clips,
+                            output.directory,
+                            first_model_key=model_key,
+                            frame_model_key=frame_model_key,
+                            aspect_ratio=spec.aspect_ratio,
+                            on_change=on_change,
+                        )
                     else:
                         options = BatchOptions(
                             output_dir=output.directory,
                             video_model_key=model_key,
+                            aspect_ratio=spec.aspect_ratio,
                             reference_image=spec.avatar,
                             reference_images=spec.avatars,
                             max_active_browsers=self._settings.max_active_browsers,

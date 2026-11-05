@@ -736,3 +736,49 @@ async def test_max_active_browsers_caps_concurrency_and_rotates_standby(tmp_path
     assert stats.done == 6
     assert peak_open <= 2
     assert sum(1 for x in sessions if x.started) == 0
+
+
+async def test_duration_and_aspect_ratio_routing_and_validation(tmp_path: Path, monkeypatch):
+    from src.engine import chain
+
+    monkeypatch.setattr(chain, "extract_last_frame", lambda video, frame: frame.write_text(video.name))
+
+    # Validation: t2v rejects 10s, img rejects duration, video modes reject 1:1
+    with pytest.raises(ValidationError, match="supports durations"):
+        JobRequest(mode=Mode.T2V, duration=10, rows=[JobRow(name="1", prompt="p")])
+    with pytest.raises(ValidationError, match="does not take a video duration"):
+        JobRequest(mode=Mode.IMG, duration=4, rows=[JobRow(name="1", image_prompt="i")])
+    with pytest.raises(ValidationError, match="supports aspect ratios"):
+        JobRequest(mode=Mode.I2V, aspect_ratio="1:1", rows=[JobRow(name="1", prompt="v", image_prompt="i")])
+    assert JobRequest(mode=Mode.IMG, aspect_ratio="1:1", rows=[JobRow(name="1", image_prompt="i")]).aspect_ratio == "1:1"
+
+    # Runner: i2v 6s + 9:16 selects start-frame 6s model and passes 9:16 to both image & video
+    s_i2v = FakeSession("a", tmp_path / "tmp1")
+    runner1 = _runner_with(tmp_path, monkeypatch, [s_i2v])
+    spec_i2v = JobSpec(
+        mode=Mode.I2V,
+        duration=6,
+        aspect_ratio="9:16",
+        rows=[JobRow(name="1", prompt="walk", image_prompt="street")],
+        output_dir=tmp_path / "out_i2v",
+    )
+    st1, _, _ = await runner1.run(spec_i2v)
+    assert st1 is JobState.DONE
+    assert s_i2v.model_keys == ["veo_3_1_i2v_s_lite_6s_low_priority"]
+    assert s_i2v.image_aspect_ratios == ["9:16"]
+    assert s_i2v.video_aspect_ratios == ["9:16"]
+
+    # Runner: f2v 4s selects 4s t2v for clip 0 and 4s start-frame for clip 1
+    s_f2v = FakeSession("a", tmp_path / "tmp2")
+    runner2 = _runner_with(tmp_path, monkeypatch, [s_f2v])
+    spec_f2v = JobSpec(
+        mode=Mode.F2V,
+        duration=4,
+        aspect_ratio="9:16",
+        rows=[JobRow(name="c0", prompt="p0"), JobRow(name="c1", prompt="p1")],
+        output_dir=tmp_path / "out_f2v",
+    )
+    st2, _, _ = await runner2.run(spec_f2v)
+    assert st2 is JobState.DONE
+    assert s_f2v.model_keys == ["veo_3_1_t2v_lite_4s_low_priority", "veo_3_1_i2v_s_lite_4s_low_priority"]
+    assert s_f2v.video_aspect_ratios == ["9:16", "9:16"]

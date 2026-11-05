@@ -19,7 +19,14 @@ class JobRow(BaseModel):
     image_prompt: str | None = Field(default=None, description="Image prompt (img / i2v modes)")
 
 
-def check_rows(mode: Mode, rows: list[JobRow], avatar: bool, static_image: bool) -> None:
+def check_rows(
+    mode: Mode,
+    rows: list[JobRow],
+    avatar: bool,
+    static_image: bool,
+    duration: int | None = None,
+    aspect_ratio: str | None = None,
+) -> None:
     """Validate rows and input pictures against what the mode needs; raises ValueError."""
     spec = MODES[mode]
     if not rows:
@@ -36,6 +43,13 @@ def check_rows(mode: Mode, rows: list[JobRow], avatar: bool, static_image: bool)
         raise ValueError(f"mode {mode} needs an avatar picture")
     if static_image and not spec.static_image:
         raise ValueError(f"mode {mode} does not take a static image")
+    if duration is not None:
+        if not spec.durations:
+            raise ValueError(f"mode {mode} does not take a video duration")
+        if duration not in spec.durations:
+            raise ValueError(f"mode {mode} supports durations {list(spec.durations)}s, got {duration}s")
+    if aspect_ratio is not None and aspect_ratio not in spec.aspect_ratios:
+        raise ValueError(f"mode {mode} supports aspect ratios {list(spec.aspect_ratios)}, got {aspect_ratio!r}")
     needs_image_prompt = spec.needs_image_prompt and not static_image
     for row in rows:
         if spec.needs_video_prompt and not row.prompt:
@@ -51,6 +65,8 @@ class JobSpec(BaseModel):
     rows: list[JobRow]
     output_dir: Path
     strategy: Strategy = Strategy.PARALLEL
+    duration: int | None = Field(default=None, description="Video clip duration in seconds (4, 6, 8, or 10)")
+    aspect_ratio: str | None = Field(default=None, description="Output aspect ratio ('16:9', '9:16', or '1:1')")
     static_image: Path | None = Field(default=None, description="i2v: one picture used as the source of every video")
     avatar: Path | None = Field(default=None, description="i2i2v: primary reference picture kept in every generated image")
     avatars: list[Path] = Field(default_factory=list, description="Multi-angle avatar reference pictures (ordered, primary first)")
@@ -66,7 +82,14 @@ class JobSpec(BaseModel):
                 merged.append(p)
         self.avatars = merged
         self.avatar = merged[0] if merged else None
-        check_rows(self.mode, self.rows, bool(self.avatars), self.static_image is not None)
+        check_rows(
+            self.mode,
+            self.rows,
+            bool(self.avatars),
+            self.static_image is not None,
+            duration=self.duration,
+            aspect_ratio=self.aspect_ratio,
+        )
         for path in (*self.avatars, *( [self.static_image] if self.static_image is not None else [] )):
             if not path.is_file():
                 raise ValueError(f"file not found: {path}")
@@ -81,6 +104,8 @@ class JobRequest(BaseModel):
     title: str | None = Field(default=None, max_length=200)
     project_id: str | None = Field(default=None, max_length=32)
     strategy: Strategy = Strategy.PARALLEL
+    duration: int | None = Field(default=None, description="Video clip duration in seconds (4, 6, 8, or 10)")
+    aspect_ratio: str | None = Field(default=None, max_length=16, description="Output aspect ratio ('16:9', '9:16', or '1:1')")
     static_image: str | None = Field(default=None, description="i2v: key of the picture used for every video")
     avatar: str | None = Field(default=None, description="i2i2v: key of the primary reference picture")
     avatar_keys: list[str] | None = Field(default=None, max_length=8, description="Ordered multi-angle avatar reference keys")
@@ -95,7 +120,14 @@ class JobRequest(BaseModel):
         keys = keys[:8]
         self.avatar_keys = keys or None
         self.avatar = keys[0] if keys else None
-        check_rows(self.mode, self.rows, bool(keys), self.static_image is not None)
+        check_rows(
+            self.mode,
+            self.rows,
+            bool(keys),
+            self.static_image is not None,
+            duration=self.duration,
+            aspect_ratio=self.aspect_ratio,
+        )
         return self
 
 
@@ -130,6 +162,8 @@ class JobStatus(BaseModel):
     project_id: str | None = None
     mode: Mode
     strategy: Strategy
+    duration: int | None = None
+    aspect_ratio: str | None = None
     state: JobState = JobState.QUEUED
     progress: JobProgress
     message: str | None = None

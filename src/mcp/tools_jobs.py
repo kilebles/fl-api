@@ -90,6 +90,34 @@ def enrich_job_rows(
     return out
 
 
+def build_modes_catalog() -> list[dict[str, Any]]:
+    """Build complete metadata for all Google Flow generation modes, including durations and aspect ratios."""
+    out: list[dict[str, Any]] = []
+    for mode, spec in MODES.items():
+        entry: dict[str, Any] = {
+            "id": mode.value,
+            "title": spec.title,
+            "makes_images": spec.makes_images,
+            "makes_videos": spec.makes_videos,
+            "needs_video_prompt": spec.needs_video_prompt,
+            "needs_image_prompt": spec.needs_image_prompt,
+            "avatar": spec.avatar,
+            "optional_avatar": spec.optional_avatar,
+            "static_image": spec.static_image,
+            "chain": spec.chain,
+            "durations": list(spec.durations),
+            "default_duration": spec.default_duration,
+            "aspect_ratios": list(spec.aspect_ratios),
+            "default_aspect_ratio": spec.default_aspect_ratio,
+        }
+        if spec.duration_models:
+            entry["video_models_by_duration"] = {str(k): v for k, v in spec.duration_models.items()}
+        if spec.frame_duration_models:
+            entry["frame_models_by_duration"] = {str(k): v for k, v in spec.frame_duration_models.items()}
+        out.append(entry)
+    return out
+
+
 def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
     """Register Veo / image batch queue tools on `mcp`."""
 
@@ -98,8 +126,10 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         annotations=READ_ONLY,
     )
     async def list_generation_modes(ctx: Context | None = None) -> list[dict[str, Any]]:
-        """List all Google Flow generation modes (t2v, flash_t2v, img, i2v, flash_i2v, i2i2v, f2v) and required inputs."""
-        return await client.request("GET", "/api/modes", caller_headers=_ctx_headers(ctx))
+        """List all Google Flow generation modes (t2v, flash_t2v, img, i2v, flash_i2v, i2i2v, f2v), supported video durations (4/6/8/10s), aspect ratios (16:9, 9:16, 1:1), and required inputs."""
+        api_modes: list[dict[str, Any]] = await client.request("GET", "/api/modes", caller_headers=_ctx_headers(ctx))
+        by_id = {m["id"]: m for m in build_modes_catalog()}
+        return [{**by_id.get(m["id"], {}), **m} for m in api_modes]
 
     @mcp.tool(
         title="List Generation Jobs",
@@ -235,6 +265,8 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         title: str | None = None,
         project_id: str | None = None,
         strategy: Strategy | None = None,
+        duration: Literal[4, 6, 8, 10] | None = None,
+        aspect_ratio: Literal["16:9", "9:16", "1:1"] | None = None,
         avatar_id: str | None = None,
         avatar_key: str | None = None,
         avatar_keys: list[str] | None = None,
@@ -250,6 +282,10 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         - `rows`: explicit `[{"name": "1", "prompt": "video prompt", "image_prompt": "image prompt"}]`
         - `prompts`: simple list of prompt strings `["shot 1...", "shot 2..."]` (auto-numbered 1..N)
         - `xlsx_path`: path to a local `.xlsx` file with `number`, `prompt` / `img_prompt` + `vid_prompt` columns.
+
+        Video duration (`duration`): `4`, `6`, or `8` sec for Veo 3.1 (`t2v`, `i2v`, `i2i2v`, default `8`);
+        `4`, `6`, `8`, or `10` sec for Omni 1.1 Flash (`flash_t2v`, `flash_i2v`, default `10`) and chained `f2v` (default `8`).
+        Aspect ratio (`aspect_ratio`): `"16:9"` or `"9:16"` for video modes, plus `"1:1"` for `img`.
         """
         headers = _ctx_headers(ctx)
         spec = MODES[mode]
@@ -307,6 +343,8 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             "title": title,
             "project_id": project_id,
             "strategy": chosen_strategy.value,
+            "duration": duration,
+            "aspect_ratio": aspect_ratio,
             "avatar": resolved_avatar_key,
             "avatar_keys": resolved_avatar_keys,
             "static_image": static_image_key,

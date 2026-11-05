@@ -15,6 +15,10 @@ class ModeInfo(BaseModel):
     avatar: bool
     static_image: bool
     chain: bool
+    durations: list[int] = []
+    default_duration: int | None = None
+    aspect_ratios: list[str] = ["16:9", "9:16"]
+    default_aspect_ratio: str = "16:9"
 
 
 class Upload(BaseModel):

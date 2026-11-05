@@ -20,6 +20,7 @@ from src.flow.models import (
     RecaptchaContext,
     StructuredPrompt,
     TextPart,
+    resolve_image_aspect_ratio,
 )
 
 _DIRECT_URL_KEYS = ("fifeUrl", "downloadUrl", "servingBaseUri", "imageUrl", "url")
@@ -60,6 +61,7 @@ class ImageGenerationService:
         cookies: dict[str, str] | None = None,
         reference_media_ids: list[str] | None = None,
         model_name: str | None = None,
+        aspect_ratio: str | None = None,
     ) -> list[str]:
         """
         Submit a text-to-image generation request to Flow API.
@@ -72,6 +74,7 @@ class ImageGenerationService:
             reference_media_ids: Media ids of uploaded pictures the model must keep
                 (image-to-image, e.g. an avatar). Uses the request's `imageInputs`.
             model_name: Explicit Flow image model enum (defaults to settings.image_model_name).
+            aspect_ratio: `"16:9"`, `"9:16"`, `"1:1"`, or raw Flow enum (defaults to landscape).
 
         Returns:
             List of media IDs for the generated images.
@@ -101,6 +104,7 @@ class ImageGenerationService:
             requests=[
                 ImageRequestItem(
                     clientContext=client_context,
+                    imageAspectRatio=resolve_image_aspect_ratio(aspect_ratio),
                     seed=seed,
                     imageInputs=[ImageInput(name=m) for m in reference_media_ids or []],
                     imageModelName=effective_model,

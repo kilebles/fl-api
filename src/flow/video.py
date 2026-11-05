@@ -30,6 +30,7 @@ from src.flow.models import (
     VideoGenerationRequest,
     VideoGenerationResponse,
     VideoRequestItem,
+    resolve_video_aspect_ratio,
 )
 
 _UPLOAD_FILTER_REASONS = ("PUBLIC_ERROR_MINOR_UPLOAD", "PUBLIC_ERROR_UNSAFE_GENERATION", "PUBLIC_ERROR_MINOR")
@@ -51,6 +52,7 @@ class VideoGenerationService:
         browser_headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         model_key: str | None = None,
+        aspect_ratio: str | None = None,
     ) -> VideoGenerationResponse:
         """Submit a text-to-video request; returns the accepted media."""
         logger.info(f"Sending generation request: {prompt}")
@@ -59,7 +61,7 @@ class VideoGenerationService:
             mediaGenerationContext=self._media_context(),
             requests=[
                 VideoRequestItem(
-                    aspectRatio=self._settings.video_aspect_ratio,
+                    aspectRatio=resolve_video_aspect_ratio(aspect_ratio, self._settings.video_aspect_ratio),
                     seed=random.randint(1, 99999),
                     textInput=self._text_input(prompt),
                     videoModelKey=model_key or self._settings.video_model_key,
@@ -80,6 +82,7 @@ class VideoGenerationService:
         cookies: dict[str, str] | None = None,
         model_key: str | None = None,
         extra_media_ids: list[str] | None = None,
+        aspect_ratio: str | None = None,
     ) -> VideoGenerationResponse:
         """Submit an image-to-video request with an uploaded image (plus up to 2 avatar anchors) as references."""
         ref_ids: list[str] = [media_id]
@@ -92,7 +95,7 @@ class VideoGenerationService:
             mediaGenerationContext=self._media_context(),
             requests=[
                 ImageVideoRequestItem(
-                    aspectRatio=self._settings.video_aspect_ratio,
+                    aspectRatio=resolve_video_aspect_ratio(aspect_ratio, self._settings.video_aspect_ratio),
                     seed=random.randint(1, 99999),
                     textInput=self._text_input(prompt),
                     videoModelKey=model_key or self._settings.i2v_model_key,
@@ -115,6 +118,7 @@ class VideoGenerationService:
         cookies: dict[str, str] | None = None,
         model_key: str | None = None,
         crop_coordinates: CropCoordinates | None = None,
+        aspect_ratio: str | None = None,
     ) -> VideoGenerationResponse:
         """Submit a frame-to-video request: the uploaded image is the clip's first frame (f2v chains)."""
         logger.info(f"Sending f2v generation request: {prompt}")
@@ -123,7 +127,7 @@ class VideoGenerationService:
             mediaGenerationContext=self._media_context(),
             requests=[
                 F2vRequestItem(
-                    aspectRatio=self._settings.video_aspect_ratio,
+                    aspectRatio=resolve_video_aspect_ratio(aspect_ratio, self._settings.video_aspect_ratio),
                     seed=random.randint(1, 99999),
                     textInput=self._text_input(prompt),
                     videoModelKey=model_key or self._settings.f2v_model_key,

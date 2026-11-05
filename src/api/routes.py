@@ -66,6 +66,10 @@ async def modes() -> list[ModeInfo]:
             avatar=spec.avatar,
             static_image=spec.static_image,
             chain=spec.chain,
+            durations=list(spec.durations),
+            default_duration=spec.default_duration,
+            aspect_ratios=list(spec.aspect_ratios),
+            default_aspect_ratio=spec.default_aspect_ratio,
         )
         for mode, spec in MODES.items()
     ]

@@ -84,6 +84,10 @@ async def test_mcp_requires_auth_and_restarts_cleanly(tmp_path: Path):
                                 "submit_generation_job",
                                 "handoff_prompts_to_job",
                                 "start_infographics_run",
+                                "analyze_avatar_reference",
+                                "order_avatar_references",
+                                "generate_avatar_angles",
+                                "cancel_avatar_angles",
                             } <= tool_names
 
                             resources = await session.list_resources()
@@ -272,17 +276,36 @@ async def test_mcp_full_pipeline_project_avatar_prompts_handoff_and_job(tmp_path
                     assert row_1["image_prompt"].endswith(", 35mm grain")
                     assert row_1["prompt"].endswith(", 35mm grain")
 
-                    # Also test submit_generation_job + diagnose_job on a filtered row
+                    # Also test submit_generation_job with duration + aspect_ratio + list_generation_modes + analyze_avatar_reference
+                    modes_catalog = _call_result_json(await session.call_tool("list_generation_modes", {}))
+                    t2v_meta = next(m for m in modes_catalog if m["id"] == "t2v")
+                    assert t2v_meta["durations"] == [4, 6, 8] and t2v_meta["default_duration"] == 8
+                    flash_meta = next(m for m in modes_catalog if m["id"] == "flash_t2v")
+                    assert flash_meta["durations"] == [4, 6, 8, 10] and flash_meta["default_duration"] == 10
+
+                    ref_analysis = _call_result_json(
+                        await session.call_tool("analyze_avatar_reference", {"file_path": str(avatar_pic)})
+                    )
+                    assert "recommended_angles" in ref_analysis and ref_analysis["key"].startswith("inputs/")
+
+                    ordered_refs = _call_result_json(
+                        await session.call_tool("order_avatar_references", {"image_keys": [ref_analysis["key"]]})
+                    )
+                    assert ordered_refs["keys"] == [ref_analysis["key"]]
+
                     custom_job = _call_result_json(
                         await session.call_tool(
                             "submit_generation_job",
                             {
                                 "mode": "t2v",
+                                "duration": 4,
+                                "aspect_ratio": "9:16",
                                 "prompts": ["good shot", "video prompt number 1 video prompt number 1 video prompt number 1"],
                                 "project_id": proj["id"],
                             },
                         )
                     )
+                    assert custom_job["duration"] == 4 and custom_job["aspect_ratio"] == "9:16"
                     for _ in range(80):
                         c_details = _call_result_json(
                             await session.call_tool("get_job_details", {"job_id": custom_job["id"]})
@@ -290,6 +313,8 @@ async def test_mcp_full_pipeline_project_avatar_prompts_handoff_and_job(tmp_path
                         if c_details["job"]["state"] in ("done", "stopped", "failed"):
                             break
                         await asyncio.sleep(0.03)
+                    assert "veo_3_1_t2v_lite_4s_low_priority" in fake_session.model_keys
+                    assert "9:16" in fake_session.video_aspect_ratios
 
                     diag = _call_result_json(
                         await session.call_tool("diagnose_job", {"job_id": custom_job["id"]})

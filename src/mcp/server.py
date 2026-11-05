@@ -17,9 +17,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.api.auth import get_principal
 from src.core.settings import Settings
-from src.jobs.modes import MODES
 from src.mcp.client import FlPlatformClient, extract_caller_headers
-from src.mcp.tools_jobs import register_job_tools
+from src.mcp.tools_jobs import build_modes_catalog, register_job_tools
 from src.mcp.tools_monitor import register_monitor_tools
 from src.mcp.tools_pipeline import register_pipeline_tools
 
@@ -30,16 +29,22 @@ Architecture & Workflow Stages:
 1. Monitoring & Accounts:
    - Call `get_system_overview` first to inspect JobQueue, browser accounts, infographics, and upstream services.
    - Use `get_accounts_status`, `diagnose_job`, and `tail_server_logs` when troubleshooting waiting/stopped/failed jobs.
-   - Jobs run one at a time in `JobQueue` because they share Dolphin Anty / Octo Browser profiles.
+   - Jobs run one at a time in `JobQueue` because they share Dolphin Anty / Octo Browser profiles (pooled via `MAX_ACTIVE_BROWSERS`).
 
-2. Projects («Ролики») & Avatars:
+2. Projects («Ролики») & 360° Avatars:
    - Projects hold a `title` and a `style` suffix automatically appended to prompts (`save_project`, `list_projects`).
-   - Avatars hold reference images and appearance text for `i2i2v` character consistency (`list_avatars`, `save_avatar`).
+   - Avatars hold ordered multi-angle reference images and appearance text for `i2i2v` / `img` character consistency (`list_avatars`, `save_avatar`, `analyze_avatar_reference`, `order_avatar_references`, `generate_avatar_angles`, `cancel_avatar_angles`).
 
-3. End-to-End Video Production Stages:
+3. Video Durations & Aspect Ratios:
+   - Veo 3.1 modes (`t2v`, `i2v`, `i2i2v`): `duration` supports `4`, `6`, or `8` seconds (default `8`); `aspect_ratio` supports `"16:9"` or `"9:16"`.
+   - Omni 1.1 Flash modes (`flash_t2v`, `flash_i2v`): `duration` supports `4`, `6`, `8`, or `10` seconds (default `10`); `aspect_ratio` supports `"16:9"` or `"9:16"`.
+   - Chained clips (`f2v`): `duration` supports `4`, `6`, `8` (Veo 3.1), or `10` seconds (Omni 1.1 Flash), default `8`; `aspect_ratio` supports `"16:9"` or `"9:16"`.
+   - Image-only (`img`): `aspect_ratio` supports `"16:9"`, `"9:16"`, or `"1:1"`.
+
+4. End-to-End Video Production Stages:
    - Stage 1 (Scenario & Analytics): `fl-scenario` (`list_scenario_projects`, `create_scenario_project`, `control_scenario_project`).
    - Stage 2 (Prompts): `fl-prompts` or built-in `fl-api` (`start_prompt_generation`, `get_prompt_run_details`).
-   - Stage 3 (Veo / Image Generation): Use `handoff_prompts_to_job` to send finished prompt pairs directly into `JobQueue`, or `submit_generation_job` for custom/Excel/single runs.
+   - Stage 3 (Veo / Image Generation): Use `handoff_prompts_to_job` to send finished prompt pairs directly into `JobQueue`, or `submit_generation_job` for custom/Excel/single runs (pass `duration` and `aspect_ratio` as needed).
    - Stage 4 (Infographics): `start_infographics_run` discovers people/places/artifacts via Wikidata/Wikimedia and renders Remotion cards.
    - Stage 5 (Voice & Footage): `start_voice_job` (translation + Fish TTS + mixing) and `start_footage_project`.
 """.strip()
@@ -132,25 +137,11 @@ def create_mcp_server(
         "fl://modes",
         name="generation_modes",
         title="Veo & Image Generation Modes",
-        description="All supported generation modes (t2v, flash_t2v, img, i2v, flash_i2v, i2i2v, f2v) and their input specs.",
+        description="All supported generation modes (t2v, flash_t2v, img, i2v, flash_i2v, i2i2v, f2v), supported video durations, aspect ratios, and input specs.",
         mime_type="application/json",
     )
     def modes_resource() -> str:
-        modes_list = [
-            {
-                "id": mode.value,
-                "title": spec.title,
-                "makes_images": spec.makes_images,
-                "makes_videos": spec.makes_videos,
-                "needs_video_prompt": spec.needs_video_prompt,
-                "needs_image_prompt": spec.needs_image_prompt,
-                "avatar": spec.avatar,
-                "static_image": spec.static_image,
-                "chain": spec.chain,
-            }
-            for mode, spec in MODES.items()
-        ]
-        return json.dumps(modes_list, ensure_ascii=False, indent=2)
+        return json.dumps(build_modes_catalog(), ensure_ascii=False, indent=2)
 
     @mcp.resource(
         "fl://pipeline",

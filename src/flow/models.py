@@ -9,7 +9,35 @@ class AspectRatio(str, Enum):
 
     LANDSCAPE = "VIDEO_ASPECT_RATIO_LANDSCAPE"
     PORTRAIT = "VIDEO_ASPECT_RATIO_PORTRAIT"
-    SQUARE = "VIDEO_ASPECT_RATIO_SQUARE"
+
+
+VIDEO_ASPECT_BY_RATIO: dict[str, str] = {
+    "16:9": AspectRatio.LANDSCAPE.value,
+    "9:16": AspectRatio.PORTRAIT.value,
+    "VIDEO_ASPECT_RATIO_LANDSCAPE": AspectRatio.LANDSCAPE.value,
+    "VIDEO_ASPECT_RATIO_PORTRAIT": AspectRatio.PORTRAIT.value,
+}
+
+IMAGE_ASPECT_BY_RATIO: dict[str, str] = {
+    "16:9": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "9:16": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "1:1": "IMAGE_ASPECT_RATIO_SQUARE",
+    "IMAGE_ASPECT_RATIO_LANDSCAPE": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "IMAGE_ASPECT_RATIO_PORTRAIT": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "IMAGE_ASPECT_RATIO_SQUARE": "IMAGE_ASPECT_RATIO_SQUARE",
+}
+
+
+def resolve_video_aspect_ratio(ratio: str | None, default: str) -> str:
+    if not ratio:
+        return default
+    return VIDEO_ASPECT_BY_RATIO.get(ratio, default)
+
+
+def resolve_image_aspect_ratio(ratio: str | None, default: str = "IMAGE_ASPECT_RATIO_LANDSCAPE") -> str:
+    if not ratio:
+        return default
+    return IMAGE_ASPECT_BY_RATIO.get(ratio, default)
 
 
 class RecaptchaContext(BaseModel):

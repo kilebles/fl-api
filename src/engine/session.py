@@ -35,6 +35,7 @@ from src.flow.http import MODEL_ACCESS_DENIED, QUOTA_REACHED, TOO_MUCH_TRAFFIC, 
 from src.flow.image import ImageGenerationService
 from src.flow.polling import PollingService
 from src.flow.video import VideoGenerationService
+from src.jobs.modes import is_start_frame_model
 
 T = TypeVar("T")
 
@@ -259,18 +260,28 @@ class AccountSession:
         frame: Path | None = None,
         model_key: str | None = None,
         extra_references: list[Path] | None = None,
+        aspect_ratio: str | None = None,
     ) -> SubmittedVideo:
         """Send a video request: text-to-video, image-to-video (`image`) or frame-to-video (`frame`)."""
         if image is not None and frame is not None:
             raise ValueError("pass either image or frame, not both")
         source = image or frame
-        label = f"i2v {source.name}" if image else f"f2v {source.name}" if frame else "t2v"
+        use_start_frame = frame is not None or (image is not None and is_start_frame_model(model_key))
+        label = (
+            f"f2v {source.name}"
+            if frame is not None
+            else f"i2v-frame {source.name}"
+            if use_start_frame
+            else f"i2v {source.name}"
+            if image is not None
+            else "t2v"
+        )
         logger.info(f"[{index}] {label}: {prompt[:50]}...")
 
         async def call(token: str, proxy_url: str | None):
             async with self._generate_lock:
                 cookies = dict(self._downloader.cookies) or None
-                common = dict(
+                common: dict[str, Any] = dict(
                     authorization=self._credentials.authorization,
                     project_id=self._credentials.project_id,
                     recaptcha_token=token,
@@ -279,6 +290,8 @@ class AccountSession:
                     cookies=cookies,
                     model_key=model_key,
                 )
+                if aspect_ratio is not None:
+                    common["aspect_ratio"] = aspect_ratio
                 if source is None:
                     return await self._video.generate(prompt=prompt, **common)
                 media_id = await self._video.upload_image(
@@ -289,7 +302,7 @@ class AccountSession:
                     browser_headers=self._credentials.browser_headers or None,
                     cookies=cookies,
                 )
-                if image:
+                if not use_start_frame:
                     extra_ids = [
                         await self._reference_media_id(ref, proxy_url)
                         for ref in (extra_references or [])[:2]
@@ -390,6 +403,7 @@ class AccountSession:
         dest: Path,
         reference: Path | None = None,
         references: list[Path] | None = None,
+        aspect_ratio: str | None = None,
     ) -> Path:
         """Generate one image and save it as `dest`.
 
@@ -416,6 +430,7 @@ class AccountSession:
                 used_model[0] = model_name
                 used_proxy[0] = proxy_url
                 reference_ids = [await self._reference_media_id(r, proxy_url) for r in refs] if refs else None
+                extra_kwargs = {"aspect_ratio": aspect_ratio} if aspect_ratio is not None else {}
                 return await self._image.generate(
                     prompt=prompt,
                     project_id=self._credentials.project_id,
@@ -426,6 +441,7 @@ class AccountSession:
                     cookies=dict(self._downloader.cookies) or None,
                     reference_media_ids=reference_ids,
                     model_name=model_name,
+                    **extra_kwargs,
                 )
 
         media_ids = await self._request(

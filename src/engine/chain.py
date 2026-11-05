@@ -17,6 +17,8 @@ async def run_chain(
     clips: list[tuple[str, str]],
     output_dir: Path,
     first_model_key: str | None = None,
+    frame_model_key: str | None = None,
+    aspect_ratio: str | None = None,
     on_change: Callable[[], Awaitable[None]] | None = None,
 ) -> BatchStats:
     """
@@ -64,13 +66,14 @@ async def run_chain(
             continue
 
         try:
+            extra_chain = {"aspect_ratio": aspect_ratio} if aspect_ratio is not None else {}
             if index == 0:
-                submitted = await session.submit_video(index, prompt, model_key=first_model_key)
+                submitted = await session.submit_video(index, prompt, model_key=first_model_key, **extra_chain)
             else:
                 if last_frame is None or not last_frame.exists():
                     raise RuntimeError(f"No usable frame to continue the chain at {name} — no prior clip succeeded")
                 logger.info(f"[{index}] f2v: {name} from {last_frame.name}")
-                submitted = await session.submit_video(index, prompt, frame=last_frame)
+                submitted = await session.submit_video(index, prompt, frame=last_frame, model_key=frame_model_key, **extra_chain)
             path = await session.finish_video(index, submitted)
         except GenerationFilteredError as e:
             logger.warning(f"[{index}] f2v: {name} filtered — skipped")

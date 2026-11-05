@@ -85,6 +85,7 @@ class WorkItem:
 class BatchOptions:
     output_dir: Path
     video_model_key: str | None = None
+    aspect_ratio: str | None = None
     reference_image: Path | None = None
     reference_images: list[Path] = field(default_factory=list)
     max_retries: int = 5
@@ -412,7 +413,11 @@ class BatchScheduler:
     async def _run_image(self, w: _Worker, state: _BatchState, item: WorkItem) -> bool:
         """Make the item's image. Returns True when the worker should stop."""
         try:
-            extra_img = {"references": self._options.reference_images} if self._options.reference_images else {}
+            extra_img: dict[str, object] = {}
+            if self._options.reference_images:
+                extra_img["references"] = self._options.reference_images
+            if self._options.aspect_ratio is not None:
+                extra_img["aspect_ratio"] = self._options.aspect_ratio
             await w.session.make_image(
                 item.index,
                 item.image_prompt,
@@ -452,11 +457,11 @@ class BatchScheduler:
                 await self._settle(state, item, "failed", skip_reason=f"source image missing: {item.image_path}")
             return False
         try:
-            extra_vid = (
-                {"extra_references": self._options.reference_images[:2]}
-                if self._options.reference_images
-                else {}
-            )
+            extra_vid: dict[str, object] = {}
+            if self._options.reference_images:
+                extra_vid["extra_references"] = self._options.reference_images[:2]
+            if self._options.aspect_ratio is not None:
+                extra_vid["aspect_ratio"] = self._options.aspect_ratio
             submitted = await w.session.submit_video(
                 item.index,
                 item.video_prompt,

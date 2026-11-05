@@ -316,3 +316,57 @@ async def test_multi_reference_image_and_r2v_fallback(tmp_path: Path):
     assert r2v_calls[0][:2] == ("up-scene", ["up-ref_0", "up-ref_1"])
     assert r2v_calls[1][:2] == ("up-scene", None)
     await session.close()
+
+
+async def test_short_duration_i2v_routes_to_start_frame_endpoint_and_portrait_aspect(tmp_path: Path):
+    session, _, _ = await _session(tmp_path, 1, [])
+    scene = tmp_path / "scene.jpg"
+    scene.write_bytes(b"scene")
+    ref = tmp_path / "avatar.jpg"
+    ref.write_bytes(b"avatar")
+
+    frame_calls: list[dict] = []
+    r2v_calls: list[dict] = []
+
+    class RoutingVideo:
+        async def upload_image(self, image_path: Path, **kwargs) -> str:
+            return f"up-{image_path.stem}"
+
+        async def generate_from_frame(self, **kwargs):
+            frame_calls.append(kwargs)
+            return VideoGenerationResponse(media=[MediaInfo(media_id="v-4s", project_id="proj", workflow_id="", status="")])
+
+        async def generate_from_image(self, **kwargs):
+            r2v_calls.append(kwargs)
+            return VideoGenerationResponse(media=[MediaInfo(media_id="v-8s", project_id="proj", workflow_id="", status="")])
+
+    session._video = RoutingVideo()
+
+    # 4s Veo 3.1 Lite uses start-frame endpoint (`generate_from_frame`) even when `image` + `extra_references` are passed
+    sub_4s = await session.submit_video(
+        0,
+        "turn head",
+        image=scene,
+        model_key="veo_3_1_i2v_s_lite_4s_low_priority",
+        extra_references=[ref],
+        aspect_ratio="9:16",
+    )
+    assert sub_4s.media_id == "v-4s"
+    assert len(frame_calls) == 1 and len(r2v_calls) == 0
+    assert frame_calls[0]["model_key"] == "veo_3_1_i2v_s_lite_4s_low_priority"
+    assert frame_calls[0]["aspect_ratio"] == "9:16"
+
+    # Omni 1.1 Flash 4s (`abra_r2v_4s`) natively supports referenceImages (`generate_from_image`)
+    sub_flash = await session.submit_video(
+        1,
+        "smile",
+        image=scene,
+        model_key="abra_r2v_4s",
+        extra_references=[ref],
+        aspect_ratio="16:9",
+    )
+    assert sub_flash.media_id == "v-8s"
+    assert len(r2v_calls) == 1
+    assert r2v_calls[0]["model_key"] == "abra_r2v_4s"
+    assert r2v_calls[0]["extra_media_ids"] == ["up-avatar"]
+    await session.close()

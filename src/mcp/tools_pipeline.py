@@ -194,6 +194,105 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         """Delete an avatar by ID."""
         return await client.request("DELETE", f"/api/avatars/{avatar_id}", caller_headers=_ctx_headers(ctx))
 
+    @mcp.tool(title="Analyze Avatar Reference Photo", annotations=CREATE_ACTION)
+    async def analyze_avatar_reference(
+        image_key: str | None = None,
+        file_path: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Classify framing (`close_up`, `medium`, `full_body`, `turnaround_sheet`) and camera angle (`front`, `three_quarter`, `profile`, `back`) of an uploaded `image_key` or local `file_path`, returning non-duplicating `recommended_angles` for 360° generation."""
+        if bool(image_key) == bool(file_path):
+            raise ValueError("Provide exactly one of `image_key` or `file_path`.")
+        headers = _ctx_headers(ctx)
+        resolved_key = image_key
+        if file_path:
+            path = Path(file_path).expanduser().resolve()
+            if not path.is_file():
+                raise ValueError(f"Reference image file not found: {path}")
+            uploaded = await client.request(
+                "POST",
+                "/api/uploads",
+                files={"file": (path.name, await asyncio.to_thread(path.read_bytes))},
+                caller_headers=headers,
+            )
+            resolved_key = uploaded["key"]
+        return await client.request(
+            "POST",
+            "/api/avatars/analyze-reference",
+            json_body={"key": resolved_key},
+            caller_headers=headers,
+        )
+
+    @mcp.tool(title="Order Avatar References Canonically", annotations=SAFE_MUTATE)
+    async def order_avatar_references(
+        image_keys: list[str],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Automatically sort uploaded reference `image_keys` into canonical Google Flow & Veo slot priority (`0° front -> 45° three_quarter -> full_body -> 90° profile -> 180° back`)."""
+        if not image_keys:
+            raise ValueError("`image_keys` must contain at least one uploaded key.")
+        return await client.request(
+            "POST",
+            "/api/avatars/order-references",
+            json_body={"keys": image_keys},
+            caller_headers=_ctx_headers(ctx),
+        )
+
+    @mcp.tool(title="Generate 360° Avatar Turnaround Angles", annotations=CREATE_ACTION)
+    async def generate_avatar_angles(
+        avatar_id: str | None = None,
+        name: str | None = None,
+        appearance: str | None = None,
+        angles: list[Literal["front", "three_quarter", "profile", "back", "full_body"]] | None = None,
+        style: str | None = None,
+        project_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Generate studio 360° turnaround angles (`three_quarter`, `profile`, `back`, `full_body`) for an existing `avatar_id` locked to its primary photo, or create a brand-new avatar from text (`name` + `appearance`) when `avatar_id` is omitted."""
+        headers = _ctx_headers(ctx)
+        if avatar_id:
+            body: dict[str, Any] = {}
+            if angles is not None:
+                body["angles"] = angles
+            if style is not None:
+                body["style"] = style
+            if project_id is not None:
+                body["project_id"] = project_id
+            return await client.request(
+                "POST",
+                f"/api/avatars/{avatar_id}/angles",
+                json_body=body,
+                caller_headers=headers,
+            )
+        if not name or not (appearance and appearance.strip()):
+            raise ValueError("Provide `avatar_id` for an existing avatar, or both `name` and `appearance` to generate from scratch.")
+        gen_body: dict[str, Any] = {"name": name.strip(), "appearance": appearance.strip()}
+        if angles is not None:
+            gen_body["angles"] = angles
+        if style is not None:
+            gen_body["style"] = style
+        if project_id is not None:
+            gen_body["project_id"] = project_id
+        return await client.request(
+            "POST",
+            "/api/avatars/generate",
+            json_body=gen_body,
+            caller_headers=headers,
+        )
+
+    @mcp.tool(title="Cancel 360° Avatar Generation", annotations=SAFE_MUTATE)
+    async def cancel_avatar_angles(
+        avatar_id: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Stop an active 360° turnaround generation job for `avatar_id` while keeping any angles already imported."""
+        return await client.request(
+            "POST",
+            f"/api/avatars/{avatar_id}/angles/cancel",
+            json_body={},
+            caller_headers=_ctx_headers(ctx),
+        )
+
     # ------------------------------------------------------------------ Stage 1: Scenario & Analytics (fl-scenario)
 
     @mcp.tool(title="List Scenario Niches & Options", annotations=READ_ONLY)
@@ -548,9 +647,13 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         project_id: str | None = None,
         avatar_id: str | None = None,
         avatar_key: str | None = None,
+        avatar_keys: list[str] | None = None,
         static_image_key: str | None = None,
         title: str | None = None,
         strategy: Strategy | None = None,
+        duration: Literal[4, 6, 8, 10] | None = None,
+        aspect_ratio: Literal["16:9", "9:16", "1:1"] | None = None,
+        video_model_key: str | None = None,
         apply_project_style: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -558,6 +661,7 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         Send finished prompt pairs from `fl-prompts` or built-in `fl-api` directly into `JobQueue` (like clicking «В производство»).
 
         Automatically applies `avatar.appearance` (for `i2i2v`) and `project.style` suffix, without downloading `.xlsx` files.
+        Supports `duration` (`4`, `6`, `8`, or `10` sec depending on `mode`) and `aspect_ratio` (`"16:9"`, `"9:16"`, or `"1:1"` for `img`).
         """
         headers = _ctx_headers(ctx)
         raw_rows: list[dict[str, Any]] = []
@@ -602,7 +706,7 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
 
         spec = MODES[mode]
         resolved_avatar_key, resolved_avatar_keys, avatar_appearance = await resolve_avatar_refs(
-            client, avatar_id, avatar_key, caller_headers=headers
+            client, avatar_id, avatar_key, avatar_keys=avatar_keys, caller_headers=headers
         )
         style = await resolve_project_style(client, inferred_project_id, headers) if apply_project_style else ""
         enriched_rows = enrich_job_rows(
@@ -619,9 +723,12 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             "title": title or inferred_title,
             "project_id": inferred_project_id,
             "strategy": chosen_strategy.value,
+            "duration": duration,
+            "aspect_ratio": aspect_ratio,
             "avatar": resolved_avatar_key,
             "avatar_keys": resolved_avatar_keys,
             "static_image": static_image_key,
+            "video_model_key": video_model_key,
         }
         return await client.request("POST", "/api/jobs", json_body=body, caller_headers=headers)
 
