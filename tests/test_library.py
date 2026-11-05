@@ -170,3 +170,68 @@ def test_avatar_multi_refs_and_360_studio_generation(tmp_path: Path, monkeypatch
 
         assert len(cleo["image_keys"]) == 4
         assert cleo["pack_job_id"] is None
+
+
+def test_smart_reference_framing_analysis_no_duplicates(tmp_path: Path, monkeypatch):
+    from src.accounts.repository import AccountRepository
+    from src.avatars.angles import ReferenceAnalyzer, detect_image_mime, recommend_angles_for
+    from src.engine import scheduler
+    from src.jobs.runner import JobRunner
+    from src.storage.objects import make_object_store
+    from tests.fakes import FakeSession
+
+    # 1. Pure matrix checks: zero duplicate framing/angles
+    assert recommend_angles_for("full_body", "front") == ["front", "three_quarter", "back"]
+    assert recommend_angles_for("full_body", "three_quarter") == ["front", "profile", "back"]
+    assert recommend_angles_for("full_body", "profile") == ["front", "three_quarter", "back"]
+    assert recommend_angles_for("full_body", "back") == ["front", "three_quarter", "profile"]
+    assert recommend_angles_for("close_up", "front") == ["three_quarter", "profile", "full_body"]
+    assert recommend_angles_for("medium", "three_quarter") == ["front", "profile", "full_body"]
+    assert recommend_angles_for("medium", "profile") == ["front", "three_quarter", "full_body"]
+    assert recommend_angles_for("turnaround_sheet", "front") == ["front", "three_quarter", "profile"]
+
+    assert detect_image_mime(b"\x89PNG\r\n\x1a\nrest") == "image/png"
+    assert detect_image_mime(b"\xff\xd8\xff\xe0rest") == "image/jpeg"
+    assert detect_image_mime(b"RIFF\x00\x00\x00\x00WEBPrest") == "image/webp"
+
+    # 2. End-to-end API + cache + auto-selection in AvatarStudio when angles=None
+    monkeypatch.setattr(scheduler, "PICK_POLL_INTERVAL", 0.02)
+    monkeypatch.setattr(scheduler, "INTER_GENERATION_PAUSE", (0.0, 0.0))
+
+    settings = _settings(tmp_path)
+    store = make_object_store(settings)
+    calls: list[str] = []
+
+    async def fake_classifier(data: bytes, mime: str):
+        calls.append(mime)
+        return ("full_body", "front")
+
+    analyzer = ReferenceAnalyzer("", store, classifier=fake_classifier)
+    repo = AccountRepository(settings.accounts_dir)
+    repo.create("1")
+    fake_session = FakeSession("account_1", tmp_path / "scratch")
+    runner = JobRunner(settings, repo)
+    monkeypatch.setattr(runner, "_make_sessions", lambda accounts, strategy: [fake_session])
+
+    with TestClient(create_app(settings, objects=store, runner=runner, analyzer=analyzer)) as client:
+        key = client.post("/api/uploads", files={"file": ("fullbody.png", b"\x89PNG\r\n\x1a\nbody")}).json()["key"]
+        r1 = client.post("/api/avatars/analyze-reference", json={"key": key})
+        assert r1.status_code == 200
+        body = r1.json()
+        assert body["detected"] is True
+        assert body["framing"] == "full_body"
+        assert body["angle"] == "front"
+        assert body["summary_ru"] == "в полный рост · анфас 0°"
+        assert body["recommended_angles"] == ["front", "three_quarter", "back"]
+
+        # Second call hits in-memory LRU cache without invoking classifier again
+        r2 = client.post("/api/avatars/analyze-reference", json={"key": key})
+        assert r2.status_code == 200
+        assert calls == ["image/png"]
+
+        # Calling /angles without explicit angles uses analyzer -> ["front", "three_quarter", "back"] (no "full_body" duplicate!)
+        av = client.post("/api/avatars", json={"name": "Цезарь", "appearance": "тога", "image_keys": [key]}).json()
+        started = client.post(f"/api/avatars/{av['id']}/angles", json={}).json()
+        job_detail = client.get(f"/api/jobs/{started['pack_job_id']}").json()
+        assert [row["name"] for row in job_detail["rows"]] == ["front", "three_quarter", "back"]
+

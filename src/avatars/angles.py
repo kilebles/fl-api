@@ -1,13 +1,18 @@
-"""Studio 360° turnaround angles for avatars: prompt templates and live JobQueue attachment."""
+"""Studio 360° turnaround angles for avatars: prompt templates, smart reference framing analysis, and live JobQueue attachment."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import uuid
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from google import genai
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from src.avatars.service import AvatarNotFoundError, AvatarRecord, AvatarService
 from src.jobs.models import JobRequest, JobRow, JobState, JobStatus
@@ -15,11 +20,14 @@ from src.jobs.modes import Mode, Strategy
 from src.jobs.queue import JobQueue
 from src.storage.objects import ObjectStore
 
-AngleId = Literal["front", "three_quarter", "profile", "full_body"]
+AngleId = Literal["front", "three_quarter", "profile", "back", "full_body"]
+ReferenceFraming = Literal["close_up", "medium", "full_body", "turnaround_sheet"]
+ReferenceAngle = Literal["front", "three_quarter", "profile", "back"]
 
-TURNAROUND_ORDER: tuple[AngleId, ...] = ("front", "three_quarter", "profile", "full_body")
+TURNAROUND_ORDER: tuple[AngleId, ...] = ("front", "three_quarter", "profile", "back", "full_body")
 DEFAULT_TURNAROUND_ANGLES: tuple[AngleId, ...] = ("three_quarter", "profile", "full_body")
 MAX_AVATAR_REFS = 8
+ANALYSIS_CACHE_MAX = 256
 
 
 @dataclass(frozen=True)
@@ -34,13 +42,13 @@ class AngleSpec:
 ANGLES: dict[AngleId, AngleSpec] = {
     "front": AngleSpec(
         id="front",
-        title="Анфас",
+        title="Крупный анфас",
         badge="0°",
         from_reference_prompt=(
-            "Studio character reference portrait of the exact same person from the reference image, "
-            "clean front-facing view looking directly into the camera, head and shoulders framing, "
-            "85mm portrait lens, calm neutral expression, soft even three-point studio lighting, "
-            "plain matte neutral grey studio backdrop, identical facial structure, skin texture, hair, and collar"
+            "Studio character reference close-up portrait of the exact same person from the reference image, "
+            "clean front-facing 0-degree view looking directly into the camera, tight head and shoulders framing "
+            "for sharp facial detail, 85mm portrait lens, calm neutral expression, soft even three-point studio lighting, "
+            "plain matte neutral grey studio backdrop, identical facial bone structure, eyes, skin texture, hair, and collar"
         ),
         from_scratch_prompt=(
             "Studio character reference portrait, clean front-facing head and shoulders view looking directly "
@@ -78,6 +86,22 @@ ANGLES: dict[AngleId, AngleSpec] = {
             "85mm lens, neutral expression, soft even studio lighting, plain matte neutral grey studio backdrop"
         ),
     ),
+    "back": AngleSpec(
+        id="back",
+        title="Со спины",
+        badge="180°",
+        from_reference_prompt=(
+            "Studio full-length rear reference view of the exact same person from the reference image "
+            "standing on a plain matte neutral grey cyclorama studio floor, strict 180-degree back view from head to footwear, "
+            "head slightly turned 15 degrees to reveal hairline and ear silhouette, soft even full-length studio lighting, "
+            "50mm lens, single figure only, matching exact hair back, collar, shoulders, back of complete outfit, and shoes"
+        ),
+        from_scratch_prompt=(
+            "Studio full-length rear character reference standing on a plain matte neutral grey cyclorama studio floor, "
+            "strict 180-degree back view from head to footwear, head slightly turned 15 degrees showing hairline and ear silhouette, "
+            "soft even full-length studio lighting, 50mm lens, single figure only"
+        ),
+    ),
     "full_body": AngleSpec(
         id="full_body",
         title="Полный рост",
@@ -95,6 +119,204 @@ ANGLES: dict[AngleId, AngleSpec] = {
         ),
     ),
 }
+
+_FRAMING_LABELS_RU: dict[ReferenceFraming, str] = {
+    "close_up": "крупный портрет",
+    "medium": "поясной портрет",
+    "full_body": "в полный рост",
+    "turnaround_sheet": "лист ракурсов",
+}
+
+_ANGLE_LABELS_RU: dict[ReferenceAngle, str] = {
+    "front": "анфас 0°",
+    "three_quarter": "полуоборот 45°",
+    "profile": "профиль 90°",
+    "back": "со спины 180°",
+}
+
+
+class _VisionClassification(BaseModel):
+    framing: ReferenceFraming = Field(
+        description=(
+            "'close_up' = head/face/shoulders only; "
+            "'medium' = chest-up, waist-up, or knees-up without feet; "
+            "'full_body' = single figure visible from head all the way down to legs/feet; "
+            "'turnaround_sheet' = multiple poses/angles of the same character side-by-side in one image."
+        )
+    )
+    angle: ReferenceAngle = Field(
+        description=(
+            "Dominant camera angle on the character: "
+            "'front' = facing camera (0-20 deg), "
+            "'three_quarter' = angled 3/4 view (25-65 deg), "
+            "'profile' = side view (70-115 deg), "
+            "'back' = seen from behind (135-180 deg)."
+        )
+    )
+
+
+@dataclass(frozen=True)
+class ReferenceAnalysis:
+    key: str
+    detected: bool
+    framing: ReferenceFraming
+    angle: ReferenceAngle
+    summary_ru: str
+    recommended_angles: list[AngleId]
+
+
+def recommend_angles_for(framing: ReferenceFraming, angle: ReferenceAngle) -> list[AngleId]:
+    """Return 3 optimal non-duplicating studio angles so #1 + 3 angles = 4 Flow multi-reference slots."""
+    if framing == "turnaround_sheet":
+        return ["front", "three_quarter", "profile"]
+    if framing == "full_body":
+        # User already uploaded a full-body shot: add a crisp close-up face anchor ("front") + missing angles,
+        # and use single rear view ("back") instead of repeating a front+back full_body sheet.
+        if angle == "front":
+            return ["front", "three_quarter", "back"]
+        if angle == "three_quarter":
+            return ["front", "profile", "back"]
+        if angle == "profile":
+            return ["front", "three_quarter", "back"]
+        return ["front", "three_quarter", "profile"]
+    # close_up or medium portrait: include full_body (front+back) and skip whichever portrait angle #1 already covers
+    if angle == "front":
+        return ["three_quarter", "profile", "full_body"]
+    if angle == "three_quarter":
+        return ["front", "profile", "full_body"]
+    return ["front", "three_quarter", "full_body"]
+
+
+def format_reference_summary(framing: ReferenceFraming, angle: ReferenceAngle) -> str:
+    if framing == "turnaround_sheet":
+        return _FRAMING_LABELS_RU[framing]
+    return f"{_FRAMING_LABELS_RU[framing]} · {_ANGLE_LABELS_RU[angle]}"
+
+
+def detect_image_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return "image/jpeg"
+
+
+ReferenceClassifier = Callable[[bytes, str], Awaitable[tuple[ReferenceFraming, ReferenceAngle]]]
+
+_CLASSIFY_PROMPT = (
+    "Classify the primary character photo by shot framing and camera angle so a 360-degree reference studio "
+    "can generate only the missing angles without duplicates."
+)
+
+
+class ReferenceAnalyzer:
+    """Classifies an avatar's primary reference image (`framing` + `angle`) via Gemini Interactions API."""
+
+    def __init__(
+        self,
+        google_api_key: str,
+        objects: ObjectStore,
+        *,
+        classifier: ReferenceClassifier | None = None,
+    ) -> None:
+        self._objects = objects
+        self._client = genai.Client(api_key=google_api_key) if google_api_key else None
+        self._classifier = classifier
+        self._cache: OrderedDict[str, ReferenceAnalysis] = OrderedDict()
+        self._inflight: dict[str, asyncio.Task[ReferenceAnalysis]] = {}
+
+    def _fallback(self, key: str) -> ReferenceAnalysis:
+        return ReferenceAnalysis(
+            key=key,
+            detected=False,
+            framing="medium",
+            angle="front",
+            summary_ru=format_reference_summary("medium", "front"),
+            recommended_angles=list(DEFAULT_TURNAROUND_ANGLES),
+        )
+
+    async def analyze_key(self, key: str) -> ReferenceAnalysis:
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached
+
+        existing = self._inflight.get(key)
+        if existing is not None:
+            return await existing
+
+        task = asyncio.create_task(self._compute(key))
+        self._inflight[key] = task
+        try:
+            return await task
+        finally:
+            self._inflight.pop(key, None)
+
+    async def _compute(self, key: str) -> ReferenceAnalysis:
+        if self._classifier is None and self._client is None:
+            return self._fallback(key)
+        try:
+            data = await self._objects.get_bytes(key)
+            mime_type = detect_image_mime(data)
+            if self._classifier is not None:
+                framing, angle = await self._classifier(data, mime_type)
+            else:
+                framing, angle = await self._classify_with_gemini(data, mime_type)
+            result = ReferenceAnalysis(
+                key=key,
+                detected=True,
+                framing=framing,
+                angle=angle,
+                summary_ru=format_reference_summary(framing, angle),
+                recommended_angles=recommend_angles_for(framing, angle),
+            )
+            self._cache[key] = result
+            self._cache.move_to_end(key)
+            while len(self._cache) > ANALYSIS_CACHE_MAX:
+                self._cache.popitem(last=False)
+            return result
+        except Exception as e:
+            logger.warning(f"[avatar-studio] reference analysis fallback for {key}: {type(e).__name__}: {e}")
+            return self._fallback(key)
+
+    async def _classify_with_gemini(self, data: bytes, mime_type: str) -> tuple[ReferenceFraming, ReferenceAngle]:
+        assert self._client is not None
+        image_b64 = base64.b64encode(data).decode("ascii")
+        schema = _VisionClassification.model_json_schema()
+        inputs: list[dict[str, Any]] = [
+            {"type": "text", "text": _CLASSIFY_PROMPT},
+            {"type": "image", "data": image_b64, "mime_type": mime_type},
+        ]
+        response_format: dict[str, Any] = {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": schema,
+        }
+        try:
+            interaction = await self._client.aio.interactions.create(
+                model="gemini-3.5-flash-lite",
+                input=inputs,
+                response_format=response_format,
+                generation_config={"temperature": 0.0},
+                store=False,
+                timeout=12.0,
+            )
+        except Exception as first_err:
+            logger.debug(f"[avatar-studio] gemini-3.5-flash-lite failed ({first_err}), retrying gemini-3.8-flash")
+            interaction = await self._client.aio.interactions.create(
+                model="gemini-3.8-flash",
+                input=inputs,
+                response_format=response_format,
+                generation_config={"thinking_level": "low", "temperature": 0.0},
+                store=False,
+                timeout=15.0,
+            )
+        parsed = _VisionClassification.model_validate_json(interaction.output_text or "{}")
+        return parsed.framing, parsed.angle
 
 
 def build_angle_prompt(angle_id: AngleId, appearance: str, style: str = "", *, has_reference: bool) -> str:
@@ -126,10 +348,18 @@ class AvatarBusyError(RuntimeError):
 class AvatarStudio:
     """Coordinates 360° studio angle generation through JobQueue and attaches finished frames to the avatar."""
 
-    def __init__(self, avatars: AvatarService, queue: JobQueue, objects: ObjectStore) -> None:
+    def __init__(
+        self,
+        avatars: AvatarService,
+        queue: JobQueue,
+        objects: ObjectStore,
+        *,
+        analyzer: ReferenceAnalyzer | None = None,
+    ) -> None:
         self._avatars = avatars
         self._queue = queue
         self._objects = objects
+        self._analyzer = analyzer
         self._lock = asyncio.Lock()
         queue.add_hook(self._on_job_event)
 
@@ -149,8 +379,8 @@ class AvatarStudio:
         if free_slots <= 0:
             raise ValueError("У аватара уже максимум референсов (8)")
 
-        wanted = normalize_angles(angles)
         if not record.image_keys:
+            wanted = normalize_angles(angles)
             if not record.appearance.strip():
                 raise ValueError("Опишите внешность аватара или загрузите базовый портрет")
             follow_up = [a for a in wanted if a != "front"][: max(0, MAX_AVATAR_REFS - 1)]
@@ -160,6 +390,12 @@ class AvatarStudio:
                 style=style,
                 project_id=project_id,
             )
+
+        if angles is None and self._analyzer is not None:
+            analysis = await self._analyzer.analyze_key(record.image_keys[0])
+            wanted = normalize_angles(analysis.recommended_angles)
+        else:
+            wanted = normalize_angles(angles)
 
         selected = wanted[:free_slots]
         if not selected:

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from src.api.auth import Caller
 from src.api.routes import check_upload_key_owner
-from src.avatars.angles import ANGLES, AngleId, AvatarStudio
+from src.avatars.angles import ANGLES, AngleId, AvatarStudio, ReferenceAnalyzer, ReferenceAngle, ReferenceFraming
 from src.avatars.service import AvatarRecord, AvatarService
 from src.jobs.models import JobState
 from src.projects.service import ProjectRecord, ProjectService
@@ -28,9 +28,14 @@ def get_avatar_studio(request: Request) -> AvatarStudio:
     return request.app.state.avatar_studio
 
 
+def get_avatar_analyzer(request: Request) -> ReferenceAnalyzer:
+    return request.app.state.avatar_analyzer
+
+
 Projects = Annotated[ProjectService, Depends(get_projects)]
 Avatars = Annotated[AvatarService, Depends(get_avatars)]
 Studio = Annotated[AvatarStudio, Depends(get_avatar_studio)]
+Analyzer = Annotated[ReferenceAnalyzer, Depends(get_avatar_analyzer)]
 
 
 class Project(BaseModel):
@@ -90,6 +95,19 @@ class AvatarAnglesIn(BaseModel):
     angles: list[AngleId] | None = None
     style: str | None = None
     project_id: str | None = None
+
+
+class AvatarAnalyzeIn(BaseModel):
+    key: str = Field(min_length=1, max_length=512)
+
+
+class AvatarRefAnalysisOut(BaseModel):
+    key: str
+    detected: bool
+    framing: ReferenceFraming
+    angle: ReferenceAngle
+    summary_ru: str
+    recommended_angles: list[AngleId]
 
 
 def _project(r: ProjectRecord) -> Project:
@@ -199,6 +217,26 @@ async def create_avatar(body: AvatarIn, avatars: Avatars, request: Request, call
     await _check_keys(request, body.image_keys, caller)
     record = await avatars.create(body.name, body.appearance, body.image_keys, user_id=caller.user_id)
     return await _avatar(record, request)
+
+
+@router.post("/avatars/analyze-reference")
+async def analyze_avatar_reference(
+    body: AvatarAnalyzeIn,
+    analyzer: Analyzer,
+    request: Request,
+    caller: Caller,
+) -> AvatarRefAnalysisOut:
+    """Classify framing and camera angle of an uploaded reference photo to suggest non-duplicating 360° angles."""
+    await _check_keys(request, [body.key], caller)
+    res = await analyzer.analyze_key(body.key)
+    return AvatarRefAnalysisOut(
+        key=res.key,
+        detected=res.detected,
+        framing=res.framing,
+        angle=res.angle,
+        summary_ru=res.summary_ru,
+        recommended_angles=res.recommended_angles,
+    )
 
 
 @router.post("/avatars/generate", status_code=201)

@@ -35,7 +35,7 @@ from src.auth.service import (
     UsernameAlreadyExistsError,
     UserNotFoundError,
 )
-from src.avatars.angles import AvatarBusyError, AvatarStudio
+from src.avatars.angles import AvatarBusyError, AvatarStudio, ReferenceAnalyzer
 from src.avatars.service import AvatarNotFoundError, AvatarService
 from src.core.db import Database
 from src.core.settings import Settings
@@ -57,8 +57,9 @@ def create_app(
     runner: JobRunner | None = None,
     llm: LLMClient | None = None,
     mailer: ResendMailer | None = None,
+    analyzer: ReferenceAnalyzer | None = None,
 ) -> FastAPI:
-    """Build the app; `objects`, `runner` and `llm` can be replaced (tests)."""
+    """Build the app; `objects`, `runner`, `llm` and `analyzer` can be replaced (tests)."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -95,7 +96,8 @@ def create_app(
         app.state.infographics = infographics = InfographicsService(db, store, settings)
         app.state.projects = ProjectService(db, store)
         app.state.avatars = AvatarService(db)
-        app.state.avatar_studio = AvatarStudio(app.state.avatars, queue, store)
+        app.state.avatar_analyzer = analyzer or ReferenceAnalyzer(settings.google_api_key, store)
+        app.state.avatar_studio = AvatarStudio(app.state.avatars, queue, store, analyzer=app.state.avatar_analyzer)
         await queue.start(background_sync=True)
         await prompts.start()
         await infographics.start()
