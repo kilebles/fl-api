@@ -36,6 +36,7 @@ class DolphinAntyManager:
         self._accounts: deque[AccountInfo] = deque(accounts)
         self._current: AccountInfo = accounts[0]
         self._current_ws: str | None = None
+        self._ever_touched: bool = False
         self._public_api = public_api
         self._local_api = local_api
         self._proxy_index: int = 0
@@ -80,6 +81,7 @@ class DolphinAntyManager:
     def attach(self, ws_url: str) -> None:
         """Reuse a browser that is already running for the current account (skip stop/start)."""
         self._current_ws = ws_url
+        self._ever_touched = True
 
     def forget_browser(self) -> None:
         """Drop the cached endpoint so the next start_current() really restarts the profile."""
@@ -87,8 +89,10 @@ class DolphinAntyManager:
 
     def stop_current(self) -> None:
         """Stop the currently selected Dolphin browser profile and clear its cached CDP endpoint."""
+        was_touched = self._ever_touched or self._current_ws is not None
         self._current_ws = None
-        if self._current.dolphin_id:
+        self._ever_touched = False
+        if was_touched and self._current.dolphin_id:
             self._local_api.stop(self._current.dolphin_id)
 
     def current_google_credentials(self) -> tuple[str | None, str | None]:
@@ -217,6 +221,7 @@ class DolphinAntyManager:
         a failed start is retried (falling back to the next proxy in proxies.txt).
         """
         acc = self._current
+        self._ever_touched = True
         self._apply_proxy(acc)
         self._local_api.stop(acc.dolphin_id)
         for attempt in range(1, attempts + 1):
@@ -329,6 +334,7 @@ class DolphinAntyManager:
         each failing one dead) before giving up; then move on to the next account.
         """
         acc = self._current
+        self._ever_touched = True
         dead = self._dead_proxies.setdefault(acc.name, set())
         live_proxies = [p for p in acc.proxies if p.key not in dead]
         proxy_attempts: list[ProxyInfo | None] = live_proxies if len(live_proxies) > 1 else [None]
