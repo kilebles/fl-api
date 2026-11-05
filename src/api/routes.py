@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 from src.accounts.account import AccountInfo
 from src.accounts.repository import AccountNotFoundError, AccountRepository
@@ -94,6 +94,18 @@ async def upload(request: Request, file: UploadFile, caller: Caller) -> Upload:
     key = f"{prefix}/{uuid.uuid4().hex}{suffix}"
     await request.app.state.objects.put(data, key, name)
     return Upload(key=key, name=name, size=len(data))
+
+
+@router.get("/uploads/download")
+async def download_upload(request: Request, key: str, caller: Caller, name: str | None = None) -> RedirectResponse:
+    """Redirect to a presigned Content-Disposition attachment URL for an uploaded reference image."""
+    check_upload_key_owner(key, caller)
+    if not await request.app.state.objects.exists(key):
+        raise HTTPException(404, f"uploaded file not found: {key}")
+    suffix = PurePosixPath(key).suffix.lower() or ".jpg"
+    clean_base = re.sub(r'[\\/:*?"<>|]+', "-", (name or "avatar").strip()).strip() or "avatar"
+    download_name = clean_base if clean_base.lower().endswith(tuple(IMAGE_TYPES)) else f"{clean_base}{suffix}"
+    return RedirectResponse(request.app.state.objects.url(key, download_name=download_name), status_code=302)
 
 
 @router.post("/rows/xlsx")

@@ -49,6 +49,7 @@ class Avatar(BaseModel):
     appearance: str
     image_keys: list[str]
     image_urls: list[str]
+    download_urls: list[str] = []
     created_at: datetime
 
 
@@ -70,8 +71,20 @@ def _project(r: ProjectRecord) -> Project:
 
 def _avatar(r: AvatarRecord, request: Request) -> Avatar:
     objects = request.app.state.objects
+    total = len(r.image_keys)
+    base_name = (r.name or "avatar").strip() or "avatar"
+    download_urls = [
+        objects.url(k, download_name=f"{base_name}{f' - {i + 1}' if total > 1 else ''}{k[k.rfind('.'):] if '.' in k else '.jpg'}")
+        for i, k in enumerate(r.image_keys)
+    ]
     return Avatar(
-        id=r.id, name=r.name, appearance=r.appearance or "", image_keys=r.image_keys, image_urls=[objects.url(k) for k in r.image_keys], created_at=r.created_at
+        id=r.id,
+        name=r.name,
+        appearance=r.appearance or "",
+        image_keys=r.image_keys,
+        image_urls=[objects.url(k) for k in r.image_keys],
+        download_urls=download_urls,
+        created_at=r.created_at,
     )
 
 
