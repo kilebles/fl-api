@@ -136,7 +136,7 @@ async def sync_jobs(queue: Queue, _admin: AdminCaller) -> dict[str, int]:
 async def create_job(body: JobRequest, request: Request, queue: Queue, caller: Caller) -> JobStatus:
     if body.project_id:
         await request.app.state.projects.get(body.project_id, user_id=caller.user_id)
-    for key in (body.avatar, body.static_image):
+    for key in (body.avatar, body.static_image, *(body.avatar_keys or ())):
         if key is not None:
             check_upload_key_owner(key, caller)
     return await queue.submit(body, user_id=caller.user_id)
@@ -153,6 +153,7 @@ async def get_job(job_id: str, queue: Queue, caller: Caller) -> JobDetail:
         position=await queue.position(job_id),
         video_model_key=record.video_model_key,
         avatar=record.avatar_key,
+        avatar_keys=record.resolved_avatar_keys,
         static_image=record.static_image_key,
     )
 

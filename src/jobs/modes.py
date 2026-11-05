@@ -31,6 +31,7 @@ class ModeSpec:
     needs_image_prompt: bool
     chain: bool = False
     avatar: bool = False
+    optional_avatar: bool = False
     static_image: bool = False
     video_model: Callable[[Settings], str | None] = lambda settings: None
 
@@ -48,6 +49,7 @@ MODES: dict[Mode, ModeSpec] = {
     Mode.IMG: ModeSpec(
         title="Text → image",
         makes_images=True, makes_videos=False, needs_video_prompt=False, needs_image_prompt=True,
+        optional_avatar=True,
     ),
     Mode.I2V: ModeSpec(
         title="Text → image → video (or one static image → video)",

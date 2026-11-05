@@ -33,22 +33,37 @@ async def resolve_project_style(client: FlPlatformClient, project_id: str | None
     return ""
 
 
+async def resolve_avatar_refs(
+    client: FlPlatformClient,
+    avatar_id: str | None,
+    avatar_key: str | None,
+    avatar_keys: list[str] | None = None,
+    caller_headers=None,
+) -> tuple[str | None, list[str] | None, str]:
+    """Resolve `(primary_key, all_keys, appearance)` from an `avatar_id` or raw `avatar_key` / `avatar_keys`."""
+    explicit = [str(k) for k in (avatar_keys or []) if k]
+    if avatar_key and avatar_key not in explicit:
+        explicit.insert(0, avatar_key)
+    if explicit:
+        return explicit[0], explicit, ""
+    if not avatar_id:
+        return None, None, ""
+    avatars: list[dict[str, Any]] = await client.request("GET", "/api/avatars", caller_headers=caller_headers)
+    for av in avatars:
+        if av.get("id") == avatar_id:
+            keys = [str(k) for k in (av.get("image_keys") or []) if k]
+            if not keys:
+                raise ValueError(f"Avatar {avatar_id} has no reference images yet")
+            return keys[0], keys, str(av.get("appearance") or "").strip()
+    raise ValueError(f"Avatar {avatar_id} not found")
+
+
 async def resolve_avatar(
     client: FlPlatformClient, avatar_id: str | None, avatar_key: str | None, caller_headers=None
 ) -> tuple[str | None, str]:
     """Resolve `(image_key, appearance)` from an `avatar_id` or raw `avatar_key`."""
-    if avatar_key:
-        return avatar_key, ""
-    if not avatar_id:
-        return None, ""
-    avatars: list[dict[str, Any]] = await client.request("GET", "/api/avatars", caller_headers=caller_headers)
-    for av in avatars:
-        if av.get("id") == avatar_id:
-            keys = av.get("image_keys") or []
-            if not keys:
-                raise ValueError(f"Avatar {avatar_id} has no reference images")
-            return str(keys[0]), str(av.get("appearance") or "").strip()
-    raise ValueError(f"Avatar {avatar_id} not found")
+    primary, _, appearance = await resolve_avatar_refs(client, avatar_id, avatar_key, caller_headers=caller_headers)
+    return primary, appearance
 
 
 def enrich_job_rows(
@@ -222,6 +237,7 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         strategy: Strategy | None = None,
         avatar_id: str | None = None,
         avatar_key: str | None = None,
+        avatar_keys: list[str] | None = None,
         static_image_key: str | None = None,
         video_model_key: str | None = None,
         apply_project_style: bool = True,
@@ -272,7 +288,9 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             assert rows is not None
             raw_rows = rows
 
-        resolved_avatar_key, avatar_appearance = await resolve_avatar(client, avatar_id, avatar_key, headers)
+        resolved_avatar_key, resolved_avatar_keys, avatar_appearance = await resolve_avatar_refs(
+            client, avatar_id, avatar_key, avatar_keys=avatar_keys, caller_headers=headers
+        )
         style = await resolve_project_style(client, project_id, headers) if apply_project_style else ""
         enriched_rows = enrich_job_rows(
             raw_rows,
@@ -290,6 +308,7 @@ def register_job_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             "project_id": project_id,
             "strategy": chosen_strategy.value,
             "avatar": resolved_avatar_key,
+            "avatar_keys": resolved_avatar_keys,
             "static_image": static_image_key,
             "video_model_key": video_model_key,
         }

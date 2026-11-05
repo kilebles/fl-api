@@ -86,8 +86,19 @@ class BatchOptions:
     output_dir: Path
     video_model_key: str | None = None
     reference_image: Path | None = None
+    reference_images: list[Path] = field(default_factory=list)
     max_retries: int = 5
     max_active_browsers: int = 0
+
+    def __post_init__(self) -> None:
+        merged: list[Path] = []
+        if self.reference_image is not None:
+            merged.append(self.reference_image)
+        for p in self.reference_images:
+            if p not in merged:
+                merged.append(p)
+        self.reference_images = merged
+        self.reference_image = merged[0] if merged else None
 
 
 @dataclass
@@ -395,7 +406,14 @@ class BatchScheduler:
     async def _run_image(self, w: _Worker, state: _BatchState, item: WorkItem) -> bool:
         """Make the item's image. Returns True when the worker should stop."""
         try:
-            await w.session.make_image(item.index, item.image_prompt, item.image_path, reference=self._options.reference_image)
+            extra_img = {"references": self._options.reference_images} if self._options.reference_images else {}
+            await w.session.make_image(
+                item.index,
+                item.image_prompt,
+                item.image_path,
+                reference=self._options.reference_image,
+                **extra_img,
+            )
         except ImageQuotaError:
             logger.warning(f"[{w.name}/img] image quota — this account switches to videos, {item.name} re-queued")
             state.image_queue.put_nowait(item)
@@ -428,8 +446,17 @@ class BatchScheduler:
                 await self._settle(state, item, "failed", skip_reason=f"source image missing: {item.image_path}")
             return False
         try:
+            extra_vid = (
+                {"extra_references": self._options.reference_images[:2]}
+                if self._options.reference_images
+                else {}
+            )
             submitted = await w.session.submit_video(
-                item.index, item.video_prompt, image=item.image_path, model_key=self._options.video_model_key
+                item.index,
+                item.video_prompt,
+                image=item.image_path,
+                model_key=self._options.video_model_key,
+                **extra_vid,
             )
         except GenerationFilteredError as e:
             logger.warning(f"[{w.name}/video] Filtered (permanent skip): {item.name}")

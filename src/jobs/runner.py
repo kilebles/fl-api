@@ -148,6 +148,7 @@ class JobRunner:
                             output_dir=output.directory,
                             video_model_key=model_key,
                             reference_image=spec.avatar,
+                            reference_images=spec.avatars,
                             max_active_browsers=self._settings.max_active_browsers,
                         )
                         await BatchScheduler(sessions, options, on_change=on_change).run(output.work_items(missing))

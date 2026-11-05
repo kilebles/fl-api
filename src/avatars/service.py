@@ -18,6 +18,9 @@ class AvatarRecord(Base):
     name: Mapped[str] = mapped_column(String(200))
     appearance: Mapped[str] = mapped_column(Text, default="")
     image_keys: Mapped[list[str]] = mapped_column(JSON, default=list)
+    pack_job_id: Mapped[str | None] = mapped_column(String(32), index=True, default=None)
+    pack_stage: Mapped[str | None] = mapped_column(String(32), default=None)
+    pack_pending: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
@@ -43,6 +46,10 @@ class AvatarService:
             raise AvatarNotFoundError(f"avatar {avatar_id}")
         return record
 
+    async def by_pack_job(self, job_id: str) -> AvatarRecord | None:
+        async with self._session() as session:
+            return await session.scalar(select(AvatarRecord).where(AvatarRecord.pack_job_id == job_id).limit(1))
+
     async def create(self, name: str, appearance: str, image_keys: list[str], user_id: str | None = None) -> AvatarRecord:
         record = AvatarRecord(
             id=uuid.uuid4().hex[:12],
@@ -57,9 +64,20 @@ class AvatarService:
             await session.commit()
         return record
 
-    async def update(self, avatar_id: str, user_id: str | None = None, **values: Any) -> AvatarRecord:
+    async def update(
+        self,
+        avatar_id: str,
+        user_id: str | None = None,
+        *,
+        clear_pack: bool = False,
+        **values: Any,
+    ) -> AvatarRecord:
         await self.get(avatar_id, user_id=user_id)
         values = {k: v for k, v in values.items() if v is not None}
+        if clear_pack:
+            values["pack_job_id"] = None
+            values["pack_stage"] = None
+            values["pack_pending"] = None
         if values:
             async with self._session() as session:
                 await session.execute(update(AvatarRecord).where(AvatarRecord.id == avatar_id).values(**values))

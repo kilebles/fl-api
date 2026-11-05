@@ -35,6 +35,7 @@ from src.auth.service import (
     UsernameAlreadyExistsError,
     UserNotFoundError,
 )
+from src.avatars.angles import AvatarBusyError, AvatarStudio
 from src.avatars.service import AvatarNotFoundError, AvatarService
 from src.core.db import Database
 from src.core.settings import Settings
@@ -94,6 +95,7 @@ def create_app(
         app.state.infographics = infographics = InfographicsService(db, store, settings)
         app.state.projects = ProjectService(db, store)
         app.state.avatars = AvatarService(db)
+        app.state.avatar_studio = AvatarStudio(app.state.avatars, queue, store)
         await queue.start(background_sync=True)
         await prompts.start()
         await infographics.start()
@@ -207,6 +209,10 @@ def create_app(
     @app.exception_handler(LLMNotConfiguredError)
     async def _llm_missing(request: Request, exc: LLMNotConfiguredError) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=503)
+
+    @app.exception_handler(AvatarBusyError)
+    async def _avatar_busy(request: Request, exc: AvatarBusyError) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
 
     @app.exception_handler(InputNotFoundError)
     async def _bad_input(request: Request, exc: InputNotFoundError) -> JSONResponse:

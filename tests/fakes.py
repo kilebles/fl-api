@@ -38,6 +38,8 @@ class FakeSession:
         self.videos_made: list[str] = []
         self.model_keys: list[str | None] = []
         self.sources: list[Path | None] = []
+        self.image_references: list[list[Path]] = []
+        self.video_extra_references: list[list[Path]] = []
 
     def can_make_images(self) -> bool:
         return not self.on_cooldown and self._images
@@ -59,19 +61,36 @@ class FakeSession:
     async def rotate(self) -> None:
         pass
 
-    async def make_image(self, index: int, prompt: str, dest: Path, reference: Path | None = None) -> Path:
+    async def make_image(
+        self,
+        index: int,
+        prompt: str,
+        dest: Path,
+        reference: Path | None = None,
+        references: list[Path] | None = None,
+    ) -> Path:
         await asyncio.sleep(0)
         if self._image_quota_after is not None and len(self.images_made) >= self._image_quota_after:
             self._images = False
             raise ImageQuotaError(self.name)
         if prompt in self._filtered:
             raise GenerationFilteredError(f"filtered: {prompt}")
+        refs = list(references) if references else ([reference] if reference else [])
+        self.image_references.append(refs)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(f"{prompt}|ref={reference.name if reference else ''}")
         self.images_made.append(prompt)
         return dest
 
-    async def submit_video(self, index: int, prompt: str, image: Path | None = None, frame: Path | None = None, model_key: str | None = None) -> SubmittedVideo:
+    async def submit_video(
+        self,
+        index: int,
+        prompt: str,
+        image: Path | None = None,
+        frame: Path | None = None,
+        model_key: str | None = None,
+        extra_references: list[Path] | None = None,
+    ) -> SubmittedVideo:
         await asyncio.sleep(0)
         if not self._videos:
             raise VideoAccessDeniedError(self.name)
@@ -79,6 +98,7 @@ class FakeSession:
             raise GenerationFilteredError(f"filtered: {prompt}")
         self.model_keys.append(model_key)
         self.sources.append(image or frame)
+        self.video_extra_references.append(list(extra_references or []))
         return SubmittedVideo(media_id=f"{self.name}-{index}-{prompt}", project_id="p", proxy_url=None, cookies={})
 
     async def finish_video(self, index: int, submitted: SubmittedVideo) -> Path:

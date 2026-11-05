@@ -4,7 +4,7 @@ import asyncio
 import json
 import shutil
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -48,7 +48,11 @@ class JobQueue:
         self._running_id: str | None = None
         self._running_task: asyncio.Task | None = None
         self._subscribers: set[tuple[str | None, asyncio.Queue[JobStatus]]] = set()
+        self._hooks: list[Callable[[JobStatus], Awaitable[None]]] = []
         self._stopping = False
+
+    def add_hook(self, fn: Callable[[JobStatus], Awaitable[None]]) -> None:
+        self._hooks.append(fn)
 
     async def start(self, background_sync: bool = False) -> None:
         if not background_sync:
@@ -73,8 +77,8 @@ class JobQueue:
                 pass
 
     async def submit(self, request: JobRequest, user_id: str | None = None) -> JobStatus:
-        for key in (request.avatar, request.static_image):
-            if key is not None and not await self._objects.exists(key):
+        for key in (*(request.avatar_keys or []), *([request.avatar] if request.avatar else []), *([request.static_image] if request.static_image else [])):
+            if not await self._objects.exists(key):
                 raise InputNotFoundError(f"uploaded file not found: {key}")
         record = await self._repo.create(uuid.uuid4().hex[:12], request, user_id=user_id)
         meta = {
@@ -87,6 +91,7 @@ class JobQueue:
             "rows": record.rows,
             "video_model_key": record.video_model_key,
             "avatar_key": record.avatar_key,
+            "avatar_keys": record.resolved_avatar_keys,
             "static_image_key": record.static_image_key,
             "created_at": record.created_at.isoformat(),
         }
@@ -175,6 +180,11 @@ class JobQueue:
         return record
 
     async def _publish(self, status: JobStatus, owner_id: str | None = None) -> None:
+        for hook in list(self._hooks):
+            try:
+                await hook(status)
+            except Exception as e:
+                logger.warning(f"[queue] status hook failed for {status.id}: {e}")
         for sub_user_id, queue in list(self._subscribers):
             if sub_user_id is not None and sub_user_id != owner_id:
                 continue
@@ -274,13 +284,19 @@ class JobQueue:
         out.mkdir(parents=True, exist_ok=True)
         mode = MODES[Mode(record.mode)]
 
-        inputs: dict[str, Path] = {}
-        for field, key in (("avatar", record.avatar_key), ("static_image", record.static_image_key)):
-            if key:
-                path = work / "inputs" / f"{field}{PurePosixPath(key).suffix}"
-                if not path.exists():
-                    await self._objects.download(key, path)
-                inputs[field] = path
+        avatar_paths: list[Path] = []
+        for idx, key in enumerate(record.resolved_avatar_keys):
+            suffix = PurePosixPath(key).suffix or ".jpg"
+            path = work / "inputs" / (f"avatar{suffix}" if idx == 0 else f"avatar_{idx + 1}{suffix}")
+            if not path.exists():
+                await self._objects.download(key, path)
+            avatar_paths.append(path)
+
+        static_path: Path | None = None
+        if record.static_image_key:
+            static_path = work / "inputs" / f"static_image{PurePosixPath(record.static_image_key).suffix}"
+            if not static_path.exists():
+                await self._objects.download(record.static_image_key, static_path)
 
         valid_rows = {r.name for r in record.job_rows}
         done_rows = {f.row for f in files if f.kind == "skip" or f.kind == ("video" if mode.makes_videos else "image")}
@@ -304,5 +320,7 @@ class JobQueue:
             output_dir=out,
             strategy=Strategy(record.strategy),
             video_model_key=record.video_model_key,
-            **inputs,
+            avatar=avatar_paths[0] if avatar_paths else None,
+            avatars=avatar_paths,
+            static_image=static_path,
         )

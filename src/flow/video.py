@@ -79,9 +79,14 @@ class VideoGenerationService:
         browser_headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         model_key: str | None = None,
+        extra_media_ids: list[str] | None = None,
     ) -> VideoGenerationResponse:
-        """Submit an image-to-video request with an uploaded image as the reference."""
-        logger.info(f"Sending i2v generation request: {prompt}")
+        """Submit an image-to-video request with an uploaded image (plus up to 2 avatar anchors) as references."""
+        ref_ids: list[str] = [media_id]
+        for extra in extra_media_ids or []:
+            if extra and extra not in ref_ids and len(ref_ids) < 3:
+                ref_ids.append(extra)
+        logger.info(f"Sending i2v generation request ({len(ref_ids)} ref(s)): {prompt}")
         request = ImageVideoGenerationRequest(
             clientContext=self._client_context(project_id, recaptcha_token),
             mediaGenerationContext=self._media_context(),
@@ -91,7 +96,7 @@ class VideoGenerationService:
                     seed=random.randint(1, 99999),
                     textInput=self._text_input(prompt),
                     videoModelKey=model_key or self._settings.i2v_model_key,
-                    referenceImages=[ReferenceImage(mediaId=media_id)],
+                    referenceImages=[ReferenceImage(mediaId=mid) for mid in ref_ids],
                 )
             ],
         )

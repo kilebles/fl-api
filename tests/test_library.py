@@ -82,3 +82,91 @@ def test_projects_sync_across_databases_via_object_store(tmp_path: Path):
         )
         assert resp.status_code == 201
         assert resp.json()["project_id"] == project["id"]
+
+
+def test_avatar_multi_refs_and_360_studio_generation(tmp_path: Path, monkeypatch):
+    import time
+
+    from src.accounts.repository import AccountRepository
+    from src.engine import scheduler
+    from src.jobs.runner import JobRunner
+    from tests.fakes import FakeSession
+
+    monkeypatch.setattr(scheduler, "PICK_POLL_INTERVAL", 0.02)
+    monkeypatch.setattr(scheduler, "INTER_GENERATION_PAUSE", (0.0, 0.0))
+
+    settings = _settings(tmp_path)
+    repo = AccountRepository(settings.accounts_dir)
+    repo.create("1")
+    fake_session = FakeSession("account_1", tmp_path / "scratch")
+    runner = JobRunner(settings, repo)
+    monkeypatch.setattr(runner, "_make_sessions", lambda accounts, strategy: [fake_session])
+
+    with TestClient(create_app(settings, runner=runner)) as client:
+        # 1. Existing avatar with 1 photo -> build 360° angles -> grows to 4 image_keys
+        k1 = client.post("/api/uploads", files={"file": ("portrait.png", b"png-1")}).json()["key"]
+        av = client.post(
+            "/api/avatars",
+            json={"name": "Марк Аврелий", "appearance": "кудрявая борода, белый плащ", "image_keys": [k1]},
+        ).json()
+
+        started = client.post(f"/api/avatars/{av['id']}/angles", json={})
+        assert started.status_code == 202
+        assert started.json()["pack_job_id"] is not None
+        assert started.json()["pack_total"] == 3
+
+        for _ in range(200):
+            listed = client.get("/api/avatars").json()
+            current = next(a for a in listed if a["id"] == av["id"])
+            if current["pack_job_id"] is None and len(current["image_keys"]) == 4:
+                break
+            time.sleep(0.02)
+
+        assert len(current["image_keys"]) == 4
+        assert current["image_keys"][0] == k1
+        assert len(current["image_urls"]) == 4
+
+        # 2. Submit i2i2v job with all 4 avatar_keys -> verify all 4 reach make_image & 2 anchors reach submit_video
+        fake_session.image_references.clear()
+        fake_session.video_extra_references.clear()
+        job = client.post(
+            "/api/jobs",
+            json={
+                "mode": "i2i2v",
+                "avatar": current["image_keys"][0],
+                "avatar_keys": current["image_keys"],
+                "rows": [{"name": "1", "image_prompt": "standing in senate", "prompt": "slow push in"}],
+            },
+        ).json()
+        for _ in range(200):
+            detail = client.get(f"/api/jobs/{job['id']}").json()
+            if detail["state"] == "done":
+                break
+            time.sleep(0.02)
+
+        assert detail["state"] == "done"
+        assert detail["avatar_keys"] == current["image_keys"]
+        assert len(fake_session.image_references) == 1
+        assert len(fake_session.image_references[0]) == 4
+        assert len(fake_session.video_extra_references) == 1
+        assert len(fake_session.video_extra_references[0]) == 2
+
+        # 3. Generate a complete 4-angle avatar from text alone (Stage 1 front -> Stage 2 turnaround)
+        gen = client.post(
+            "/api/avatars/generate",
+            json={"name": "Клеопатра", "appearance": "золотая диадема, льняное платье"},
+        )
+        assert gen.status_code == 201
+        gen_id = gen.json()["id"]
+        assert gen.json()["pack_stage"] == "base"
+        assert gen.json()["pack_total"] == 4
+
+        for _ in range(300):
+            listed = client.get("/api/avatars").json()
+            cleo = next(a for a in listed if a["id"] == gen_id)
+            if cleo["pack_job_id"] is None and len(cleo["image_keys"]) == 4:
+                break
+            time.sleep(0.02)
+
+        assert len(cleo["image_keys"]) == 4
+        assert cleo["pack_job_id"] is None

@@ -245,6 +245,7 @@ class AccountSession:
         image: Path | None = None,
         frame: Path | None = None,
         model_key: str | None = None,
+        extra_references: list[Path] | None = None,
     ) -> SubmittedVideo:
         """Send a video request: text-to-video, image-to-video (`image`) or frame-to-video (`frame`)."""
         if image is not None and frame is not None:
@@ -275,8 +276,26 @@ class AccountSession:
                     browser_headers=self._credentials.browser_headers or None,
                     cookies=cookies,
                 )
-                generate = self._video.generate_from_image if image else self._video.generate_from_frame
-                return await generate(prompt=prompt, media_id=media_id, **common)
+                if image:
+                    extra_ids = [
+                        await self._reference_media_id(ref, proxy_url)
+                        for ref in (extra_references or [])[:2]
+                        if ref != source
+                    ]
+                    if extra_ids:
+                        try:
+                            return await self._video.generate_from_image(
+                                prompt=prompt, media_id=media_id, extra_media_ids=extra_ids, **common
+                            )
+                        except httpx.HTTPStatusError as exc:
+                            if exc.response.status_code != 400:
+                                raise
+                            logger.warning(f"[{index}] Multi-ref r2v returned 400 — falling back to primary scene frame")
+                            common["recaptcha_token"] = await asyncio.wait_for(
+                                self._producer.get_token(), timeout=TOKEN_TIMEOUT
+                            )
+                    return await self._video.generate_from_image(prompt=prompt, media_id=media_id, **common)
+                return await self._video.generate_from_frame(prompt=prompt, media_id=media_id, **common)
 
         response = await self._request(index, label, call)
         if not response.media:
@@ -351,15 +370,27 @@ class AccountSession:
         self._count_success()
         return path
 
-    async def make_image(self, index: int, prompt: str, dest: Path, reference: Path | None = None) -> Path:
+    async def make_image(
+        self,
+        index: int,
+        prompt: str,
+        dest: Path,
+        reference: Path | None = None,
+        references: list[Path] | None = None,
+    ) -> Path:
         """Generate one image and save it as `dest`.
 
         Tries configured image models in order (BELUGA = Nano Banana 2.1 -> GEM_PIX_2 = Nano Banana Pro):
         when one model hits its per-model daily quota, the session immediately switches to the next.
-        With `reference` the picture is uploaded to the project once and passed as an
-        image input, so the generated image keeps its subject (avatar mode).
+        With `reference` / `references` up to 4 avatar angle pictures are uploaded once per project
+        and passed as `imageInputs`, locking identity across angles.
         """
-        logger.info(f"[{index}] image: {prompt[:50]}..." + (f" (reference {reference.name})" if reference else ""))
+        refs: list[Path] = []
+        for p in (*(references or []), *([reference] if reference else [])):
+            if p not in refs and len(refs) < 4:
+                refs.append(p)
+        ref_note = f" (references: {', '.join(r.name for r in refs)})" if refs else ""
+        logger.info(f"[{index}] image: {prompt[:50]}...{ref_note}")
         used_proxy: list[str | None] = [None]
         used_model: list[str | None] = [None]
 
@@ -371,7 +402,7 @@ class AccountSession:
                     raise ImageQuotaError(f"[{index}] all image models on cooldown on {self.name}")
                 used_model[0] = model_name
                 used_proxy[0] = proxy_url
-                reference_ids = [await self._reference_media_id(reference, proxy_url)] if reference else None
+                reference_ids = [await self._reference_media_id(r, proxy_url) for r in refs] if refs else None
                 return await self._image.generate(
                     prompt=prompt,
                     project_id=self._credentials.project_id,

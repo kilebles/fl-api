@@ -33,6 +33,7 @@ class JobDetail(JobStatus):
     position: int | None = None
     video_model_key: str | None = None
     avatar: str | None = None
+    avatar_keys: list[str] = []
     static_image: str | None = None
 
 

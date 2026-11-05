@@ -270,3 +270,49 @@ def test_sapisidhash_headers_and_clients6_endpoint():
 
     rewritten = api_endpoint("https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText", auth)
     assert rewritten == "https://aisandbox-pa.clients6.google.com/v1/video:batchAsyncGenerateVideoText"
+
+
+async def test_multi_reference_image_and_r2v_fallback(tmp_path: Path):
+    session, _, _ = await _session(tmp_path, 1, [])
+    refs = []
+    for i in range(5):
+        p = tmp_path / f"ref_{i}.jpg"
+        p.write_bytes(f"img-{i}".encode())
+        refs.append(p)
+
+    captured_img_refs: list[list[str] | None] = []
+    r2v_calls: list[tuple[str, list[str] | None, str]] = []
+
+    class MultiRefImage:
+        async def generate(self, **kwargs):
+            captured_img_refs.append(kwargs.get("reference_media_ids"))
+            return ["gen-scene"]
+
+        async def download(self, media_id: str, cookies: dict, proxy_url=None) -> Path:
+            out = tmp_path / f"{media_id}.jpg"
+            out.write_bytes(b"scene")
+            return out
+
+    class MultiRefVideo:
+        async def upload_image(self, image_path: Path, **kwargs) -> str:
+            return f"up-{image_path.stem}"
+
+        async def generate_from_image(self, *, media_id: str, extra_media_ids: list[str] | None = None, recaptcha_token: str = "", **kwargs):
+            r2v_calls.append((media_id, extra_media_ids, recaptcha_token))
+            if extra_media_ids:
+                raise _error(400, "INVALID_ARGUMENT")
+            return VideoGenerationResponse(media=[MediaInfo(media_id="v-ok", project_id="proj", workflow_id="", status="")])
+
+    session._image = MultiRefImage()
+    session._video = MultiRefVideo()
+    scene = await session.make_image(0, "portrait", tmp_path / "scene.jpg", references=refs)
+    # Capped at 4 imageInputs in Nano Banana
+    assert captured_img_refs == [["up-ref_0", "up-ref_1", "up-ref_2", "up-ref_3"]]
+
+    submitted = await session.submit_video(0, "walk forward", image=scene, extra_references=refs[:3])
+    assert submitted.media_id == "v-ok"
+    # First attempt passes 2 extra avatar anchors (total 3 referenceImages); on 400 falls back cleanly to single scene frame!
+    assert len(r2v_calls) == 2
+    assert r2v_calls[0][:2] == ("up-scene", ["up-ref_0", "up-ref_1"])
+    assert r2v_calls[1][:2] == ("up-scene", None)
+    await session.close()

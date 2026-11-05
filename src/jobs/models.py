@@ -29,7 +29,7 @@ def check_rows(mode: Mode, rows: list[JobRow], avatar: bool, static_image: bool)
         raise ValueError(f"row names must be letters, digits, '_', '-', '.': {bad[:5]}")
     if len(set(names)) != len(names):
         raise ValueError("row names must be unique")
-    if avatar and not spec.avatar:
+    if avatar and not (spec.avatar or spec.optional_avatar):
         raise ValueError(f"mode {mode} does not take an avatar")
     if spec.avatar and not avatar:
         raise ValueError(f"mode {mode} needs an avatar picture")
@@ -51,14 +51,23 @@ class JobSpec(BaseModel):
     output_dir: Path
     strategy: Strategy = Strategy.PARALLEL
     static_image: Path | None = Field(default=None, description="i2v: one picture used as the source of every video")
-    avatar: Path | None = Field(default=None, description="i2i2v: reference picture kept in every generated image")
+    avatar: Path | None = Field(default=None, description="i2i2v: primary reference picture kept in every generated image")
+    avatars: list[Path] = Field(default_factory=list, description="Multi-angle avatar reference pictures (ordered, primary first)")
     video_model_key: str | None = Field(default=None, description="Override of the mode's video model")
 
     @model_validator(mode="after")
     def _check(self) -> "JobSpec":
-        check_rows(self.mode, self.rows, self.avatar is not None, self.static_image is not None)
-        for path in (self.avatar, self.static_image):
-            if path is not None and not path.is_file():
+        merged: list[Path] = []
+        if self.avatar is not None:
+            merged.append(self.avatar)
+        for p in self.avatars:
+            if p not in merged:
+                merged.append(p)
+        self.avatars = merged
+        self.avatar = merged[0] if merged else None
+        check_rows(self.mode, self.rows, bool(self.avatars), self.static_image is not None)
+        for path in (*self.avatars, *( [self.static_image] if self.static_image is not None else [] )):
+            if not path.is_file():
                 raise ValueError(f"file not found: {path}")
         return self
 
@@ -72,12 +81,20 @@ class JobRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=32)
     strategy: Strategy = Strategy.PARALLEL
     static_image: str | None = Field(default=None, description="i2v: key of the picture used for every video")
-    avatar: str | None = Field(default=None, description="i2i2v: key of the reference picture")
+    avatar: str | None = Field(default=None, description="i2i2v: key of the primary reference picture")
+    avatar_keys: list[str] | None = Field(default=None, max_length=8, description="Ordered multi-angle avatar reference keys")
     video_model_key: str | None = Field(default=None, description="Override of the mode's video model")
 
     @model_validator(mode="after")
     def _check(self) -> "JobRequest":
-        check_rows(self.mode, self.rows, self.avatar is not None, self.static_image is not None)
+        keys: list[str] = []
+        for k in (*(self.avatar_keys or []), *([self.avatar] if self.avatar else [])):
+            if k and k not in keys:
+                keys.append(k)
+        keys = keys[:8]
+        self.avatar_keys = keys or None
+        self.avatar = keys[0] if keys else None
+        check_rows(self.mode, self.rows, bool(keys), self.static_image is not None)
         return self
 
 

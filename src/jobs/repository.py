@@ -47,6 +47,7 @@ class JobRecord(Base):
     total: Mapped[int] = mapped_column(Integer)
     video_model_key: Mapped[str | None] = mapped_column(String(100))
     avatar_key: Mapped[str | None] = mapped_column(String(300))
+    avatar_keys: Mapped[list[str] | None] = mapped_column(JSON, default=None)
     static_image_key: Mapped[str | None] = mapped_column(String(300))
     pass_num: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
@@ -56,6 +57,12 @@ class JobRecord(Base):
     @property
     def job_rows(self) -> list[JobRow]:
         return [JobRow.model_validate(row) for row in self.rows]
+
+    @property
+    def resolved_avatar_keys(self) -> list[str]:
+        if self.avatar_keys:
+            return [k for k in self.avatar_keys if k]
+        return [self.avatar_key] if self.avatar_key else []
 
 
 class JobFileRecord(Base):
@@ -95,6 +102,7 @@ class JobRepository:
             total=len(request.rows),
             video_model_key=request.video_model_key,
             avatar_key=request.avatar,
+            avatar_keys=request.avatar_keys,
             static_image_key=request.static_image,
             pass_num=0,
             created_at=datetime.now(),
@@ -260,6 +268,7 @@ class JobRepository:
                         strategy = meta.get("strategy", Strategy.PARALLEL.value)
                         video_model_key = meta.get("video_model_key")
                         avatar_key = meta.get("avatar_key")
+                        avatar_keys = meta.get("avatar_keys")
                         static_image_key = meta.get("static_image_key")
                         created_raw = meta.get("created_at")
                         created_at = datetime.fromisoformat(created_raw) if isinstance(created_raw, str) else datetime.now()
@@ -286,6 +295,7 @@ class JobRepository:
                         strategy = Strategy.PARALLEL.value
                         video_model_key = None
                         avatar_key = None
+                        avatar_keys = None
                         static_image_key = None
 
                     finished_at = max((obj.last_modified for _, _, _, obj in jfiles), default=created_at)
@@ -309,6 +319,7 @@ class JobRepository:
                         total=total,
                         video_model_key=video_model_key,
                         avatar_key=avatar_key,
+                        avatar_keys=avatar_keys,
                         static_image_key=static_image_key,
                         pass_num=1,
                         created_at=created_at,

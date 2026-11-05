@@ -11,7 +11,7 @@ from mcp.types import ToolAnnotations
 
 from src.jobs.modes import MODES, Mode, Strategy
 from src.mcp.client import FlPlatformClient, PlatformAPIError, docx_bytes_from_text, extract_caller_headers
-from src.mcp.tools_jobs import enrich_job_rows, resolve_avatar, resolve_project_style
+from src.mcp.tools_jobs import enrich_job_rows, resolve_avatar_refs, resolve_project_style
 from src.prompts.scenario import parse_scenario
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True)
@@ -125,9 +125,11 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
         image_keys: list[str] | None = None,
         local_image_paths: list[str] | None = None,
         avatar_id: str | None = None,
+        generate_360: bool = False,
+        project_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Create or update an avatar for `i2i2v` mode; local pictures in `local_image_paths` are uploaded automatically."""
+        """Create or update an avatar for `i2i2v` mode; local pictures in `local_image_paths` are uploaded automatically. Set `generate_360=True` to build 360° turnaround angles (or generate from text if no picture is given)."""
         headers = _ctx_headers(ctx)
         keys = list(image_keys or [])
         for raw_path in local_image_paths or []:
@@ -150,16 +152,42 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
                 patch["appearance"] = appearance
             if keys:
                 patch["image_keys"] = keys
-            return await client.request("PATCH", f"/api/avatars/{avatar_id}", json_body=patch, caller_headers=headers)
+            saved = await client.request("PATCH", f"/api/avatars/{avatar_id}", json_body=patch, caller_headers=headers) if patch else await client.request("GET", "/api/avatars", caller_headers=headers)
+            if generate_360:
+                return await client.request(
+                    "POST",
+                    f"/api/avatars/{avatar_id}/angles",
+                    json_body={"project_id": project_id},
+                    caller_headers=headers,
+                )
+            return saved if isinstance(saved, dict) else next(a for a in saved if a["id"] == avatar_id)
+
+        if not keys and generate_360:
+            if not name or not (appearance and appearance.strip()):
+                raise ValueError("Generating an avatar from scratch (`generate_360=True` without images) requires `name` and `appearance`.")
+            return await client.request(
+                "POST",
+                "/api/avatars/generate",
+                json_body={"name": name, "appearance": appearance.strip(), "project_id": project_id},
+                caller_headers=headers,
+            )
 
         if not name or not keys:
-            raise ValueError("Creating an avatar requires `name` and at least one image in `image_keys` or `local_image_paths`.")
-        return await client.request(
+            raise ValueError("Creating an avatar requires `name` and at least one image in `image_keys` or `local_image_paths` (or `generate_360=True` with `appearance`).")
+        saved = await client.request(
             "POST",
             "/api/avatars",
             json_body={"name": name, "appearance": appearance or "", "image_keys": keys},
             caller_headers=headers,
         )
+        if generate_360:
+            return await client.request(
+                "POST",
+                f"/api/avatars/{saved['id']}/angles",
+                json_body={"project_id": project_id},
+                caller_headers=headers,
+            )
+        return saved
 
     @mcp.tool(title="Delete Avatar", annotations=DESTRUCTIVE)
     async def delete_avatar(avatar_id: str, ctx: Context | None = None) -> dict[str, Any]:
@@ -573,7 +601,9 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             raise ValueError(f"Prompt source {prompt_run_id} has no generated prompt rows yet.")
 
         spec = MODES[mode]
-        resolved_avatar_key, avatar_appearance = await resolve_avatar(client, avatar_id, avatar_key, headers)
+        resolved_avatar_key, resolved_avatar_keys, avatar_appearance = await resolve_avatar_refs(
+            client, avatar_id, avatar_key, caller_headers=headers
+        )
         style = await resolve_project_style(client, inferred_project_id, headers) if apply_project_style else ""
         enriched_rows = enrich_job_rows(
             raw_rows,
@@ -590,6 +620,7 @@ def register_pipeline_tools(mcp: MCPServer, client: FlPlatformClient) -> None:
             "project_id": inferred_project_id,
             "strategy": chosen_strategy.value,
             "avatar": resolved_avatar_key,
+            "avatar_keys": resolved_avatar_keys,
             "static_image": static_image_key,
         }
         return await client.request("POST", "/api/jobs", json_body=body, caller_headers=headers)
