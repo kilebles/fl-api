@@ -105,6 +105,14 @@ class AvatarAnalyzeIn(BaseModel):
     key: str = Field(min_length=1, max_length=512)
 
 
+class AvatarOrderIn(BaseModel):
+    keys: list[str] = Field(min_length=1, max_length=8)
+
+
+class AvatarOrderOut(BaseModel):
+    keys: list[str]
+
+
 class AvatarRefAnalysisOut(BaseModel):
     key: str
     detected: bool
@@ -221,10 +229,23 @@ async def list_avatars(avatars: Avatars, request: Request, caller: Caller) -> li
 
 
 @router.post("/avatars", status_code=201)
-async def create_avatar(body: AvatarIn, avatars: Avatars, request: Request, caller: Caller) -> Avatar:
+async def create_avatar(body: AvatarIn, avatars: Avatars, analyzer: Analyzer, request: Request, caller: Caller) -> Avatar:
     await _check_keys(request, body.image_keys, caller)
-    record = await avatars.create(body.name, body.appearance, body.image_keys, user_id=caller.user_id)
+    ordered_keys = await analyzer.order_keys(body.image_keys)
+    record = await avatars.create(body.name, body.appearance, ordered_keys, user_id=caller.user_id)
     return await _avatar(record, request)
+
+
+@router.post("/avatars/order-references")
+async def order_avatar_references(
+    body: AvatarOrderIn,
+    analyzer: Analyzer,
+    request: Request,
+    caller: Caller,
+) -> AvatarOrderOut:
+    """Automatically arrange uploaded reference keys into optimal Flow & Veo slot order."""
+    await _check_keys(request, body.keys, caller)
+    return AvatarOrderOut(keys=await analyzer.order_keys(body.keys))
 
 
 @router.post("/avatars/analyze-reference")
@@ -320,11 +341,20 @@ async def download_avatar_zip(avatar_id: str, avatars: Avatars, request: Request
 
 
 @router.patch("/avatars/{avatar_id}")
-async def patch_avatar(avatar_id: str, body: AvatarPatch, avatars: Avatars, request: Request, caller: Caller) -> Avatar:
-    if body.image_keys is not None:
-        await _check_keys(request, body.image_keys, caller)
+async def patch_avatar(
+    avatar_id: str,
+    body: AvatarPatch,
+    avatars: Avatars,
+    analyzer: Analyzer,
+    request: Request,
+    caller: Caller,
+) -> Avatar:
+    ordered_keys = body.image_keys
+    if ordered_keys is not None:
+        await _check_keys(request, ordered_keys, caller)
+        ordered_keys = await analyzer.order_keys(ordered_keys)
     record = await avatars.update(
-        avatar_id, user_id=caller.user_id, name=body.name, appearance=body.appearance, image_keys=body.image_keys
+        avatar_id, user_id=caller.user_id, name=body.name, appearance=body.appearance, image_keys=ordered_keys
     )
     return await _avatar(record, request)
 

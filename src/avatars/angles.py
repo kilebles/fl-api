@@ -134,6 +134,83 @@ _ANGLE_LABELS_RU: dict[ReferenceAngle, str] = {
     "back": "со спины 180°",
 }
 
+STUDIO_ANGLE_CLASSIFICATION: dict[AngleId, tuple[ReferenceFraming, ReferenceAngle]] = {
+    "front": ("close_up", "front"),
+    "three_quarter": ("medium", "three_quarter"),
+    "profile": ("medium", "profile"),
+    "back": ("full_body", "back"),
+    "full_body": ("turnaround_sheet", "front"),
+}
+
+
+def order_references(
+    keys: list[str],
+    specs: list[tuple[ReferenceFraming, ReferenceAngle]],
+) -> list[str]:
+    """Order avatar reference keys into optimal Flow & Veo slots:
+
+    - Slot 1 (Главный): front-facing hero anchor (0°), preserving earliest front upload on ties.
+    - Slot 2 (#2, sent to Veo r2v with Slot 1): three-quarter 45° (or complementary front/full-body).
+    - Slots 3-4 (#3-#4, sent to Flow make_image): full-body silhouette, extra front/profile, and back (180°) last.
+    """
+    deduped: list[tuple[int, str, ReferenceFraming, ReferenceAngle]] = []
+    seen: set[str] = set()
+    for idx, (key, (framing, angle)) in enumerate(zip(keys, specs, strict=False)):
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append((idx, key, framing, angle))
+    if len(deduped) <= 1:
+        return [it[1] for it in deduped]
+
+    def _slot1_rank(it: tuple[int, str, ReferenceFraming, ReferenceAngle]) -> tuple[int, int]:
+        idx, _k, framing, angle = it
+        if angle == "front" and framing != "turnaround_sheet":
+            pri = 0
+        elif angle == "front":
+            pri = 1
+        elif angle == "three_quarter":
+            pri = 2
+        elif angle == "profile":
+            pri = 3
+        else:
+            pri = 4
+        return (pri, idx)
+
+    def _slot2_rank(it: tuple[int, str, ReferenceFraming, ReferenceAngle]) -> tuple[int, int]:
+        idx, _k, framing, angle = it
+        if angle == "three_quarter":
+            pri = 0
+        elif angle == "front" and framing != "turnaround_sheet":
+            pri = 1
+        elif framing in ("full_body", "turnaround_sheet") and angle != "back":
+            pri = 2
+        elif angle == "profile":
+            pri = 3
+        else:
+            pri = 4
+        return (pri, idx)
+
+    def _tail_rank(it: tuple[int, str, ReferenceFraming, ReferenceAngle]) -> tuple[int, int]:
+        idx, _k, framing, angle = it
+        if framing in ("full_body", "turnaround_sheet") and angle != "back":
+            pri = 0
+        elif angle == "front":
+            pri = 1
+        elif angle == "three_quarter":
+            pri = 2
+        elif angle == "profile":
+            pri = 3
+        else:
+            pri = 4
+        return (pri, idx)
+
+    primary = min(deduped, key=_slot1_rank)
+    rest = [it for it in deduped if it[0] != primary[0]]
+    second = min(rest, key=_slot2_rank)
+    tail = [it for it in rest if it[0] != second[0]]
+    tail.sort(key=_tail_rank)
+    return [primary[1], second[1], *(it[1] for it in tail)]
+
 
 class _VisionClassification(BaseModel):
     framing: ReferenceFraming = Field(
@@ -238,6 +315,34 @@ class ReferenceAnalyzer:
             summary_ru=format_reference_summary("medium", "front"),
             recommended_angles=list(DEFAULT_TURNAROUND_ANGLES),
         )
+
+    def seed_angle(self, key: str, angle_id: AngleId) -> None:
+        """Cache known classification for a studio-generated turnaround frame (zero API cost)."""
+        framing, angle = STUDIO_ANGLE_CLASSIFICATION[angle_id]
+        self._cache[key] = ReferenceAnalysis(
+            key=key,
+            detected=True,
+            framing=framing,
+            angle=angle,
+            summary_ru=format_reference_summary(framing, angle),
+            recommended_angles=recommend_angles_for(framing, angle),
+        )
+        self._cache.move_to_end(key)
+        while len(self._cache) > ANALYSIS_CACHE_MAX:
+            self._cache.popitem(last=False)
+
+    async def order_keys(self, keys: list[str]) -> list[str]:
+        """Return deduplicated reference keys arranged in optimal Flow & Veo slot priority."""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for k in keys:
+            if k and k not in seen:
+                seen.add(k)
+                unique.append(k)
+        if len(unique) <= 1:
+            return unique
+        analyses = await asyncio.gather(*(self.analyze_key(k) for k in unique))
+        return order_references(unique, [(a.framing, a.angle) for a in analyses])
 
     async def analyze_key(self, key: str) -> ReferenceAnalysis:
         cached = self._cache.get(key)
@@ -569,6 +674,8 @@ class AvatarStudio:
                     dest_key = f"{prefix}/{uuid.uuid4().hex}.jpg"
                     await self._objects.put(data, dest_key, f"{record.name}_{row_name}.jpg")
                     imported[row_name] = dest_key
+                    if self._analyzer is not None and row_name in STUDIO_ANGLE_CLASSIFICATION:
+                        self._analyzer.seed_angle(dest_key, row_name)  # type: ignore[arg-type]
                     new_keys.append(dest_key)
                 except Exception as e:
                     logger.warning(f"[avatar-studio] failed to import {src_key} for avatar {record.id}: {e}")
@@ -577,6 +684,17 @@ class AvatarStudio:
             for k in new_keys:
                 if k not in merged_keys and len(merged_keys) < MAX_AVATAR_REFS:
                     merged_keys.append(k)
+
+            if len(merged_keys) >= 2:
+                if self._analyzer is not None:
+                    merged_keys = await self._analyzer.order_keys(merged_keys)
+                else:
+                    by_imported_key = {v: k for k, v in imported.items()}
+                    specs = [
+                        STUDIO_ANGLE_CLASSIFICATION.get(by_imported_key.get(k), ("medium", "front"))  # type: ignore[arg-type]
+                        for k in merged_keys
+                    ]
+                    merged_keys = order_references(merged_keys, specs)
 
             pending["imported"] = imported
             all_expected_imported = bool(expected) and all(row_name in imported for row_name in expected)

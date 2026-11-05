@@ -278,3 +278,54 @@ def test_duplicate_title_numbering_utc_timestamps_and_avatar_zip(tmp_path: Path)
             assert zf.namelist() == ["Тест - 1.jpg", "Тест - 2.png"]
 
 
+def test_automatic_avatar_reference_ordering(tmp_path: Path):
+    from src.avatars.angles import ReferenceAnalyzer, order_references
+    from src.storage.objects import make_object_store
+
+    # 1. Pure slot logic: even if back finishes 1st, hero stays #1, 3/4 takes #2 (Veo), close-up #3, back #4
+    ordered = order_references(
+        ["k_hero_fb", "k_back", "k_front_cu", "k_3q"],
+        [
+            ("full_body", "front"),
+            ("full_body", "back"),
+            ("close_up", "front"),
+            ("medium", "three_quarter"),
+        ],
+    )
+    assert ordered == ["k_hero_fb", "k_3q", "k_front_cu", "k_back"]
+
+    # 2. API auto-ordering when user uploads [back, profile, three_quarter, front] in random order
+    settings = _settings(tmp_path)
+    store = make_object_store(settings)
+    by_payload = {
+        b"back": ("full_body", "back"),
+        b"profile": ("medium", "profile"),
+        b"3q": ("medium", "three_quarter"),
+        b"front": ("medium", "front"),
+    }
+
+    async def fake_classifier(data: bytes, _mime: str):
+        return by_payload[data]
+
+    analyzer = ReferenceAnalyzer("", store, classifier=fake_classifier)
+    with TestClient(create_app(settings, objects=store, analyzer=analyzer)) as client:
+        k_back = client.post("/api/uploads", files={"file": ("back.jpg", b"back")}).json()["key"]
+        k_prof = client.post("/api/uploads", files={"file": ("prof.jpg", b"profile")}).json()["key"]
+        k_3q = client.post("/api/uploads", files={"file": ("3q.jpg", b"3q")}).json()["key"]
+        k_front = client.post("/api/uploads", files={"file": ("front.jpg", b"front")}).json()["key"]
+
+        preview_order = client.post(
+            "/api/avatars/order-references",
+            json={"keys": [k_back, k_prof, k_3q, k_front]},
+        )
+        assert preview_order.status_code == 200
+        assert preview_order.json()["keys"] == [k_front, k_3q, k_prof, k_back]
+
+        av = client.post(
+            "/api/avatars",
+            json={"name": "Легионер", "appearance": "доспех", "image_keys": [k_back, k_prof, k_3q, k_front]},
+        ).json()
+        assert av["image_keys"] == [k_front, k_3q, k_prof, k_back]
+
+
+
